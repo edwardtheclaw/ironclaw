@@ -475,6 +475,7 @@ mod tests {
             ollama: None,
             openai_compatible: None,
             tinfoil: None,
+            gemini_oauth: None,
         }
     }
 
@@ -520,6 +521,8 @@ pub fn create_gemini_oauth_provider(config: &LlmConfig) -> Result<Arc<dyn LlmPro
     let gemini_config = config
         .gemini_oauth
         .clone()
-        .expect("Gemini OAuth config must be present when backend is GeminiOauth");
+        .ok_or_else(|| LlmError::AuthFailed {
+            provider: "gemini_oauth".to_string(),
+        })?;
     Ok(Arc::new(gemini_oauth::GeminiOauthProvider::new(gemini_config)))
 }

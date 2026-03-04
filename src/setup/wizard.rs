@@ -1209,10 +1209,11 @@ impl SetupWizard {
             }
             "gemini_oauth" => {
                 let default_models: Vec<(String, String)> = vec![
-                    ("gemini-3-flash-preview".into(), "Gemini 3 Flash (Preview)".into()),
-                    ("gemini-3-pro-preview".into(), "Gemini 3 Pro (Preview)".into()),
-                    ("gemini-3.1-pro-preview".into(), "Gemini 3.1 Pro (Preview)".into()),
-                    ("gemini-3.1-pro-preview-customtools".into(), "Gemini 3.1 Pro Custom Tools (Preview)".into()),
+                    ("gemini-3.1-pro-preview".into(), "Gemini 3.1 Pro (Latest, strongest reasoning)".into()),
+                    ("gemini-3-flash-preview".into(), "Gemini 3 Flash (Fast preview with thinking)".into()),
+                    ("gemini-2.5-pro".into(), "Gemini 2.5 Pro (Stable, strong reasoning)".into()),
+                    ("gemini-2.5-flash".into(), "Gemini 2.5 Flash (Fast, good quality)".into()),
+                    ("gemini-2.5-flash-lite".into(), "Gemini 2.5 Flash Lite (Fastest, lightweight)".into()),
                 ];
                 self.select_from_model_list(&default_models)?;
             }

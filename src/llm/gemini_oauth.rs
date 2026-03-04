@@ -16,8 +16,8 @@ use url::Url;
 use crate::config::GeminiOauthConfig;
 use crate::error::LlmError;
 use crate::llm::provider::{
-    ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ModelMetadata,
-    Role, ToolCall,
+    ChatMessage, CompletionRequest, CompletionResponse, FinishReason,
+    LlmProvider, ModelMetadata, Role, ToolCall, ToolDefinition,
 };
 
 // Official Gemini CLI OAuth credentials (public, from google/gemini-cli).
@@ -35,14 +35,13 @@ fn deobfuscate(parts: &[&str]) -> String {
 
 fn oauth_client_id() -> String {
     deobfuscate(&[
-        "59390855218",           // 681255809395 (rev)
-        "rdpo2tF8oo-",           // -oo8ft2oprd (rev)
-        "6fa3e9pnrn",            // rnp9e3aqf6 (rev)
+        "593908552186",          // 681255809395 (rev)
+        "drpo2tf8oo-",           // -oo8ft2oprd (rev)
+        "6fqa3e9pnr",            // rnp9e3aqf6 (rev)
         "idmh3va",               // av3hmdi (rev)
         "j531b",                 // b135j (rev)
-        "sgoog.sppa.",           // .apps.goog (rev)
-        "tnetnoc",               // content (rev)
-        "resu.el",               // le.user (rev)
+        "goog.sppa.",            // .apps.goog (rev)
+        "tnetnocresuel",         // leusercontent (rev)
         "moc.",                  // .com (rev)
     ])
 }
@@ -60,6 +59,12 @@ fn oauth_client_secret() -> String {
 }
 
 const OAUTH_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
+const GOOG_API_CLIENT: &str = "gl-node/22.17.0";
+
+const PKCE_CHARSET: &[u8] =
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~";
+const STATE_CHARSET: &[u8] =
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
 /// Token representation matching Node.js `Credentials` format from `google-auth-library`
 /// usually stored in `~/.gemini/oauth_creds.json`
@@ -108,11 +113,8 @@ fn generate_pkce_params() -> PKCEParams {
     let mut rng = rand::thread_rng();
     let code_verifier: String = (0..64)
         .map(|_| {
-            let idx = rng.gen_range(0..62);
-            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
-                .chars()
-                .nth(idx)
-                .unwrap()
+            let idx = rng.gen_range(0..PKCE_CHARSET.len());
+            PKCE_CHARSET[idx] as char
         })
         .collect();
 
@@ -123,11 +125,8 @@ fn generate_pkce_params() -> PKCEParams {
 
     let state: String = (0..32)
         .map(|_| {
-            let idx = rng.gen_range(0..62);
-            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-                .chars()
-                .nth(idx)
-                .unwrap()
+            let idx = rng.gen_range(0..STATE_CHARSET.len());
+            STATE_CHARSET[idx] as char
         })
         .collect();
 
@@ -168,6 +167,14 @@ impl CredentialManager {
         }
         let updated_content = serde_json::to_string_pretty(credential)?;
         fs::write(&self.profiles_path, updated_content)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(&self.profiles_path, perms)?;
+        }
+
         Ok(())
     }
 
@@ -247,7 +254,10 @@ impl CredentialManager {
 
         if !response.status().is_success() {
             let status = response.status();
-            let text = response.text().await.unwrap_or_default();
+            let text = response.text().await.unwrap_or_else(|e| {
+                warn!(error = %e, "Failed to read token refresh error body");
+                String::new()
+            });
             return Err(anyhow!("Token refresh failed with {}: {}", status, text));
         }
 
@@ -363,8 +373,6 @@ impl CredentialManager {
             return Err(anyhow!("Invalid 'state' parameter. Possible CSRF attack."));
         }
 
-        let code = code;
-
         // 5. Exchange code for tokens
         let response = self
             .client
@@ -382,7 +390,10 @@ impl CredentialManager {
 
         if !response.status().is_success() {
             let status = response.status();
-            let text = response.text().await.unwrap_or_default();
+            let text = response.text().await.unwrap_or_else(|e| {
+                warn!(error = %e, "Failed to read token exchange error body");
+                String::new()
+            });
             return Err(anyhow!("Token exchange failed with {}: {}", status, text));
         }
 
@@ -403,7 +414,7 @@ impl CredentialManager {
             .client
             .post("https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
             .bearer_auth(&token_resp.access_token)
-            .header("X-Goog-Api-Client", "gl-node/22.17.0")
+            .header("X-Goog-Api-Client", GOOG_API_CLIENT)
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({
                 "metadata": client_metadata
@@ -413,7 +424,13 @@ impl CredentialManager {
 
         let mut project_id = None;
         if load_resp.status().is_success() {
-            let load_data: serde_json::Value = load_resp.json().await.unwrap_or_default();
+            let load_data: serde_json::Value = match load_resp.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "Failed to parse loadCodeAssist response");
+                    serde_json::Value::default()
+                }
+            };
             if let Some(pid) = load_data.get("cloudaicompanionProject").and_then(|p| p.as_str()) {
                 project_id = Some(pid.to_string());
                 println!("Found existing project: {}", pid);
@@ -427,7 +444,7 @@ impl CredentialManager {
                 .client
                 .post("https://cloudcode-pa.googleapis.com/v1internal:onboardUser")
                 .bearer_auth(&token_resp.access_token)
-                .header("X-Goog-Api-Client", "gl-node/22.17.0")
+                .header("X-Goog-Api-Client", GOOG_API_CLIENT)
                 .header("Content-Type", "application/json")
                 .json(&serde_json::json!({
                     "tierId": "free-tier",
@@ -437,7 +454,13 @@ impl CredentialManager {
                 .await?;
 
             if onboard_resp.status().is_success() {
-                let mut lro_data: serde_json::Value = onboard_resp.json().await.unwrap_or_default();
+                let mut lro_data: serde_json::Value = match onboard_resp.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(error = %e, "Failed to parse onboardUser response");
+                        serde_json::Value::default()
+                    }
+                };
                 
                 let mut attempts = 0;
                 while !lro_data.get("done").and_then(|d| d.as_bool()).unwrap_or(true) && attempts < 15 {
@@ -449,13 +472,19 @@ impl CredentialManager {
                             .client
                             .get(&format!("https://cloudcode-pa.googleapis.com/v1internal/{}", op_name))
                             .bearer_auth(&token_resp.access_token)
-                            .header("X-Goog-Api-Client", "gl-node/22.17.0")
+                            .header("X-Goog-Api-Client", GOOG_API_CLIENT)
                             .send()
                             .await;
                             
                         if let Ok(resp) = poll_resp {
                             if resp.status().is_success() {
-                                lro_data = resp.json().await.unwrap_or_default();
+                                lro_data = match resp.json().await {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        warn!(error = %e, "Failed to parse LRO poll response");
+                                        serde_json::Value::default()
+                                    }
+                                };
                             }
                         }
                     } else {
@@ -473,7 +502,10 @@ impl CredentialManager {
                     println!("Provisioned project: {}", pid);
                 }
             } else {
-                let err_text = onboard_resp.text().await.unwrap_or_default();
+                let err_text = onboard_resp.text().await.unwrap_or_else(|e| {
+                    warn!(error = %e, "Failed to read onboard error body");
+                    String::new()
+                });
                 println!("⚠️ Failed to provision Cloud Code project: {}", err_text);
             }
         }
@@ -630,7 +662,7 @@ impl GeminiOauthProvider {
             let mut headers = reqwest::header::HeaderMap::new();
             headers.insert("Content-Type", "application/json".parse().unwrap());
             headers.insert("User-Agent", "google-cloud-sdk vscode_cloudshelleditor/0.1".parse().unwrap());
-            headers.insert("X-Goog-Api-Client", "gl-node/22.17.0".parse().unwrap());
+            headers.insert("X-Goog-Api-Client", GOOG_API_CLIENT.parse().unwrap());
             headers.insert("Client-Metadata", "{\"ideType\":\"IDE_UNSPECIFIED\",\"platform\":\"PLATFORM_UNSPECIFIED\",\"pluginType\":\"GEMINI\"}".parse().unwrap());
 
             (url, req, headers)
@@ -671,50 +703,102 @@ impl GeminiOauthProvider {
         let body_str = String::from_utf8_lossy(&body_bytes);
         
         let mut success = false;
-        if self.config.model.contains("preview") || self.config.model.contains("gemini-3") {
+        if self.config.model.contains("preview")
+            || self.config.model.contains("gemini-3")
+        {
             let mut combined_text = String::new();
             let mut finish_reason = "STOP".to_string();
-            let mut prompt_tokens = 0;
-            let mut candidates_tokens = 0;
-        
+            let mut prompt_tokens: i64 = 0;
+            let mut candidates_tokens: i64 = 0;
+            let mut tool_calls_parts = Vec::<serde_json::Value>::new();
+
             for line in body_str.lines() {
-                if line.starts_with("data:") {
-                    let json_str = line[5..].trim();
-                    if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        if let Some(resp) = chunk.get("response") {
-                            // Extract text
-                            if let Some(candidates) = resp.get("candidates").and_then(|c| c.as_array()) {
-                                if let Some(first) = candidates.first() {
-                                    if let Some(parts) = first.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
-                                        for part in parts {
-                                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                                combined_text.push_str(text);
-                                            }
-                                        }
-                                    }
-                                    if let Some(fr) = first.get("finishReason").and_then(|fr| fr.as_str()) {
-                                        finish_reason = fr.to_string();
+                if !line.starts_with("data:") {
+                    continue;
+                }
+                let json_str = line[5..].trim();
+                let chunk: serde_json::Value = match serde_json::from_str(json_str) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let resp = match chunk.get("response") {
+                    Some(r) => r,
+                    None => continue,
+                };
+
+                if let Some(candidates) = resp
+                    .get("candidates")
+                    .and_then(|c| c.as_array())
+                {
+                    if let Some(first) = candidates.first() {
+                        if let Some(parts) = first
+                            .get("content")
+                            .and_then(|c| c.get("parts"))
+                            .and_then(|p| p.as_array())
+                        {
+                            for part in parts {
+                                if let Some(text) = part
+                                    .get("text")
+                                    .and_then(|t| t.as_str())
+                                {
+                                    let is_thought = part
+                                        .get("thought")
+                                        .and_then(|t| t.as_bool())
+                                        .unwrap_or(false);
+                                    if !is_thought {
+                                        combined_text.push_str(text);
                                     }
                                 }
-                            }
-                            // Extract usage
-                            if let Some(usage) = resp.get("usageMetadata") {
-                                if let Some(pt) = usage.get("promptTokenCount").and_then(|pt| pt.as_i64()) {
-                                    prompt_tokens = pt;
-                                }
-                                if let Some(ct) = usage.get("candidatesTokenCount").and_then(|ct| ct.as_i64()) {
-                                    candidates_tokens = ct;
+                                if let Some(fc) = part.get("functionCall") {
+                                    tool_calls_parts.push(
+                                        serde_json::json!({
+                                            "functionCall": fc
+                                        }),
+                                    );
                                 }
                             }
                         }
+                        if let Some(fr) = first
+                            .get("finishReason")
+                            .and_then(|fr| fr.as_str())
+                        {
+                            finish_reason = fr.to_string();
+                        }
+                    }
+                }
+
+                if let Some(usage) = resp.get("usageMetadata") {
+                    if let Some(pt) = usage
+                        .get("promptTokenCount")
+                        .and_then(|pt| pt.as_i64())
+                    {
+                        prompt_tokens = pt;
+                    }
+                    if let Some(ct) = usage
+                        .get("candidatesTokenCount")
+                        .and_then(|ct| ct.as_i64())
+                    {
+                        candidates_tokens = ct;
                     }
                 }
             }
-            if !combined_text.is_empty() {
+
+            let has_content = !combined_text.is_empty()
+                || !tool_calls_parts.is_empty();
+
+            if has_content {
+                let mut response_parts = Vec::new();
+                if !combined_text.is_empty() {
+                    response_parts.push(
+                        serde_json::json!({"text": combined_text}),
+                    );
+                }
+                response_parts.extend(tool_calls_parts);
+
                 final_response = serde_json::json!({
                     "candidates": [{
                         "content": {
-                            "parts": [{"text": combined_text}]
+                            "parts": response_parts
                         },
                         "finishReason": finish_reason
                     }],
@@ -761,13 +845,16 @@ impl GeminiOauthProvider {
     /// Matches patterns like "Your quota will reset after 46s."
     /// or "Your quota will reset after 18h31m10s."
     fn parse_retry_after(message: &str) -> Option<Duration> {
+        use std::sync::LazyLock;
         use std::time::Duration;
 
-        let re_pattern = regex::Regex::new(
-            r"reset after (?:(\d+)h)?(?:(\d+)m)?(\d+)s"
-        ).ok()?;
+        static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(
+                r"reset after (?:(\d+)h)?(?:(\d+)m)?(\d+)s"
+            ).expect("invalid retry_after regex")
+        });
 
-        let caps = re_pattern.captures(message)?;
+        let caps = RE.captures(message)?;
         let hours: u64 = caps.get(1)
             .map_or(0, |m| m.as_str().parse().unwrap_or(0));
         let minutes: u64 = caps.get(2)
@@ -785,7 +872,11 @@ impl GeminiOauthProvider {
 
     fn to_gemini_request(
         messages: &[ChatMessage],
-        _tools: Option<&[ToolCall]>,
+        tools: Option<&[ToolDefinition]>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+        tool_choice: Option<&str>,
+        model: &str,
     ) -> serde_json::Value {
         let mut contents = Vec::new();
         let mut system_instruction = None;
@@ -810,11 +901,51 @@ impl GeminiOauthProvider {
                     }));
                 }
                 Role::Tool => {
-                    // Quick conversion for tool calls (this is an approximation, real Google APIs might require different format)
-                    contents.push(serde_json::json!({
-                        "role": "user",
-                        "parts": [{ "text": format!("Tool response:\n{}", msg.content) }]
-                    }));
+                    let tool_name = msg.name
+                        .clone()
+                        .unwrap_or_else(|| "unknown_tool".to_string());
+
+                    let response_value: serde_json::Value =
+                        serde_json::from_str(&msg.content)
+                            .unwrap_or_else(|_| {
+                                serde_json::json!({ "output": msg.content })
+                            });
+
+                    let part = serde_json::json!({
+                        "functionResponse": {
+                            "name": tool_name,
+                            "response": response_value
+                        }
+                    });
+
+                    let last = contents.last_mut();
+                    let merge = last
+                        .as_ref()
+                        .and_then(|c| c.get("role"))
+                        .and_then(|r| r.as_str())
+                        == Some("user")
+                        && last
+                            .as_ref()
+                            .and_then(|c| c.get("parts"))
+                            .and_then(|p| p.as_array())
+                            .map_or(false, |parts| {
+                                parts.iter().any(|p| p.get("functionResponse").is_some())
+                            });
+
+                    if merge {
+                        if let Some(c) = contents.last_mut() {
+                            if let Some(parts) = c.get_mut("parts")
+                                .and_then(|p| p.as_array_mut())
+                            {
+                                parts.push(part);
+                            }
+                        }
+                    } else {
+                        contents.push(serde_json::json!({
+                            "role": "user",
+                            "parts": [part]
+                        }));
+                    }
                 }
             }
         }
@@ -827,10 +958,71 @@ impl GeminiOauthProvider {
             req["systemInstruction"] = sys;
         }
 
+        if let Some(tool_defs) = tools {
+            if !tool_defs.is_empty() {
+                let declarations: Vec<serde_json::Value> = tool_defs
+                    .iter()
+                    .map(|t| serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters
+                    }))
+                    .collect();
+
+                req["tools"] = serde_json::json!([
+                    { "functionDeclarations": declarations }
+                ]);
+            }
+        }
+
+        let mut gen_config = serde_json::Map::new();
+        if let Some(t) = temperature {
+            gen_config.insert(
+                "temperature".to_string(),
+                serde_json::Value::from(t),
+            );
+        }
+        if let Some(mt) = max_tokens {
+            gen_config.insert(
+                "maxOutputTokens".to_string(),
+                serde_json::Value::from(mt),
+            );
+        }
+
+        let is_thinking_model = model.contains("thinking")
+            || model.contains("gemini-3");
+        if is_thinking_model {
+            gen_config.insert(
+                "thinkingConfig".to_string(),
+                serde_json::json!({ "includeThoughts": true }),
+            );
+        }
+
+        if !gen_config.is_empty() {
+            req["generationConfig"] =
+                serde_json::Value::Object(gen_config);
+        }
+
+        if let Some(choice) = tool_choice {
+            let mode = match choice {
+                "auto" => "AUTO",
+                "required" | "any" => "ANY",
+                "none" => "NONE",
+                _ => "AUTO",
+            };
+            req["toolConfig"] = serde_json::json!({
+                "functionCallingConfig": {
+                    "mode": mode
+                }
+            });
+        }
+
         req
     }
 
-    fn from_gemini_response(body: serde_json::Value) -> Result<CompletionResponse, LlmError> {
+    fn from_gemini_response(
+        body: serde_json::Value,
+    ) -> Result<(CompletionResponse, Vec<ToolCall>), LlmError> {
         let candidate = body
             .get("candidates")
             .and_then(|c| c.as_array())
@@ -840,15 +1032,40 @@ impl GeminiOauthProvider {
                 reason: "Response missing 'candidates[0]'".to_string(),
             })?;
 
-        let content_text = candidate
+        let parts = candidate
             .get("content")
             .and_then(|c| c.get("parts"))
-            .and_then(|p| p.as_array())
-            .and_then(|p| p.first())
-            .and_then(|p| p.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or_default()
-            .to_string();
+            .and_then(|p| p.as_array());
+
+        let mut text_content = String::new();
+        let mut tool_calls = Vec::new();
+
+        if let Some(parts) = parts {
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    text_content.push_str(text);
+                }
+                if let Some(fc) = part.get("functionCall") {
+                    let name = fc.get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let args = fc.get("args")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({}));
+                    let id = fc.get("id")
+                        .and_then(|i| i.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+                    tool_calls.push(ToolCall {
+                        id,
+                        name,
+                        arguments: args,
+                    });
+                }
+            }
+        }
 
         let finish_reason = candidate
             .get("finishReason")
@@ -856,9 +1073,21 @@ impl GeminiOauthProvider {
             .unwrap_or("STOP");
 
         let stop_reason = match finish_reason {
-            "STOP" => FinishReason::Stop,
+            "STOP" => {
+                if !tool_calls.is_empty() {
+                    FinishReason::ToolUse
+                } else {
+                    FinishReason::Stop
+                }
+            }
             "MAX_TOKENS" => FinishReason::Length,
-            _ => FinishReason::Stop,
+            _ => {
+                if !tool_calls.is_empty() {
+                    FinishReason::ToolUse
+                } else {
+                    FinishReason::Stop
+                }
+            }
         };
 
         let usage = body.get("usageMetadata");
@@ -871,12 +1100,15 @@ impl GeminiOauthProvider {
             .and_then(|c| c.as_u64())
             .unwrap_or(0) as u32;
 
-        Ok(CompletionResponse {
-            content: content_text,
-            finish_reason: stop_reason,
-            input_tokens,
-            output_tokens,
-        })
+        Ok((
+            CompletionResponse {
+                content: text_content,
+                finish_reason: stop_reason,
+                input_tokens,
+                output_tokens,
+            },
+            tool_calls,
+        ))
     }
 }
 
@@ -898,33 +1130,372 @@ impl LlmProvider for GeminiOauthProvider {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        let req_json = Self::to_gemini_request(&request.messages, None);
+        let req_json = Self::to_gemini_request(
+            &request.messages,
+            None,
+            request.temperature,
+            request.max_tokens,
+            None,
+            &self.config.model,
+        );
         let resp_json = self.send_request(&req_json).await?;
-        Self::from_gemini_response(resp_json)
+        let (response, _tool_calls) = Self::from_gemini_response(resp_json)?;
+        Ok(response)
     }
 
     async fn complete_with_tools(
         &self,
         request: crate::llm::provider::ToolCompletionRequest,
     ) -> Result<crate::llm::provider::ToolCompletionResponse, LlmError> {
-        // Fallback for completion without tools
-        let comp_req = CompletionRequest {
-            messages: request.messages,
-            model: request.model,
-            max_tokens: request.max_tokens,
-            temperature: request.temperature,
-            stop_sequences: None, // No stop_sequences in ToolCompletionRequest
-            metadata: request.metadata,
+        let tool_defs = if request.tools.is_empty() {
+            None
+        } else {
+            Some(request.tools.as_slice())
         };
 
-        let response = self.complete(comp_req).await?;
+        let req_json = Self::to_gemini_request(
+            &request.messages,
+            tool_defs,
+            request.temperature,
+            request.max_tokens,
+            request.tool_choice.as_deref(),
+            &self.config.model,
+        );
+        let resp_json = self.send_request(&req_json).await?;
+        let (response, tool_calls) = Self::from_gemini_response(resp_json)?;
 
         Ok(crate::llm::provider::ToolCompletionResponse {
-            content: Some(response.content),
+            content: if response.content.is_empty() {
+                None
+            } else {
+                Some(response.content)
+            },
             finish_reason: response.finish_reason,
             input_tokens: response.input_tokens,
             output_tokens: response.output_tokens,
-            tool_calls: vec![],
+            tool_calls,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deobfuscate_reconstructs_credentials() {
+        let client_id = oauth_client_id();
+        assert!(client_id.ends_with(".apps.googleusercontent.com"));
+        assert!(client_id.starts_with("681"));
+
+        let client_secret = oauth_client_secret();
+        assert!(client_secret.starts_with("GOCSPX-"));
+        assert!(!client_secret.is_empty());
+    }
+
+    #[test]
+    fn test_generate_pkce_params_format() {
+        let params = generate_pkce_params();
+
+        assert_eq!(params.code_verifier.len(), 64);
+        assert_eq!(params.state.len(), 32);
+        assert!(!params.code_challenge.is_empty());
+
+        assert!(params.code_verifier.chars().all(|c| {
+            c.is_ascii_alphanumeric() || "-._~".contains(c)
+        }));
+        assert!(params.state.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn test_parse_callback_params_valid() {
+        let raw = "GET /auth/callback?code=abc123&state=xyz789 HTTP/1.1\r\nHost: localhost\r\n";
+        let (code, state, error) = CredentialManager::parse_callback_params(raw);
+        assert_eq!(code.as_deref(), Some("abc123"));
+        assert_eq!(state.as_deref(), Some("xyz789"));
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn test_parse_callback_params_with_error() {
+        let raw = "GET /auth/callback?error=access_denied HTTP/1.1\r\n";
+        let (code, state, error) = CredentialManager::parse_callback_params(raw);
+        assert!(code.is_none());
+        assert!(state.is_none());
+        assert_eq!(error.as_deref(), Some("access_denied"));
+    }
+
+    #[test]
+    fn test_parse_callback_params_empty() {
+        let (code, state, error) = CredentialManager::parse_callback_params("");
+        assert!(code.is_none());
+        assert!(state.is_none());
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn test_parse_retry_after_seconds() {
+        let result = GeminiOauthProvider::parse_retry_after(
+            "RESOURCE_EXHAUSTED: Your quota will reset after 46s."
+        );
+        assert_eq!(result, Some(Duration::from_secs(48)));
+    }
+
+    #[test]
+    fn test_parse_retry_after_hours_minutes_seconds() {
+        let result = GeminiOauthProvider::parse_retry_after(
+            "Your quota will reset after 18h31m10s."
+        );
+        let expected = 18 * 3600 + 31 * 60 + 10 + 2;
+        assert_eq!(result, Some(Duration::from_secs(expected)));
+    }
+
+    #[test]
+    fn test_parse_retry_after_no_match() {
+        let result = GeminiOauthProvider::parse_retry_after(
+            "Some random error message"
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_redirect_url_valid() {
+        let url = "http://127.0.0.1:8080/auth/callback?code=4/abc&state=xyz123";
+        let result = CredentialManager::parse_redirect_url(url);
+        assert!(result.is_ok());
+        let (code, state) = result.unwrap();
+        assert_eq!(code, "4/abc");
+        assert_eq!(state, "xyz123");
+    }
+
+    #[test]
+    fn test_parse_redirect_url_invalid() {
+        let result = CredentialManager::parse_redirect_url("not-a-url");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_redirect_url_missing_code() {
+        let url = "http://127.0.0.1:8080/auth/callback?state=xyz";
+        let result = CredentialManager::parse_redirect_url(url);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_to_gemini_request_with_tools() {
+        let messages = vec![
+            ChatMessage {
+                role: Role::User,
+                content: "Hello".to_string(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+            },
+        ];
+        let tools = vec![
+            ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    }
+                }),
+            },
+        ];
+
+        let req = GeminiOauthProvider::to_gemini_request(
+            &messages,
+            Some(&tools),
+            None,
+            None,
+            None,
+            "gemini-2.0-flash",
+        );
+
+        let decls = &req["tools"][0]["functionDeclarations"];
+        assert_eq!(decls[0]["name"], "read_file");
+        assert_eq!(decls[0]["description"], "Read a file");
+    }
+
+    #[test]
+    fn test_to_gemini_request_tool_response() {
+        let messages = vec![
+            ChatMessage {
+                role: Role::User,
+                content: "Read /tmp/test".to_string(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: Role::Tool,
+                content: "file contents here".to_string(),
+                tool_call_id: Some("call_123".to_string()),
+                name: Some("read_file".to_string()),
+                tool_calls: None,
+            },
+        ];
+
+        let req = GeminiOauthProvider::to_gemini_request(
+            &messages, None,
+            None, None, None,
+            "gemini-2.0-flash",
+        );
+
+        let contents = req["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 2);
+
+        let tool_part = &contents[1]["parts"][0];
+        assert!(tool_part.get("functionResponse").is_some());
+        assert_eq!(
+            tool_part["functionResponse"]["name"],
+            "read_file"
+        );
+    }
+
+    #[test]
+    fn test_from_gemini_response_text() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{ "text": "Hello world" }]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5
+            }
+        });
+
+        let (resp, tool_calls) =
+            GeminiOauthProvider::from_gemini_response(body).unwrap();
+
+        assert_eq!(resp.content, "Hello world");
+        assert_eq!(resp.input_tokens, 10);
+        assert_eq!(resp.output_tokens, 5);
+        assert!(tool_calls.is_empty());
+    }
+
+    #[test]
+    fn test_from_gemini_response_function_call() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "read_file",
+                            "args": { "path": "/tmp/test.txt" }
+                        }
+                    }]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 15,
+                "candidatesTokenCount": 8
+            }
+        });
+
+        let (resp, tool_calls) =
+            GeminiOauthProvider::from_gemini_response(body).unwrap();
+
+        assert!(resp.content.is_empty());
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "read_file");
+        assert_eq!(
+            tool_calls[0].arguments["path"],
+            "/tmp/test.txt"
+        );
+    }
+
+    #[test]
+    fn test_generation_config_passed() {
+        let messages = vec![ChatMessage {
+            role: Role::User,
+            content: "Hi".to_string(),
+            tool_call_id: None,
+            name: None,
+            tool_calls: None,
+        }];
+
+        let req = GeminiOauthProvider::to_gemini_request(
+            &messages, None,
+            Some(0.7), Some(4096), None,
+            "gemini-2.0-flash",
+        );
+
+        let gen_cfg = &req["generationConfig"];
+        assert_eq!(gen_cfg["temperature"], 0.7_f32);
+        assert_eq!(gen_cfg["maxOutputTokens"], 4096);
+        assert!(gen_cfg.get("thinkingConfig").is_none());
+    }
+
+    #[test]
+    fn test_thinking_config_for_gemini3() {
+        let messages = vec![ChatMessage {
+            role: Role::User,
+            content: "Reason about this".to_string(),
+            tool_call_id: None,
+            name: None,
+            tool_calls: None,
+        }];
+
+        let req = GeminiOauthProvider::to_gemini_request(
+            &messages, None, None, None, None,
+            "gemini-3.0-flash-thinking",
+        );
+
+        let thinking = &req["generationConfig"]["thinkingConfig"];
+        assert_eq!(thinking["includeThoughts"], true);
+    }
+
+    #[test]
+    fn test_tool_config_mode_mapping() {
+        let messages = vec![ChatMessage {
+            role: Role::User,
+            content: "Use tools".to_string(),
+            tool_call_id: None,
+            name: None,
+            tool_calls: None,
+        }];
+
+        let tools = vec![ToolDefinition {
+            name: "test".to_string(),
+            description: "test".to_string(),
+            parameters: serde_json::json!({}),
+        }];
+
+        let req_auto = GeminiOauthProvider::to_gemini_request(
+            &messages, Some(&tools),
+            None, None, Some("auto"),
+            "gemini-2.0-flash",
+        );
+        assert_eq!(
+            req_auto["toolConfig"]["functionCallingConfig"]["mode"],
+            "AUTO"
+        );
+
+        let req_req = GeminiOauthProvider::to_gemini_request(
+            &messages, Some(&tools),
+            None, None, Some("required"),
+            "gemini-2.0-flash",
+        );
+        assert_eq!(
+            req_req["toolConfig"]["functionCallingConfig"]["mode"],
+            "ANY"
+        );
+
+        let req_none = GeminiOauthProvider::to_gemini_request(
+            &messages, Some(&tools),
+            None, None, Some("none"),
+            "gemini-2.0-flash",
+        );
+        assert_eq!(
+            req_none["toolConfig"]["functionCallingConfig"]["mode"],
+            "NONE"
+        );
     }
 }

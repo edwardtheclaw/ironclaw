@@ -378,9 +378,8 @@ impl LlmConfig {
             let credentials_path = optional_env("GEMINI_CREDENTIALS_PATH")?
                 .map(PathBuf::from)
                 .unwrap_or_else(|| {
-                    crate::bootstrap::ironclaw_base_dir()
-                        .parent() // ~/.ironclaw -> ~/
-                        .expect("ironclaw_base_dir has no parent")
+                    dirs::home_dir()
+                        .unwrap_or_else(|| PathBuf::from("/tmp"))
                         .join(".gemini")
                         .join("oauth_creds.json")
                 });
