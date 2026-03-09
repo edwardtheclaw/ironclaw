@@ -41,7 +41,7 @@ jobs:
     name: Telegram Channel Tests
     if: >
       github.event_name == 'push' ||
-      contains(github.event.pull_request.labels.*.name, 'staging-promotion')
+      (github.event_name == 'pull_request' && github.base_ref != 'staging')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -56,7 +56,7 @@ jobs:
     name: Windows Build (${{ matrix.name }})
     if: >
       github.event_name == 'push' ||
-      contains(github.event.pull_request.labels.*.name, 'staging-promotion')
+      (github.event_name == 'pull_request' && github.base_ref != 'staging')
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -83,7 +83,7 @@ jobs:
     name: WASM WIT Compatibility
     if: >
       github.event_name == 'push' ||
-      contains(github.event.pull_request.labels.*.name, 'staging-promotion')
+      (github.event_name == 'pull_request' && github.base_ref != 'staging')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -106,7 +106,7 @@ jobs:
     name: Docker Build
     if: >
       github.event_name == 'push' ||
-      contains(github.event.pull_request.labels.*.name, 'staging-promotion')
+      (github.event_name == 'pull_request' && github.base_ref != 'staging')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
