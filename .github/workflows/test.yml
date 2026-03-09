@@ -145,7 +145,6 @@ jobs:
           fi
           # Gated jobs: must pass on promotion PRs / push, skipped on developer PRs
           for job in telegram-tests wasm-wit-compat docker-build windows-build version-check; do
-            result="${{ needs.telegram-tests.result }}"
             case "$job" in
               telegram-tests) result="${{ needs.telegram-tests.result }}" ;;
               wasm-wit-compat) result="${{ needs.wasm-wit-compat.result }}" ;;

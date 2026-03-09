@@ -41,6 +41,8 @@ jobs:
 
       - name: Check for changes since last tested
         id: check
+        env:
+          FORCE_RUN: ${{ inputs.force }}
         run: |
           CURRENT_HEAD=$(git rev-parse HEAD)
           echo "current_head=${CURRENT_HEAD}" >> "$GITHUB_OUTPUT"
@@ -70,7 +72,7 @@ jobs:
           fi
 
           # Force override from workflow_dispatch
-          if [ "${{ inputs.force }}" = "true" ]; then
+          if [ "$FORCE_RUN" = "true" ]; then
             echo "Force run requested"
             HAS_CHANGES=true
             if [ -z "$DIFF_RANGE" ]; then
@@ -273,7 +275,8 @@ jobs:
             fi
 
             echo "Claude review status: ${STATUS} (${ELAPSED}s elapsed)"
-            sleep "$INTERVAL"
+            # Sleep in 1s increments so GitHub can cancel between iterations
+            for _i in $(seq 1 "$INTERVAL"); do sleep 1; done
             ELAPSED=$((ELAPSED + INTERVAL))
           done
 
@@ -371,9 +374,10 @@ jobs:
         id: evaluate
         env:
           PR_NUMBER: ${{ needs.create-promotion-pr.outputs.pr_number }}
+          SKIP_GATE: ${{ inputs.skip_claude_gate }}
         run: |
           HAS_BLOCKING="${{ steps.process-findings.outputs.has_blocking }}"
-          SKIP_INPUT="${{ inputs.skip_claude_gate }}"
+          SKIP_INPUT="$SKIP_GATE"
 
           if [ "$HAS_BLOCKING" = "true" ]; then
             echo "::warning::Claude review found blocking issues (CRITICAL ≥80 confidence)"
@@ -400,6 +404,8 @@ jobs:
         run: |
           if [ -n "$PR_NUMBER" ]; then
             echo "Merging promotion PR #${PR_NUMBER}"
+            # --delete-branch is safe: GitHub auto-retargets any chained PRs
+            # targeting this branch to the next base (verified in ironclaw-ci-test)
             gh pr merge "$PR_NUMBER" --merge --delete-branch
             echo "merged=true" >> "$GITHUB_OUTPUT"
           fi
