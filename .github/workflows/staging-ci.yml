@@ -404,9 +404,10 @@ jobs:
         run: |
           if [ -n "$PR_NUMBER" ]; then
             echo "Merging promotion PR #${PR_NUMBER}"
-            # --delete-branch is safe: GitHub auto-retargets any chained PRs
-            # targeting this branch to the next base (verified in ironclaw-ci-test)
-            gh pr merge "$PR_NUMBER" --merge --delete-branch
+            # Do NOT use --delete-branch: deleting a promotion branch closes
+            # any chained PRs that use it as their base (verified in ironclaw-ci-test).
+            # Stale promotion branches are cleaned up separately.
+            gh pr merge "$PR_NUMBER" --merge
             echo "merged=true" >> "$GITHUB_OUTPUT"
           fi
 
