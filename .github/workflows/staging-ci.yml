@@ -18,6 +18,7 @@ permissions:
   contents: write
   issues: write
   pull-requests: write
+  checks: read
 
 concurrency:
   group: staging-ci
@@ -240,15 +241,43 @@ jobs:
             echo "token=${{ github.token }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Wait for Claude review
+      - name: Wait for Claude review job
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          PR_NUMBER: ${{ needs.create-promotion-pr.outputs.pr_number }}
+          REPO: ${{ github.repository }}
         run: |
-          PR_NUMBER="${{ needs.create-promotion-pr.outputs.pr_number }}"
           if [ -z "$PR_NUMBER" ]; then
             echo "No PR number — skipping wait"
-          else
-            echo "Waiting 15 minutes for Claude review on PR #${PR_NUMBER}..."
-            sleep 900
+            exit 0
           fi
+
+          PR_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid' || echo "")
+          if [ -z "$PR_SHA" ]; then
+            echo "::warning::Could not get PR head SHA"
+            exit 0
+          fi
+
+          echo "Polling for Claude Code Review job on PR #${PR_NUMBER} (SHA: ${PR_SHA})..."
+          TIMEOUT=1200  # 20 minutes
+          ELAPSED=0
+          INTERVAL=30
+
+          while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+            STATUS=$(gh api "repos/${REPO}/commits/${PR_SHA}/check-runs" \
+              --jq '[.check_runs[] | select(.name == "Claude Code Review") | .conclusion // .status] | first // "pending"' 2>/dev/null || echo "pending")
+
+            if [ "$STATUS" = "success" ] || [ "$STATUS" = "failure" ] || [ "$STATUS" = "cancelled" ]; then
+              echo "Claude review job completed with status: ${STATUS} (${ELAPSED}s)"
+              exit 0
+            fi
+
+            echo "Claude review status: ${STATUS} (${ELAPSED}s elapsed)"
+            sleep "$INTERVAL"
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          echo "::warning::Claude review job not completed after ${TIMEOUT}s"
 
       - name: Process Claude review comments and create issues
         id: process-findings
@@ -341,7 +370,6 @@ jobs:
       - name: Evaluate gate
         id: evaluate
         env:
-          GH_TOKEN: ${{ steps.token.outputs.token }}
           PR_NUMBER: ${{ needs.create-promotion-pr.outputs.pr_number }}
         run: |
           HAS_BLOCKING="${{ steps.process-findings.outputs.has_blocking }}"
@@ -363,7 +391,12 @@ jobs:
             echo "passed=true" >> "$GITHUB_OUTPUT"
           fi
 
-          # Merge the promotion PR
+      - name: Merge promotion PR
+        if: steps.evaluate.outputs.passed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          PR_NUMBER: ${{ needs.create-promotion-pr.outputs.pr_number }}
+        run: |
           if [ -n "$PR_NUMBER" ]; then
             echo "Merging promotion PR #${PR_NUMBER}"
             gh pr merge "$PR_NUMBER" --merge --delete-branch || echo "::warning::Auto-merge failed for PR #${PR_NUMBER}"
