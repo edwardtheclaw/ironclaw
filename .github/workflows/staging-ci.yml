@@ -146,7 +146,7 @@ jobs:
         if: steps.ahead-check.outputs.commits_ahead != '0'
         run: |
           SHORT_SHA=$(echo "${{ needs.check-changes.outputs.current_head }}" | cut -c1-8)
-          BRANCH="staging-promote/${SHORT_SHA}"
+          BRANCH="staging-promote/${SHORT_SHA}-${{ github.run_id }}"
           git checkout -b "$BRANCH"
           git push origin "$BRANCH"
           echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
@@ -392,6 +392,7 @@ jobs:
           fi
 
       - name: Merge promotion PR
+        id: merge
         if: steps.evaluate.outputs.passed == 'true'
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
@@ -399,7 +400,8 @@ jobs:
         run: |
           if [ -n "$PR_NUMBER" ]; then
             echo "Merging promotion PR #${PR_NUMBER}"
-            gh pr merge "$PR_NUMBER" --merge --delete-branch || echo "::warning::Auto-merge failed for PR #${PR_NUMBER}"
+            gh pr merge "$PR_NUMBER" --merge --delete-branch
+            echo "merged=true" >> "$GITHUB_OUTPUT"
           fi
 
   # ── Update tested tag (always, so next batch covers only new commits) ──
