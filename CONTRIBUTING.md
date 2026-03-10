@@ -47,7 +47,7 @@ All PRs follow a risk-based review process:
 |-------|-------|-------------|
 | **A** | Docs, tests, chore, dependency bumps | 1 approval + CI green |
 | **B** | Features, refactors, new tools/channels | 1 approval + CI green + test evidence |
-| **C** | Security (`src/safety/`, `src/secrets/`), runtime (`src/agent/`, `src/worker/`), database schema, CI workflows | 2 approvals + rollback plan documented |
+| **C** | Security (`src/safety/`, `src/secrets/`, `src/sandbox/`, `src/orchestrator/`), runtime (`src/agent/`, `src/worker/`), database schema, CI workflows | 2 approvals + rollback plan documented |
 
 Select the appropriate track in the PR template based on what your changes touch.
 
@@ -57,4 +57,4 @@ IronClaw uses dual-backend persistence (PostgreSQL + libSQL). All new persistenc
 
 ## Adding Dependencies
 
-Run `cargo deny check` before adding new dependencies to verify license compatibility and check for known advisories.
+Run `cargo deny check` before adding new dependencies to verify license compatibility and check for known advisories (requires `deny.toml`; see the `cargo-deny` CI job).
