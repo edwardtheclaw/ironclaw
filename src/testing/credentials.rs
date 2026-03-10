@@ -65,7 +65,7 @@ pub const TEST_GITHUB_TOKEN: &str = "ghp_test123";
 // ── Telegram ────────────────────────────────────────────────────────────
 
 /// Telegram bot token for credential redaction tests.
-pub const TEST_TELEGRAM_BOT_TOKEN: &str = "8218490433:AAEZeUxwqZ5OO3mOCXv7fKvpdhDgsmBBNis";
+pub const TEST_TELEGRAM_BOT_TOKEN: &str = "0000000000:AAFakeTestTokenForTestingPurposesOnly";
 
 // ── OAuth client credentials ────────────────────────────────────────────
 
