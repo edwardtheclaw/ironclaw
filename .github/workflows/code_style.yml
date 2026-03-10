@@ -16,6 +16,17 @@ jobs:
     - name: Check formatting
       run: cargo fmt --all -- --check
 
+  deny-check:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+    - name: Install cargo-deny
+      run: cargo install cargo-deny
+    - name: Run cargo deny
+      run: cargo deny check
+
   clippy:
     name: Clippy (${{ matrix.name }})
     runs-on: ubuntu-latest
@@ -71,13 +82,13 @@ jobs:
 
   # Roll-up job for branch protection
   code-style:
-    name: Code Style (fmt + clippy)
+    name: Code Style (fmt + clippy + deny)
     runs-on: ubuntu-latest
     if: always()
-    needs: [format, clippy, clippy-windows]
+    needs: [format, clippy, clippy-windows, deny-check]
     steps:
       - run: |
-          if [[ "${{ needs.format.result }}" != "success" || "${{ needs.clippy.result }}" != "success" ]]; then
+          if [[ "${{ needs.format.result }}" != "success" || "${{ needs.clippy.result }}" != "success" || "${{ needs.deny-check.result }}" != "success" ]]; then
             echo "One or more jobs failed"
             exit 1
           fi
