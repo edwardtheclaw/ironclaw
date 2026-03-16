@@ -879,21 +879,15 @@ mod tests {
         // Insert a handle so update_worker_status has something to update
         {
             let mut containers = state.job_manager.containers.write().await;
-            containers.insert(
+            let mut handle = crate::orchestrator::job_manager::ContainerHandle::new(
                 job_id,
-                crate::orchestrator::job_manager::ContainerHandle {
-                    job_id,
-                    container_id: "test-container".to_string(),
-                    state: crate::orchestrator::job_manager::ContainerState::Running,
-                    mode: crate::orchestrator::job_manager::JobMode::Worker,
-                    created_at: chrono::Utc::now(),
-                    project_dir: None,
-                    task_description: "test".to_string(),
-                    last_worker_status: None,
-                    worker_iteration: 0,
-                    completion_result: None,
-                },
+                crate::orchestrator::job_manager::JobMode::Worker,
+                "test".to_string(),
+                None,
             );
+            handle.container_id = "test-container".to_string();
+            handle.mark_running();
+            containers.insert(job_id, handle);
         }
 
         let jm = Arc::clone(&state.job_manager);

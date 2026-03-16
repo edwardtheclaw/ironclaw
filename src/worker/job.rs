@@ -54,6 +54,9 @@ pub struct WorkerDeps {
     pub approval_context: Option<ApprovalContext>,
     /// HTTP interceptor for trace recording/replay (propagated to JobContext).
     pub http_interceptor: Option<Arc<dyn crate::llm::recording::HttpInterceptor>>,
+    /// Unified event bus. When present, job events are emitted through the bus
+    /// in addition to the legacy SSE + DB paths.
+    pub event_bus: Option<crate::event_bus::EventBus>,
 }
 
 /// Worker that executes a single job.
@@ -120,8 +123,62 @@ impl Worker {
     }
 
     /// Fire-and-forget persistence of a job event and SSE broadcast.
+    ///
+    /// Also emits through the unified event bus when available, so the
+    /// audit sink and other subscribers capture all job activity.
     fn log_event(&self, event_type: &str, data: serde_json::Value) {
         let job_id = self.job_id;
+
+        // Emit through unified event bus (audit + future sinks)
+        if let Some(ref bus) = self.deps.event_bus {
+            use crate::event_bus::{EventContext, EventSource};
+            use crate::events::DomainEvent;
+
+            let job_id_str = job_id.to_string();
+            let domain_event = match event_type {
+                "message" => Some(DomainEvent::JobMessage {
+                    job_id: job_id_str.clone(),
+                    role: data
+                        .get("role")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("assistant")
+                        .to_string(),
+                    content: data
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                }),
+                "status" => Some(DomainEvent::JobStatus {
+                    job_id: job_id_str.clone(),
+                    message: data
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                }),
+                "result" => Some(DomainEvent::JobResult {
+                    job_id: job_id_str.clone(),
+                    status: data
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("completed")
+                        .to_string(),
+                    session_id: data
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                }),
+                _ => None,
+            };
+            if let Some(event) = domain_event {
+                bus.emit_domain(
+                    EventSource::new("worker", "job"),
+                    EventContext::with_job(job_id),
+                    event,
+                );
+            }
+        }
 
         // Persist to DB
         if let Some(store) = self.store() {
@@ -1452,6 +1509,7 @@ mod tests {
             sse_tx: None,
             approval_context: None,
             http_interceptor: None,
+            event_bus: None,
         };
 
         Worker::new(job_id, deps)
@@ -1642,6 +1700,7 @@ mod tests {
             sse_tx: None,
             approval_context,
             http_interceptor: None,
+            event_bus: None,
         };
 
         Worker::new(job_id, deps)

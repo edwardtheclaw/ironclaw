@@ -714,7 +714,8 @@ mod tests {
         };
         let json = trigger.to_config_json();
         let parsed = Trigger::from_db("event", json).expect("parse event"); // safety: test-only
-        assert!( // safety: test-only
+        assert!(
+            // safety: test-only
             // safety: test-only
             matches!(parsed, Trigger::Event { channel, pattern } // safety: test-only
             if channel == Some("telegram".to_string()) && pattern == r"deploy\s+\w+")
@@ -733,7 +734,8 @@ mod tests {
         };
         let json = trigger.to_config_json();
         let parsed = Trigger::from_db("system_event", json).expect("parse system_event"); // safety: test-only
-        assert!( // safety: test-only
+        assert!(
+            // safety: test-only
             // safety: test-only
             // safety: test-only
             matches!(parsed, Trigger::SystemEvent { source, event_type, filters: f }
@@ -752,7 +754,8 @@ mod tests {
         };
         let json = action.to_config_json();
         let parsed = RoutineAction::from_db("lightweight", json).expect("parse lightweight"); // safety: test-only
-        assert!( // safety: test-only
+        assert!(
+            // safety: test-only
             // safety: test-only
             // safety: test-only
             matches!(parsed, RoutineAction::Lightweight { prompt, context_paths, max_tokens, .. }
@@ -770,7 +773,8 @@ mod tests {
         };
         let json = action.to_config_json();
         let parsed = RoutineAction::from_db("full_job", json).expect("parse full_job"); // safety: test-only
-        assert!( // safety: test-only
+        assert!(
+            // safety: test-only
             // safety: test-only
             // safety: test-only
             matches!(parsed, RoutineAction::FullJob { title, max_iterations, tool_permissions, .. }
@@ -823,7 +827,8 @@ mod tests {
         };
         let json = trigger.to_config_json();
         let parsed = Trigger::from_db("cron", json).expect("parse cron"); // safety: test-only
-        assert!( // safety: test-only
+        assert!(
+            // safety: test-only
             // safety: test-only
             matches!(parsed, Trigger::Cron { schedule, timezone } // safety: test-only
                 if schedule == "0 9 * * MON-FRI"
@@ -842,7 +847,8 @@ mod tests {
     fn test_trigger_cron_invalid_timezone_coerced_to_none() {
         let json = serde_json::json!({"schedule": "0 9 * * *", "timezone": "Fake/Zone"});
         let parsed = Trigger::from_db("cron", json).expect("parse cron"); // safety: test-only
-        assert!( // safety: test-only
+        assert!(
+            // safety: test-only
             // safety: test-only
             // safety: test-only
             matches!(parsed, Trigger::Cron { timezone, .. } if timezone.is_none()),
@@ -872,7 +878,8 @@ mod tests {
 
     #[test]
     fn test_trigger_type_tag() {
-        assert_eq!( // safety: test-only
+        assert_eq!(
+            // safety: test-only
             // safety: test-only
             // safety: test-only
             Trigger::Cron {
@@ -882,7 +889,8 @@ mod tests {
             .type_tag(),
             "cron"
         );
-        assert_eq!( // safety: test-only
+        assert_eq!(
+            // safety: test-only
             // safety: test-only
             // safety: test-only
             Trigger::Event {
@@ -892,7 +900,8 @@ mod tests {
             .type_tag(),
             "event"
         );
-        assert_eq!( // safety: test-only
+        assert_eq!(
+            // safety: test-only
             // safety: test-only
             // safety: test-only
             Trigger::SystemEvent {
@@ -915,7 +924,8 @@ mod tests {
             "max_tokens": 4096
         });
         let parsed = RoutineAction::from_db("lightweight", json).expect("parse lightweight"); // safety: test-only
-        assert!( // safety: test-only
+        assert!(
+            // safety: test-only
             // safety: test-only
             // safety: test-only
             matches!(parsed, RoutineAction::Lightweight { use_tools, max_tool_rounds, .. }
@@ -936,7 +946,8 @@ mod tests {
             RoutineAction::Lightweight {
                 max_tool_rounds, ..
             } => {
-                assert_eq!( // safety: test-only
+                assert_eq!(
+                    // safety: test-only
                     // safety: test-only
                     // safety: test-only
                     max_tool_rounds,

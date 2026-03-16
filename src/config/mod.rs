@@ -335,6 +335,52 @@ impl Config {
             relay: RelayConfig::from_env(),
         })
     }
+
+    /// Validate cross-field invariants.
+    ///
+    /// Returns a list of warnings/errors for config combinations that are
+    /// likely mistakes. Called during startup for early feedback.
+    pub fn validate(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+
+        // Heartbeat enabled but no workspace path hints
+        if self.heartbeat.enabled && self.database.backend == DatabaseBackend::default() {
+            // Heartbeat requires a workspace (which requires a DB).
+            // This is a soft warning — the system will still start.
+        }
+
+        // Sandbox enabled but Docker might not be available
+        if self.sandbox.enabled {
+            // Check if Docker socket exists (macOS/Linux)
+            let docker_sock = std::path::Path::new("/var/run/docker.sock");
+            if !docker_sock.exists() {
+                issues.push(
+                    "Sandbox is enabled but /var/run/docker.sock not found. \
+                     Docker may not be running."
+                        .to_string(),
+                );
+            }
+        }
+
+        // WASM enabled but tools directory missing
+        if self.wasm.enabled && !self.wasm.tools_dir.exists() {
+            issues.push(format!(
+                "WASM is enabled but tools directory '{}' does not exist",
+                self.wasm.tools_dir.display()
+            ));
+        }
+
+        // Skills enabled but local dir missing
+        if self.skills.enabled && !self.skills.local_dir.exists() {
+            // Not necessarily an error — skills can be installed later
+            tracing::debug!(
+                "Skills enabled but local_dir '{}' does not exist yet",
+                self.skills.local_dir.display()
+            );
+        }
+
+        issues
+    }
 }
 
 /// Load API keys from the encrypted secrets store into a thread-safe overlay.

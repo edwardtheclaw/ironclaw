@@ -656,6 +656,33 @@ ALTER TABLE agent_jobs ADD COLUMN max_tokens INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE agent_jobs ADD COLUMN total_tokens_used INTEGER NOT NULL DEFAULT 0;
 "#,
     ),
+    (
+        13,
+        "audit_log",
+        // Append-only audit log for security-relevant system events.
+        r#"
+CREATE TABLE IF NOT EXISTS audit_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id    INTEGER NOT NULL,
+    event_type  TEXT NOT NULL,
+    source_module TEXT NOT NULL,
+    source_component TEXT NOT NULL,
+    category    TEXT NOT NULL,
+    session_id  TEXT,
+    thread_id   TEXT,
+    job_id      TEXT,
+    user_id     TEXT,
+    payload     TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log (created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_log_job_id ON audit_log (job_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_session_id ON audit_log (session_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_user_id ON audit_log (user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_event_type ON audit_log (event_type);
+"#,
+    ),
 ];
 
 /// Run incremental migrations that haven't been applied yet.

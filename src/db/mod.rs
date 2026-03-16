@@ -641,6 +641,70 @@ pub trait WorkspaceStore: Send + Sync {
     ) -> Result<Vec<SearchResult>, WorkspaceError>;
 }
 
+// ==================== Audit Log ====================
+
+/// An audit record destined for the append-only `audit_log` table.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditRecord {
+    /// Bus sequence number.
+    pub event_id: u64,
+    /// Short event type name (e.g. "state_transition", "tool_execution").
+    pub event_type: String,
+    /// Source module.
+    pub source_module: String,
+    /// Source component.
+    pub source_component: String,
+    /// Event category.
+    pub category: String,
+    /// Session ID (if applicable).
+    pub session_id: Option<Uuid>,
+    /// Thread ID (if applicable).
+    pub thread_id: Option<Uuid>,
+    /// Job ID (if applicable).
+    pub job_id: Option<Uuid>,
+    /// User ID (if applicable).
+    pub user_id: Option<String>,
+    /// Full event payload as JSON.
+    pub payload: serde_json::Value,
+    /// When the event was created.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Filter for querying the audit log.
+#[derive(Debug, Default)]
+pub struct AuditFilter {
+    /// Filter by session ID.
+    pub session_id: Option<Uuid>,
+    /// Filter by job ID.
+    pub job_id: Option<Uuid>,
+    /// Filter by user ID.
+    pub user_id: Option<String>,
+    /// Filter by event type.
+    pub event_type: Option<String>,
+    /// Only events after this time.
+    pub after: Option<DateTime<Utc>>,
+    /// Only events before this time.
+    pub before: Option<DateTime<Utc>>,
+    /// Maximum number of records to return.
+    pub limit: Option<i64>,
+}
+
+/// Append-only audit log persistence.
+///
+/// Intentionally separate from `Database` — not all backends need to implement
+/// this (and it can be a standalone trait object for the audit sink).
+#[async_trait]
+pub trait AuditStore: Send + Sync {
+    /// Append audit records (batch insert). No update. No delete.
+    async fn append_audit_events(&self, events: &[AuditRecord]) -> Result<(), DatabaseError>;
+
+    /// Query the audit log with filters.
+    async fn query_audit_log(
+        &self,
+        filter: &AuditFilter,
+    ) -> Result<Vec<AuditRecord>, DatabaseError>;
+}
+
 /// Backend-agnostic database supertrait.
 ///
 /// Combines all sub-traits into one. Existing `Arc<dyn Database>` consumers

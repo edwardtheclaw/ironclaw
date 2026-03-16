@@ -51,6 +51,7 @@ pub mod document_extraction;
 pub mod error;
 pub mod estimation;
 pub mod evaluation;
+pub mod event_bus;
 pub mod events;
 pub mod extensions;
 pub mod history;

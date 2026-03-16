@@ -257,7 +257,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
     async fn check_signals(&self) -> LoopSignal {
         let sess = self.session.lock().await;
         if let Some(thread) = sess.threads.get(&self.thread_id)
-            && thread.state == ThreadState::Interrupted
+            && thread.state() == ThreadState::Interrupted
         {
             return LoopSignal::Stop;
         }
@@ -1194,6 +1194,7 @@ mod tests {
             http_interceptor: None,
             transcription: None,
             document_extraction: None,
+            event_bus: None,
         };
 
         Agent::new(
@@ -2033,6 +2034,7 @@ mod tests {
             http_interceptor: None,
             transcription: None,
             document_extraction: None,
+            event_bus: None,
         };
 
         Agent::new(
@@ -2150,6 +2152,7 @@ mod tests {
                 http_interceptor: None,
                 transcription: None,
                 document_extraction: None,
+                event_bus: None,
             };
 
             Agent::new(

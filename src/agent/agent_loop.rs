@@ -75,6 +75,8 @@ pub struct AgentDeps {
     pub cost_guard: Arc<crate::agent::cost_guard::CostGuard>,
     /// SSE broadcast sender for live job event streaming to the web gateway.
     pub sse_tx: Option<tokio::sync::broadcast::Sender<crate::events::DomainEvent>>,
+    /// Unified event bus. Optional for backward compatibility with tests.
+    pub event_bus: Option<crate::event_bus::EventBus>,
     /// HTTP interceptor for trace recording/replay.
     pub http_interceptor: Option<Arc<dyn crate::llm::recording::HttpInterceptor>>,
     /// Audio transcription middleware for voice messages.

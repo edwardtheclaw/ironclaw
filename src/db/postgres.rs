@@ -707,3 +707,162 @@ impl WorkspaceStore for PgBackend {
             .await
     }
 }
+
+// ==================== AuditStore ====================
+
+#[async_trait]
+impl crate::db::AuditStore for PgBackend {
+    async fn append_audit_events(
+        &self,
+        events: &[crate::db::AuditRecord],
+    ) -> Result<(), DatabaseError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let client = self
+            .store
+            .pool()
+            .get()
+            .await
+            .map_err(|e| DatabaseError::Pool(e.to_string()))?;
+
+        // Build a batch INSERT for all events in a single round-trip.
+        let mut query = String::from(
+            "INSERT INTO audit_log (event_id, event_type, source_module, source_component, \
+             category, session_id, thread_id, job_id, user_id, payload, created_at) VALUES ",
+        );
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        let mut param_idx = 1;
+
+        for (i, event) in events.iter().enumerate() {
+            if i > 0 {
+                query.push_str(", ");
+            }
+            query.push_str(&format!(
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                param_idx,
+                param_idx + 1,
+                param_idx + 2,
+                param_idx + 3,
+                param_idx + 4,
+                param_idx + 5,
+                param_idx + 6,
+                param_idx + 7,
+                param_idx + 8,
+                param_idx + 9,
+                param_idx + 10
+            ));
+            param_idx += 11;
+
+            params.push(Box::new(event.event_id as i64));
+            params.push(Box::new(event.event_type.clone()));
+            params.push(Box::new(event.source_module.clone()));
+            params.push(Box::new(event.source_component.clone()));
+            params.push(Box::new(event.category.clone()));
+            params.push(Box::new(event.session_id));
+            params.push(Box::new(event.thread_id));
+            params.push(Box::new(event.job_id));
+            params.push(Box::new(event.user_id.clone()));
+            params.push(Box::new(event.payload.clone()));
+            params.push(Box::new(event.created_at));
+        }
+
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+
+        client // safety: single batch INSERT, no multi-step transaction needed
+            .execute(&query, &param_refs)
+            .await
+            .map_err(|e| DatabaseError::Query(format!("audit_log insert failed: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn query_audit_log(
+        &self,
+        filter: &crate::db::AuditFilter,
+    ) -> Result<Vec<crate::db::AuditRecord>, DatabaseError> {
+        let client = self
+            .store
+            .pool()
+            .get()
+            .await
+            .map_err(|e| DatabaseError::Pool(e.to_string()))?;
+
+        let mut query = String::from(
+            "SELECT event_id, event_type, source_module, source_component, category, \
+             session_id, thread_id, job_id, user_id, payload, created_at \
+             FROM audit_log WHERE 1=1",
+        );
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        let mut idx = 1;
+
+        if let Some(ref sid) = filter.session_id {
+            query.push_str(&format!(" AND session_id = ${idx}"));
+            params.push(Box::new(*sid));
+            idx += 1;
+        }
+        if let Some(ref jid) = filter.job_id {
+            query.push_str(&format!(" AND job_id = ${idx}"));
+            params.push(Box::new(*jid));
+            idx += 1;
+        }
+        if let Some(ref uid) = filter.user_id {
+            query.push_str(&format!(" AND user_id = ${idx}"));
+            params.push(Box::new(uid.clone()));
+            idx += 1;
+        }
+        if let Some(ref et) = filter.event_type {
+            query.push_str(&format!(" AND event_type = ${idx}"));
+            params.push(Box::new(et.clone()));
+            idx += 1;
+        }
+        if let Some(ref after) = filter.after {
+            query.push_str(&format!(" AND created_at > ${idx}"));
+            params.push(Box::new(*after));
+            idx += 1;
+        }
+        if let Some(ref before) = filter.before {
+            query.push_str(&format!(" AND created_at < ${idx}"));
+            params.push(Box::new(*before));
+            idx += 1;
+        }
+
+        query.push_str(" ORDER BY created_at DESC");
+
+        let limit = filter.limit.unwrap_or(1000);
+        query.push_str(&format!(" LIMIT ${idx}"));
+        params.push(Box::new(limit));
+
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+
+        let rows = client
+            .query(&query, &param_refs)
+            .await
+            .map_err(|e| DatabaseError::Query(format!("audit_log query failed: {e}")))?;
+
+        let records = rows
+            .iter()
+            .map(|row| {
+                let event_id: i64 = row.get("event_id");
+                crate::db::AuditRecord {
+                    event_id: event_id as u64,
+                    event_type: row.get("event_type"),
+                    source_module: row.get("source_module"),
+                    source_component: row.get("source_component"),
+                    category: row.get("category"),
+                    session_id: row.get("session_id"),
+                    thread_id: row.get("thread_id"),
+                    job_id: row.get("job_id"),
+                    user_id: row.get("user_id"),
+                    payload: row.get("payload"),
+                    created_at: row.get("created_at"),
+                }
+            })
+            .collect();
+
+        Ok(records)
+    }
+}

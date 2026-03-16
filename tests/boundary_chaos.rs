@@ -310,7 +310,8 @@ fn domain_event_all_variants_serialize() {
     for variant in &variants {
         let json = serde_json::to_string(variant).unwrap(); // safety: test-only
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap(); // safety: test-only
-        assert!( // safety: test-only
+        assert!(
+            // safety: test-only
             // safety: test-only
             parsed.get("type").is_some(),
             "missing 'type' field in {:?}",

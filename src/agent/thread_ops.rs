@@ -186,61 +186,9 @@ impl Agent {
             "Processing user input"
         );
 
-        // First check thread state without holding lock during I/O
-        let thread_state = {
-            let sess = session.lock().await;
-            let thread = sess
-                .threads
-                .get(&thread_id)
-                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-            thread.state
-        };
-
-        tracing::debug!(
-            message_id = %message.id,
-            thread_id = %thread_id,
-            thread_state = ?thread_state,
-            "Checked thread state"
-        );
-
-        // Check thread state
-        match thread_state {
-            ThreadState::Processing => {
-                tracing::warn!(
-                    message_id = %message.id,
-                    thread_id = %thread_id,
-                    "Thread is processing, rejecting new input"
-                );
-                return Ok(SubmissionResult::error(
-                    "Turn in progress. Use /interrupt to cancel.",
-                ));
-            }
-            ThreadState::AwaitingApproval => {
-                tracing::warn!(
-                    message_id = %message.id,
-                    thread_id = %thread_id,
-                    "Thread awaiting approval, rejecting new input"
-                );
-                return Ok(SubmissionResult::error(
-                    "Waiting for approval. Use /interrupt to cancel.",
-                ));
-            }
-            ThreadState::Completed => {
-                tracing::warn!(
-                    message_id = %message.id,
-                    thread_id = %thread_id,
-                    "Thread completed, rejecting new input"
-                );
-                return Ok(SubmissionResult::error(
-                    "Thread completed. Use /thread new.",
-                ));
-            }
-            ThreadState::Idle | ThreadState::Interrupted => {
-                // Can proceed
-            }
-        }
-
-        // Safety validation for user input
+        // Safety validation BEFORE state check — these don't need the session
+        // lock and are the slowest part, so run them first. Then we can do the
+        // state check + start_turn atomically under one lock (TOCTOU fix).
         let validation = self.safety().validate_input(content);
         if !validation.is_valid {
             let details = validation
@@ -290,13 +238,45 @@ impl Agent {
         // Natural language goes through the agentic loop
         // Job tools (create_job, list_jobs, etc.) are in the tool registry
 
-        // Auto-compact if needed BEFORE adding new turn
+        // Check thread state and auto-compact under a single lock acquisition.
+        // The state check must happen under the lock to prevent TOCTOU races
+        // where another task could change the state between our check and
+        // the start_turn call.
         {
             let mut sess = session.lock().await;
             let thread = sess
                 .threads
                 .get_mut(&thread_id)
                 .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+
+            let thread_state = thread.state();
+            tracing::debug!(
+                message_id = %message.id,
+                thread_id = %thread_id,
+                thread_state = ?thread_state,
+                "Checked thread state"
+            );
+
+            match thread_state {
+                ThreadState::Processing => {
+                    return Ok(SubmissionResult::error(
+                        "Turn in progress. Use /interrupt to cancel.",
+                    ));
+                }
+                ThreadState::AwaitingApproval => {
+                    return Ok(SubmissionResult::error(
+                        "Waiting for approval. Use /interrupt to cancel.",
+                    ));
+                }
+                ThreadState::Completed => {
+                    return Ok(SubmissionResult::error(
+                        "Thread completed. Use /thread new.",
+                    ));
+                }
+                ThreadState::Idle | ThreadState::Interrupted => {
+                    // Can proceed
+                }
+            }
 
             let messages = thread.messages();
             if let Some(strategy) = self.context_monitor.suggest_compaction(&messages) {
@@ -405,7 +385,7 @@ impl Agent {
             .get_mut(&thread_id)
             .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
 
-        if thread.state == ThreadState::Interrupted {
+        if thread.state() == ThreadState::Interrupted {
             let _ = self
                 .channels
                 .send_status(
@@ -778,7 +758,7 @@ impl Agent {
             .get_mut(&thread_id)
             .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
 
-        match thread.state {
+        match thread.state() {
             ThreadState::Processing | ThreadState::AwaitingApproval => {
                 thread.interrupt();
                 Ok(SubmissionResult::ok_with_message("Interrupted."))
@@ -837,7 +817,7 @@ impl Agent {
             .get_mut(&thread_id)
             .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
         thread.turns.clear();
-        thread.state = ThreadState::Idle;
+        thread.reset_to_idle();
 
         // Clear undo history too
         let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
@@ -864,11 +844,11 @@ impl Agent {
                 .get_mut(&thread_id)
                 .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
 
-            if thread.state != ThreadState::AwaitingApproval {
+            if thread.state() != ThreadState::AwaitingApproval {
                 // Stale or duplicate approval (tool already executed) — silently ignore.
                 tracing::debug!(
                     %thread_id,
-                    state = ?thread.state,
+                    state = ?thread.state(),
                     "Ignoring stale approval: thread not in AwaitingApproval state"
                 );
                 return Ok(SubmissionResult::ok_with_message(""));
@@ -914,11 +894,13 @@ impl Agent {
                 );
             }
 
-            // Reset thread state to processing
+            // Reset thread state to processing (AwaitingApproval → Processing)
             {
                 let mut sess = session.lock().await;
-                if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                    thread.state = ThreadState::Processing;
+                if let Some(thread) = sess.threads.get_mut(&thread_id)
+                    && let Err(e) = thread.set_processing()
+                {
+                    tracing::warn!(%thread_id, "Invalid approval state transition: {}", e);
                 }
             }
 

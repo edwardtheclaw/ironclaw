@@ -272,6 +272,7 @@ impl Scheduler {
                 sse_tx: self.sse_tx.clone(),
                 approval_context,
                 http_interceptor: self.http_interceptor.clone(),
+                event_bus: None,
             };
             let worker = Worker::new(job_id, deps);
 

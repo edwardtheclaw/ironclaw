@@ -194,6 +194,52 @@ impl ToolRegistry {
         self.tools.try_read().map(|t| t.len()).unwrap_or(0)
     }
 
+    /// Verify that expected built-in tools are registered.
+    ///
+    /// Returns a list of tool names that should be registered but aren't.
+    /// Called during startup to catch wiring bugs.
+    pub fn verify_expected_tools(&self, config: &crate::config::Config) -> Vec<String> {
+        let tools = match self.tools.try_read() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut missing = Vec::new();
+
+        // Core built-ins that should always be present
+        for name in &["echo", "time", "json", "http"] {
+            if !tools.contains_key(*name) {
+                missing.push(name.to_string());
+            }
+        }
+
+        // Memory tools should be present when tools beyond core builtins are loaded
+        // (indicates a workspace/DB is available).
+        if tools.len() > 4 {
+            for name in &[
+                "memory_search",
+                "memory_write",
+                "memory_read",
+                "memory_tree",
+            ] {
+                if !tools.contains_key(*name) {
+                    missing.push(name.to_string());
+                }
+            }
+        }
+
+        // Dev tools when local tools allowed
+        if config.agent.allow_local_tools {
+            for name in &["shell", "read_file", "write_file"] {
+                if !tools.contains_key(*name) {
+                    missing.push(name.to_string());
+                }
+            }
+        }
+
+        missing
+    }
+
     /// Get all tools.
     pub async fn all(&self) -> Vec<Arc<dyn Tool>> {
         self.tools.read().await.values().cloned().collect()

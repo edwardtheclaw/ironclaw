@@ -1354,7 +1354,7 @@ async fn chat_history_handler(
                 turn_number: t.turn_number,
                 user_input: t.user_input.clone(),
                 response: t.response.clone(),
-                state: format!("{:?}", t.state),
+                state: format!("{:?}", t.state()),
                 started_at: t.started_at.to_rfc3339(),
                 completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
                 tool_calls: t
@@ -1500,7 +1500,7 @@ async fn chat_threads_handler(
         .into_iter()
         .map(|t| ThreadInfo {
             id: t.id,
-            state: format!("{:?}", t.state),
+            state: format!("{:?}", t.state()),
             turn_count: t.turns.len(),
             created_at: t.created_at.to_rfc3339(),
             updated_at: t.updated_at.to_rfc3339(),
@@ -1532,7 +1532,7 @@ async fn chat_new_thread_handler(
         let id = thread.id;
         let info = ThreadInfo {
             id: thread.id,
-            state: format!("{:?}", thread.state),
+            state: format!("{:?}", thread.state()),
             turn_count: thread.turns.len(),
             created_at: thread.created_at.to_rfc3339(),
             updated_at: thread.updated_at.to_rfc3339(),

@@ -14,6 +14,7 @@ use crate::channels::web::log_layer::LogBroadcaster;
 use crate::config::Config;
 use crate::context::ContextManager;
 use crate::db::Database;
+use crate::event_bus::EventBus;
 use crate::extensions::ExtensionManager;
 use crate::hooks::HookRegistry;
 use crate::llm::{LlmProvider, RecordingLlm, SessionManager};
@@ -56,6 +57,62 @@ pub struct AppComponents {
     pub session: Arc<SessionManager>,
     pub catalog_entries: Vec<crate::extensions::RegistryEntry>,
     pub dev_loaded_tool_names: Vec<String>,
+    /// Unified event bus for all system events.
+    pub event_bus: EventBus,
+}
+
+impl AppComponents {
+    /// Verify that all components expected by the config are actually present.
+    ///
+    /// Logs warnings for any missing components. Called at end of `build_all()`
+    /// to catch wiring bugs early.
+    pub fn verify_readiness(&self) {
+        let mut warnings = Vec::new();
+
+        // Config cross-field validation
+        for issue in self.config.validate() {
+            warnings.push("config validation issue");
+            tracing::warn!(component = "startup_verification", "{}", issue);
+        }
+
+        // Note: db can legitimately be None if --no-db was passed.
+        // We only warn if workspace is expected but missing.
+
+        if self.workspace.is_none() && self.db.is_some() {
+            warnings.push("Workspace is None but database is available");
+        }
+
+        if self.wasm_tool_runtime.is_none() && self.config.wasm.enabled {
+            warnings.push("WASM runtime is None but config.wasm.enabled=true");
+        }
+
+        if self.extension_manager.is_none() {
+            warnings.push("Extension manager is None");
+        }
+
+        if self.skill_registry.is_none() && self.config.skills.enabled {
+            warnings.push("Skill registry is None but config.skills.enabled=true");
+        }
+
+        // Check tool registration
+        let missing_tools = self.tools.verify_expected_tools(&self.config);
+        for tool_name in &missing_tools {
+            warnings.push("missing expected tool");
+            tracing::warn!(
+                component = "startup_verification",
+                tool = tool_name,
+                "Expected tool not registered"
+            );
+        }
+
+        for warning in &warnings {
+            tracing::warn!(component = "startup_verification", "{}", warning);
+        }
+
+        if warnings.is_empty() {
+            tracing::debug!("All expected components initialized successfully");
+        }
+    }
 }
 
 /// Options that control optional init phases.
@@ -772,6 +829,9 @@ impl AppBuilder {
             (None, None)
         };
 
+        // Create unified event bus
+        let event_bus = EventBus::new();
+
         let context_manager = Arc::new(ContextManager::new(self.config.agent.max_parallel_jobs));
         let cost_guard = Arc::new(crate::agent::cost_guard::CostGuard::new(
             crate::agent::cost_guard::CostGuardConfig {
@@ -785,7 +845,7 @@ impl AppBuilder {
             tools.count()
         );
 
-        Ok(AppComponents {
+        let components = AppComponents {
             config: self.config,
             db: self.db,
             secrets_store: self.secrets_store,
@@ -810,7 +870,12 @@ impl AppBuilder {
             session: self.session,
             catalog_entries,
             dev_loaded_tool_names,
-        })
+            event_bus,
+        };
+
+        components.verify_readiness();
+
+        Ok(components)
     }
 }
 

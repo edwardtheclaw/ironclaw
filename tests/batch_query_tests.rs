@@ -213,8 +213,10 @@ mod tests {
         assert_eq!(counts.len(), 3, "Should return 3 routines"); // safety: test-only
         assert_eq!(counts[&r1], 2, "r1 should have 2 running"); // safety: test-only
         assert_eq!(counts[&r2], 1, "r2 should have 1 running"); // safety: test-only
- assert_eq!( // safety: test-only
-            counts[&r3], 0,
+        assert_eq!(
+            // safety: test-only
+            counts[&r3],
+            0,
             "r3 should have 0 running (Ok status is not running)"
         );
     }
@@ -360,8 +362,10 @@ mod tests {
             .await
             .expect("batch query should work"); // safety: test-only
 
- assert_eq!( // safety: test-only
-            counts[&routine_id], 2,
+        assert_eq!(
+            // safety: test-only
+            counts[&routine_id],
+            2,
             "Should only count 2 Running status runs"
         );
     }
@@ -454,12 +458,16 @@ mod tests {
             .expect("batch query should work"); // safety: test-only
 
         // Verify counts match the limits
- assert_eq!( // safety: test-only
-            counts[&r1], 1,
+        assert_eq!(
+            // safety: test-only
+            counts[&r1],
+            1,
             "r1 should have 1 running (at max_concurrent=1)"
         );
- assert_eq!( // safety: test-only
-            counts[&r2], 2,
+        assert_eq!(
+            // safety: test-only
+            counts[&r2],
+            2,
             "r2 should have 2 running (at max_concurrent=2)"
         );
 

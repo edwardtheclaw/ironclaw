@@ -133,6 +133,28 @@ pub enum ThreadState {
     Interrupted,
 }
 
+impl ThreadState {
+    /// Check whether a transition from this state to `target` is valid.
+    pub fn can_transition_to(self, target: ThreadState) -> bool {
+        use ThreadState::*;
+        matches!(
+            (self, target),
+            // From Idle
+            (Idle, Processing) |
+            // From Processing
+            (Processing, Idle) |
+            (Processing, AwaitingApproval) |
+            (Processing, Interrupted) |
+            // From AwaitingApproval
+            (AwaitingApproval, Idle) |
+            (AwaitingApproval, Processing) |
+            (AwaitingApproval, Interrupted) |
+            // From Interrupted
+            (Interrupted, Idle)
+        )
+    }
+}
+
 /// Pending auth token request.
 ///
 /// Auth mode TTL — must stay in sync with
@@ -197,8 +219,8 @@ pub struct Thread {
     pub id: Uuid,
     /// Parent session ID.
     pub session_id: Uuid,
-    /// Current state.
-    pub state: ThreadState,
+    /// Current state. Private — use `state()` to read, transition methods to mutate.
+    state: ThreadState,
     /// Turns in this thread.
     pub turns: Vec<Turn>,
     /// When the thread was created.
@@ -246,6 +268,33 @@ impl Thread {
             pending_approval: None,
             pending_auth: None,
         }
+    }
+
+    /// Get the current thread state.
+    pub fn state(&self) -> ThreadState {
+        self.state
+    }
+
+    /// Force-reset the state to Idle (for clear/restore operations that
+    /// bypass normal transitions). Prefer the transition methods for
+    /// normal state changes.
+    pub fn reset_to_idle(&mut self) {
+        self.state = ThreadState::Idle;
+        self.updated_at = Utc::now();
+    }
+
+    /// Force-set state to Processing (for approval flow resumption where
+    /// state was AwaitingApproval → Processing). Validates the transition.
+    pub fn set_processing(&mut self) -> Result<(), String> {
+        if !self.state.can_transition_to(ThreadState::Processing) {
+            return Err(format!(
+                "Cannot transition from {:?} to Processing",
+                self.state
+            ));
+        }
+        self.state = ThreadState::Processing;
+        self.updated_at = Utc::now();
+        Ok(())
     }
 
     /// Get the current turn number (1-indexed for display).
@@ -518,8 +567,8 @@ pub struct Turn {
     pub response: Option<String>,
     /// Tool calls made during this turn.
     pub tool_calls: Vec<TurnToolCall>,
-    /// Turn state.
-    pub state: TurnState,
+    /// Turn state. Private — use `state()` to read, transition methods to mutate.
+    state: TurnState,
     /// When the turn started.
     pub started_at: DateTime<Utc>,
     /// When the turn completed.
@@ -547,6 +596,11 @@ impl Turn {
             error: None,
             image_content_parts: Vec::new(),
         }
+    }
+
+    /// Get the current turn state.
+    pub fn state(&self) -> TurnState {
+        self.state
     }
 
     /// Complete this turn.
@@ -629,11 +683,11 @@ mod tests {
         let mut thread = Thread::new(Uuid::new_v4());
 
         thread.start_turn("Hello");
-        assert_eq!(thread.state, ThreadState::Processing);
+        assert_eq!(thread.state(), ThreadState::Processing);
         assert_eq!(thread.turns.len(), 1);
 
         thread.complete_turn("Hi there!");
-        assert_eq!(thread.state, ThreadState::Idle);
+        assert_eq!(thread.state(), ThreadState::Idle);
         assert_eq!(thread.turns[0].response, Some("Hi there!".to_string()));
     }
 
@@ -683,7 +737,7 @@ mod tests {
         assert_eq!(thread.turns[0].response, Some("Hi there!".to_string()));
         assert_eq!(thread.turns[1].user_input, "How are you?");
         assert_eq!(thread.turns[1].response, Some("I'm good!".to_string()));
-        assert_eq!(thread.state, ThreadState::Idle);
+        assert_eq!(thread.state(), ThreadState::Idle);
     }
 
     #[test]
@@ -783,7 +837,7 @@ mod tests {
 
         assert_eq!(thread.id, specific_id);
         assert_eq!(thread.session_id, session_id);
-        assert_eq!(thread.state, ThreadState::Idle);
+        assert_eq!(thread.state(), ThreadState::Idle);
         assert!(thread.turns.is_empty());
     }
 
@@ -821,7 +875,7 @@ mod tests {
 
         // Should clear all turns and stay idle
         assert!(thread.turns.is_empty());
-        assert_eq!(thread.state, ThreadState::Idle);
+        assert_eq!(thread.state(), ThreadState::Idle);
     }
 
     #[test]
@@ -940,17 +994,17 @@ mod tests {
         let mut thread = Thread::new(Uuid::new_v4());
 
         thread.start_turn("do something");
-        assert_eq!(thread.state, ThreadState::Processing);
+        assert_eq!(thread.state(), ThreadState::Processing);
 
         thread.interrupt();
-        assert_eq!(thread.state, ThreadState::Interrupted);
+        assert_eq!(thread.state(), ThreadState::Interrupted);
 
         let last_turn = thread.last_turn().unwrap();
-        assert_eq!(last_turn.state, TurnState::Interrupted);
+        assert_eq!(last_turn.state(), TurnState::Interrupted);
         assert!(last_turn.completed_at.is_some());
 
         thread.resume();
-        assert_eq!(thread.state, ThreadState::Idle);
+        assert_eq!(thread.state(), ThreadState::Idle);
     }
 
     #[test]
@@ -958,15 +1012,15 @@ mod tests {
         let mut thread = Thread::new(Uuid::new_v4());
 
         // Idle thread: resume should be a no-op
-        assert_eq!(thread.state, ThreadState::Idle);
+        assert_eq!(thread.state(), ThreadState::Idle);
         thread.resume();
-        assert_eq!(thread.state, ThreadState::Idle);
+        assert_eq!(thread.state(), ThreadState::Idle);
 
         // Processing thread: resume should not change state
         thread.start_turn("work");
-        assert_eq!(thread.state, ThreadState::Processing);
+        assert_eq!(thread.state(), ThreadState::Processing);
         thread.resume();
-        assert_eq!(thread.state, ThreadState::Processing);
+        assert_eq!(thread.state(), ThreadState::Processing);
     }
 
     #[test]
@@ -976,10 +1030,10 @@ mod tests {
         thread.start_turn("risky operation");
         thread.fail_turn("connection timed out");
 
-        assert_eq!(thread.state, ThreadState::Idle);
+        assert_eq!(thread.state(), ThreadState::Idle);
 
         let turn = thread.last_turn().unwrap();
-        assert_eq!(turn.state, TurnState::Failed);
+        assert_eq!(turn.state(), TurnState::Failed);
         assert_eq!(turn.error, Some("connection timed out".to_string()));
         assert!(turn.response.is_none());
         assert!(turn.completed_at.is_some());
@@ -1078,7 +1132,7 @@ mod tests {
 
         // Completing a turn when there are no turns should be a safe no-op
         thread.complete_turn("phantom response");
-        assert_eq!(thread.state, ThreadState::Idle);
+        assert_eq!(thread.state(), ThreadState::Idle);
         assert!(thread.turns.is_empty());
     }
 
@@ -1088,7 +1142,7 @@ mod tests {
 
         // Failing a turn when there are no turns should be a safe no-op
         thread.fail_turn("phantom error");
-        assert_eq!(thread.state, ThreadState::Idle);
+        assert_eq!(thread.state(), ThreadState::Idle);
         assert!(thread.turns.is_empty());
     }
 
@@ -1109,7 +1163,7 @@ mod tests {
         };
 
         thread.await_approval(approval);
-        assert_eq!(thread.state, ThreadState::AwaitingApproval);
+        assert_eq!(thread.state(), ThreadState::AwaitingApproval);
         assert!(thread.pending_approval.is_some());
 
         let taken = thread.take_pending_approval();
@@ -1137,7 +1191,7 @@ mod tests {
         thread.await_approval(approval);
         thread.clear_pending_approval();
 
-        assert_eq!(thread.state, ThreadState::Idle);
+        assert_eq!(thread.state(), ThreadState::Idle);
         assert!(thread.pending_approval.is_none());
     }
 
@@ -1156,7 +1210,7 @@ mod tests {
         // Mutably modify through accessor
         session.active_thread_mut().unwrap().start_turn("test");
         assert_eq!(
-            session.active_thread().unwrap().state,
+            session.active_thread().unwrap().state(),
             ThreadState::Processing
         );
     }
@@ -1380,5 +1434,72 @@ mod tests {
             tool_result_content.len()
         );
         assert!(tool_result_content.ends_with("..."));
+    }
+
+    #[test]
+    fn thread_state_transition_table() {
+        use ThreadState::*;
+
+        // Valid transitions
+        assert!(Idle.can_transition_to(Processing));
+        assert!(Processing.can_transition_to(Idle));
+        assert!(Processing.can_transition_to(AwaitingApproval));
+        assert!(Processing.can_transition_to(Interrupted));
+        assert!(AwaitingApproval.can_transition_to(Idle));
+        assert!(AwaitingApproval.can_transition_to(Processing));
+        assert!(AwaitingApproval.can_transition_to(Interrupted));
+        assert!(Interrupted.can_transition_to(Idle));
+
+        // Invalid transitions
+        assert!(!Idle.can_transition_to(Idle));
+        assert!(!Idle.can_transition_to(AwaitingApproval));
+        assert!(!Idle.can_transition_to(Interrupted));
+        assert!(!Idle.can_transition_to(Completed));
+        assert!(!Processing.can_transition_to(Processing));
+        assert!(!Processing.can_transition_to(Completed));
+        assert!(!AwaitingApproval.can_transition_to(AwaitingApproval));
+        assert!(!Interrupted.can_transition_to(Processing));
+        assert!(!Interrupted.can_transition_to(Interrupted));
+        assert!(!Completed.can_transition_to(Idle));
+        assert!(!Completed.can_transition_to(Processing));
+    }
+
+    #[test]
+    fn thread_state_is_private() {
+        let thread = Thread::new(Uuid::new_v4());
+        // Can read via accessor
+        assert_eq!(thread.state(), ThreadState::Idle);
+    }
+
+    #[test]
+    fn set_processing_validates_transition() {
+        let mut thread = Thread::new(Uuid::new_v4());
+
+        // Idle → Processing: valid
+        assert!(thread.set_processing().is_ok());
+        assert_eq!(thread.state(), ThreadState::Processing);
+
+        // Processing → Processing: invalid
+        assert!(thread.set_processing().is_err());
+
+        // Complete the turn so we can test from AwaitingApproval
+        thread.complete_turn("done");
+
+        // AwaitingApproval → Processing: valid
+        thread.start_turn("test");
+        thread.await_approval(PendingApproval {
+            request_id: Uuid::new_v4(),
+            tool_name: "echo".into(),
+            parameters: serde_json::json!({}),
+            display_parameters: serde_json::json!({}),
+            description: "test".into(),
+            tool_call_id: "tc1".into(),
+            context_messages: vec![],
+            deferred_tool_calls: vec![],
+            user_timezone: None,
+        });
+        assert_eq!(thread.state(), ThreadState::AwaitingApproval);
+        assert!(thread.set_processing().is_ok());
+        assert_eq!(thread.state(), ThreadState::Processing);
     }
 }

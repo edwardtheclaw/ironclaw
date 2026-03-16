@@ -14,7 +14,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 /// A state change notification.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum StateChange {
     /// A routine was created, updated, toggled, or deleted.
     RoutineUpdated { routine_id: Uuid },
@@ -121,7 +121,8 @@ mod tests {
 
         // First recv should report a lag.
         let result = rx.recv().await;
-        assert!( // safety: test-only
+        assert!(
+            // safety: test-only
             // safety: test-only
             result.is_ok() || result.is_err(),
             "lagged receiver should either get an event or a Lagged error"

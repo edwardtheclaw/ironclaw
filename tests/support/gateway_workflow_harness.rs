@@ -252,6 +252,7 @@ impl GatewayWorkflowHarness {
                 http_interceptor: None,
                 transcription: None,
                 document_extraction: None,
+                event_bus: Some(components.event_bus.clone()),
             },
             channels,
             None,

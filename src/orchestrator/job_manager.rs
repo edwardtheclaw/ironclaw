@@ -94,6 +94,17 @@ pub enum ContainerState {
     Failed,
 }
 
+impl ContainerState {
+    /// Check whether a transition from this state to `target` is valid.
+    pub fn can_transition_to(self, target: ContainerState) -> bool {
+        use ContainerState::*;
+        matches!(
+            (self, target),
+            (Creating, Running) | (Creating, Failed) | (Running, Stopped) | (Running, Failed)
+        )
+    }
+}
+
 impl std::fmt::Display for ContainerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -110,7 +121,8 @@ impl std::fmt::Display for ContainerState {
 pub struct ContainerHandle {
     pub job_id: Uuid,
     pub container_id: String,
-    pub state: ContainerState,
+    /// Private — use `state()` to read, `mark_running()`/`mark_stopped()`/`mark_failed()` to mutate.
+    state: ContainerState,
     pub mode: JobMode,
     pub created_at: DateTime<Utc>,
     pub project_dir: Option<PathBuf>,
@@ -123,6 +135,49 @@ pub struct ContainerHandle {
     pub completion_result: Option<CompletionResult>,
     // NOTE: auth_token is intentionally NOT in this struct.
     // It lives only in the TokenStore (never logged, serialized, or persisted).
+}
+
+impl ContainerHandle {
+    /// Create a new container handle in `Creating` state.
+    pub fn new(
+        job_id: Uuid,
+        mode: JobMode,
+        task_description: String,
+        project_dir: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            job_id,
+            container_id: String::new(),
+            state: ContainerState::Creating,
+            mode,
+            created_at: Utc::now(),
+            project_dir,
+            task_description,
+            last_worker_status: None,
+            worker_iteration: 0,
+            completion_result: None,
+        }
+    }
+
+    /// Get the current container state.
+    pub fn state(&self) -> ContainerState {
+        self.state
+    }
+
+    /// Transition from Creating to Running.
+    pub fn mark_running(&mut self) {
+        self.state = ContainerState::Running;
+    }
+
+    /// Transition to Stopped.
+    pub fn mark_stopped(&mut self) {
+        self.state = ContainerState::Stopped;
+    }
+
+    /// Transition to Failed.
+    pub fn mark_failed(&mut self) {
+        self.state = ContainerState::Failed;
+    }
 }
 
 /// Result reported by a worker on completion.
@@ -265,18 +320,7 @@ impl ContainerJobManager {
             .await;
 
         // Record the handle
-        let handle = ContainerHandle {
-            job_id,
-            container_id: String::new(), // set after container creation
-            state: ContainerState::Creating,
-            mode,
-            created_at: Utc::now(),
-            project_dir: project_dir.clone(),
-            task_description: task.to_string(),
-            last_worker_status: None,
-            worker_iteration: 0,
-            completion_result: None,
-        };
+        let handle = ContainerHandle::new(job_id, mode, task.to_string(), project_dir.clone());
         self.containers.write().await.insert(job_id, handle);
 
         // Run the actual container creation. On any failure, revoke the token
@@ -450,7 +494,7 @@ impl ContainerJobManager {
         // Update handle with container ID
         if let Some(handle) = self.containers.write().await.get_mut(&job_id) {
             handle.container_id = container_id;
-            handle.state = ContainerState::Running;
+            handle.mark_running();
         }
 
         tracing::info!(
@@ -507,7 +551,7 @@ impl ContainerJobManager {
 
         // Update state
         if let Some(handle) = self.containers.write().await.get_mut(&job_id) {
-            handle.state = ContainerState::Stopped;
+            handle.mark_stopped();
         }
 
         // Revoke the auth token
@@ -530,7 +574,7 @@ impl ContainerJobManager {
             let mut containers = self.containers.write().await;
             if let Some(handle) = containers.get_mut(&job_id) {
                 handle.completion_result = Some(result);
-                handle.state = ContainerState::Stopped;
+                handle.mark_stopped();
             }
         }
 
@@ -680,22 +724,12 @@ mod tests {
 
         // Insert a handle
         {
+            let mut handle =
+                ContainerHandle::new(job_id, JobMode::Worker, "test job".to_string(), None);
+            handle.container_id = "test".to_string();
+            handle.mark_running();
             let mut containers = mgr.containers.write().await;
-            containers.insert(
-                job_id,
-                ContainerHandle {
-                    job_id,
-                    container_id: "test".to_string(),
-                    state: ContainerState::Running,
-                    mode: JobMode::Worker,
-                    created_at: chrono::Utc::now(),
-                    project_dir: None,
-                    task_description: "test job".to_string(),
-                    last_worker_status: None,
-                    worker_iteration: 0,
-                    completion_result: None,
-                },
-            );
+            containers.insert(job_id, handle);
         }
 
         mgr.update_worker_status(job_id, Some("Iteration 3".to_string()), 3)

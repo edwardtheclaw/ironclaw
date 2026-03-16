@@ -118,7 +118,8 @@ mod tests {
     fn test_endpoint_health_becomes_unhealthy() {
         let h = EndpointHealth::new();
         for i in 0..4 {
-            assert!( // safety: test-only
+            assert!(
+                // safety: test-only
                 // safety: test-only
                 !h.record_failure(5),
                 "should not be unhealthy at failure {}",

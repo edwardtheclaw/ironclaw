@@ -463,7 +463,7 @@ impl CreateJobTool {
             }
 
             match jm.get_handle(job_id).await {
-                Some(handle) => match handle.state {
+                Some(handle) => match handle.state() {
                     crate::orchestrator::job_manager::ContainerState::Running
                     | crate::orchestrator::job_manager::ContainerState::Creating => {
                         tokio::time::sleep(poll_interval).await;
