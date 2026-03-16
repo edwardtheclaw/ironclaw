@@ -118,9 +118,13 @@ impl PtcScriptTool {
         if output.len() <= MAX_OUTPUT_SIZE {
             output.to_string()
         } else {
+            let mut i = MAX_OUTPUT_SIZE;
+            while i > 0 && !output.is_char_boundary(i) {
+                i -= 1;
+            }
             format!(
                 "{}\n\n[Output truncated at {} bytes]",
-                &output[..MAX_OUTPUT_SIZE],
+                &output[..i],
                 MAX_OUTPUT_SIZE
             )
         }
@@ -333,6 +337,24 @@ mod tests {
         let truncated = PtcScriptTool::truncate_output(&long);
         assert!(truncated.len() < long.len());
         assert!(truncated.contains("[Output truncated"));
+    }
+
+    #[test]
+    fn test_truncate_output_multibyte_boundary() {
+        // Build a string of multi-byte chars (emoji = 4 bytes each) that crosses MAX_OUTPUT_SIZE
+        let emoji = "\u{1F600}"; // 4 bytes
+        let count = MAX_OUTPUT_SIZE / emoji.len() + 10;
+        let long: String = emoji.repeat(count);
+        assert!(long.len() > MAX_OUTPUT_SIZE);
+
+        let truncated = PtcScriptTool::truncate_output(&long);
+        // Must not panic and must contain valid UTF-8
+        assert!(truncated.contains("[Output truncated"));
+        // The kept portion must end on a char boundary (valid UTF-8 guaranteed by compilation)
+        let kept = truncated.split("\n\n[Output truncated").next().unwrap();
+        assert!(kept.len() <= MAX_OUTPUT_SIZE);
+        // Every char should be complete (no partial emoji)
+        assert!(kept.chars().all(|c| c == '\u{1F600}'));
     }
 
     #[test]

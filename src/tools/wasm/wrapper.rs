@@ -46,7 +46,7 @@ struct NestingGuard<'a> {
 
 impl Drop for NestingGuard<'_> {
     fn drop(&mut self) {
-        *self.depth -= 1;
+        *self.depth = self.depth.saturating_sub(1);
     }
 }
 

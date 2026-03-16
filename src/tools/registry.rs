@@ -157,6 +157,8 @@ impl ToolRegistry {
     pub fn set_tool_executor(&self, executor: Arc<ToolExecutor>) {
         if let Ok(mut guard) = self.tool_executor_slot.write() {
             *guard = Some(executor);
+        } else {
+            tracing::error!("tool_executor_slot RwLock is poisoned; PTC will be unavailable");
         }
     }
 
