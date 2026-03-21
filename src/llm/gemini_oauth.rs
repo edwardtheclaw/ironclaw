@@ -68,13 +68,6 @@ const STATE_CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVW
 /// Matches the value used by the official Gemini CLI.
 const SYNTHETIC_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
 
-/// Mid-stream retry options matching the official Gemini CLI behavior.
-/// Used internally by `send_request` for SSE stream error recovery.
-#[allow(dead_code)]
-const MID_STREAM_MAX_ATTEMPTS: u32 = 4;
-#[allow(dead_code)]
-const MID_STREAM_INITIAL_DELAY_MS: u64 = 1000;
-
 /// Default safety settings matching Gemini CLI defaults.
 /// BLOCK_NONE allows all content through — the agent's own safety layer handles filtering.
 fn default_safety_settings() -> Vec<serde_json::Value> {
@@ -1013,56 +1006,63 @@ impl GeminiOauthProvider {
     /// Mirrors `extractCuratedHistory` from the Gemini CLI.
     fn curate_contents(contents: &[serde_json::Value]) -> Vec<serde_json::Value> {
         let mut curated = Vec::new();
-        let mut i = 0;
-        while i < contents.len() {
-            let role = contents[i]
+        for entry in contents {
+            let role = entry
                 .get("role")
                 .and_then(|r| r.as_str())
                 .unwrap_or("");
-            if role == "user" {
-                curated.push(contents[i].clone());
-                i += 1;
-            } else {
-                // Collect consecutive model turns
-                let mut model_outputs = Vec::new();
-                let mut all_valid = true;
-                while i < contents.len() {
-                    let r = contents[i]
-                        .get("role")
-                        .and_then(|r| r.as_str())
-                        .unwrap_or("");
-                    if r != "model" {
-                        break;
-                    }
-                    model_outputs.push(contents[i].clone());
-                    // Check validity: parts must exist, not be empty, and have non-empty text
-                    if let Some(parts) = contents[i].get("parts").and_then(|p| p.as_array()) {
-                        if parts.is_empty() {
-                            all_valid = false;
-                        }
-                        for part in parts {
-                            if part.as_object().is_some_and(|o| o.is_empty()) {
-                                all_valid = false;
-                            }
-                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                let is_thought = part
-                                    .get("thought")
-                                    .and_then(|t| t.as_bool())
-                                    .unwrap_or(false);
-                                if !is_thought && text.is_empty() {
-                                    all_valid = false;
-                                }
-                            }
-                        }
-                    } else {
-                        all_valid = false;
-                    }
-                    i += 1;
-                }
-                if all_valid {
-                    curated.extend(model_outputs);
-                }
+
+            if role != "model" {
+                // Always keep non-model turns (user, tool-response)
+                curated.push(entry.clone());
+                continue;
             }
+
+            // For model turns: filter out invalid parts instead of dropping the
+            // entire turn.  A turn with functionCall parts must survive even if
+            // an accompanying text part is empty.
+            let Some(parts) = entry.get("parts").and_then(|p| p.as_array()) else {
+                // No parts array at all — skip the turn.
+                continue;
+            };
+
+            let valid_parts: Vec<&serde_json::Value> = parts
+                .iter()
+                .filter(|part| {
+                    // Drop empty objects `{}`
+                    if part.as_object().is_some_and(|o| o.is_empty()) {
+                        return false;
+                    }
+                    // Drop non-thought text parts with empty text, but only when
+                    // the part carries no other content (e.g. functionCall).
+                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                        let is_thought = part
+                            .get("thought")
+                            .and_then(|t| t.as_bool())
+                            .unwrap_or(false);
+                        if !is_thought
+                            && text.is_empty()
+                            && part.get("functionCall").is_none()
+                        {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect();
+
+            if valid_parts.is_empty() {
+                // All parts were invalid — drop the turn entirely.
+                continue;
+            }
+
+            let mut turn = entry.clone();
+            if valid_parts.len() != parts.len() {
+                // Rebuild parts array with only valid parts.
+                turn["parts"] =
+                    serde_json::Value::Array(valid_parts.into_iter().cloned().collect());
+            }
+            curated.push(turn);
         }
         curated
     }
@@ -2522,5 +2522,70 @@ mod tests {
             .expect("Missing text");
         assert!(text.contains("System 1"));
         assert!(text.contains("System 2"));
+    }
+
+    #[test]
+    fn test_curate_contents_preserves_tool_call_with_empty_text() {
+        // Regression: curate_contents must not drop model turns that contain
+        // functionCall parts just because an accompanying text part is empty.
+        let contents = vec![
+            serde_json::json!({
+                "role": "user",
+                "parts": [{ "text": "call the tool" }]
+            }),
+            serde_json::json!({
+                "role": "model",
+                "parts": [
+                    { "text": "" },
+                    { "functionCall": { "name": "echo", "args": { "msg": "hi" } } }
+                ]
+            }),
+            serde_json::json!({
+                "role": "user",
+                "parts": [{ "functionResponse": { "name": "echo", "response": { "output": "hi" } } }]
+            }),
+        ];
+
+        let curated = GeminiOauthProvider::curate_contents(&contents);
+        assert_eq!(curated.len(), 3, "All 3 turns should be preserved");
+
+        // The model turn should keep the functionCall part but drop the empty text
+        let model_parts = curated[1]
+            .get("parts")
+            .and_then(|p| p.as_array())
+            .expect("model turn should have parts");
+        assert_eq!(
+            model_parts.len(),
+            1,
+            "Empty text part should be filtered out"
+        );
+        assert!(
+            model_parts[0].get("functionCall").is_some(),
+            "functionCall part should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_curate_contents_drops_fully_invalid_turn() {
+        // A model turn where ALL parts are invalid should be dropped.
+        let contents = vec![
+            serde_json::json!({
+                "role": "user",
+                "parts": [{ "text": "hello" }]
+            }),
+            serde_json::json!({
+                "role": "model",
+                "parts": [{ "text": "" }]
+            }),
+            serde_json::json!({
+                "role": "user",
+                "parts": [{ "text": "again" }]
+            }),
+        ];
+
+        let curated = GeminiOauthProvider::curate_contents(&contents);
+        assert_eq!(curated.len(), 2, "Invalid model turn should be dropped");
+        assert_eq!(curated[0]["parts"][0]["text"], "hello");
+        assert_eq!(curated[1]["parts"][0]["text"], "again");
     }
 }
