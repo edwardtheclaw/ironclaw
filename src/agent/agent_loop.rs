@@ -1003,15 +1003,22 @@ impl Agent {
             }
         }
 
-        // Hydrate thread from DB if it's a historical thread not in memory
+        // Hydrate thread from DB if it's a historical thread not in memory.
+        // Capture the parsed UUID to avoid redundant re-parsing downstream.
+        let mut parsed_thread_uuid: Option<Uuid> = None;
         if let Some(external_thread_id) = message.conversation_scope() {
             tracing::trace!(
                 message_id = %message.id,
                 thread_id = %external_thread_id,
                 "Hydrating thread from DB"
             );
-            if let Some(rejection) = self.maybe_hydrate_thread(message, external_thread_id).await {
-                return Ok(Some(format!("Error: {}", rejection)));
+            match self.maybe_hydrate_thread(message, external_thread_id).await {
+                Ok(uuid) => {
+                    parsed_thread_uuid = uuid;
+                }
+                Err(rejection) => {
+                    return Ok(Some(format!("Error: {}", rejection)));
+                }
             }
         }
 
@@ -1023,9 +1030,7 @@ impl Agent {
             submission,
             Submission::ExecApproval { .. } | Submission::ApprovalResponse { .. }
         ) {
-            message
-                .conversation_scope()
-                .and_then(|thread_id| Uuid::parse_str(thread_id).ok())
+            parsed_thread_uuid
         } else {
             None
         };
@@ -1052,19 +1057,21 @@ impl Agent {
             } else {
                 drop(sess);
                 self.session_manager
-                    .resolve_thread(
+                    .resolve_thread_with_parsed_uuid(
                         &message.user_id,
                         &message.channel,
                         message.conversation_scope(),
+                        parsed_thread_uuid,
                     )
                     .await
             }
         } else {
             self.session_manager
-                .resolve_thread(
+                .resolve_thread_with_parsed_uuid(
                     &message.user_id,
                     &message.channel,
                     message.conversation_scope(),
+                    parsed_thread_uuid,
                 )
                 .await
         };
