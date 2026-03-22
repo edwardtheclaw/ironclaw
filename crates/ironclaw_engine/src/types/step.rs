@@ -41,10 +41,11 @@ pub enum StepStatus {
 /// Which execution tier handles the step's code/actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionTier {
-    /// Tier 0: structured tool calls (MVP).
+    /// Tier 0: structured tool calls.
     Structured,
+    /// Tier 1: embedded Python via Monty.
+    Scripting,
     // Future tiers:
-    // Scripting,  // Tier 1: embedded Starlark/Rhai
     // Wasm,       // Tier 2: WASM sandbox
     // Container,  // Tier 3: Docker container
 }
@@ -84,7 +85,7 @@ impl Step {
 
 // ── LLM response types ─────────────────────────────────────
 
-/// Response from the LLM: either text or action calls.
+/// Response from the LLM: text, action calls, or executable code.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LlmResponse {
     /// Final text response.
@@ -92,6 +93,13 @@ pub enum LlmResponse {
     /// One or more action calls (with optional reasoning text).
     ActionCalls {
         calls: Vec<ActionCall>,
+        content: Option<String>,
+    },
+    /// Executable Python code (CodeAct). Tool calls happen as function
+    /// calls within the code; the runtime suspends at each one and
+    /// delegates to the EffectExecutor.
+    Code {
+        code: String,
         content: Option<String>,
     },
 }

@@ -25,7 +25,9 @@ IronClaw currently has Session, Job, Routine, Channel, Tool, Skill, Hook, Observ
 4. **Effects, not commands** — capabilities declare their effect types; a deterministic policy engine enforces boundaries
 5. **Memory is docs, not logs** — durable knowledge is structured (summaries, lessons, playbooks), not raw history
 6. **CodeAct for capable models** — LLMs write code that composes tools, queries history, and spawns threads
-7. **Event sourcing from day one** — every thread records a complete execution trace for replay/debugging/reflection
+7. **Context as variable, not attention input** (RLM pattern) — thread context is a Python variable in the REPL, not tokens in the LLM window. The model writes code to selectively access it, avoiding context rot on long inputs
+8. **Recursive subagent spawning** (RLM pattern) — code can call `llm_query()` to spawn child threads inline. Results are stored as variables, not injected into the parent's context window
+9. **Event sourcing from day one** — every thread records a complete execution trace for replay/debugging/reflection
 
 ## The Five Primitives
 
@@ -86,7 +88,7 @@ crates/ironclaw_engine/
       mod.rs
       loop_engine.rs          # ExecutionLoop (core loop replacing run_agentic_loop)
       structured.rs           # Tier 0: structured tool calls
-      scripting.rs            # Tier 1: embedded Starlark/Rhai (Phase 3)
+      scripting.rs            # Tier 1: embedded Python via Monty (Phase 3)
       context.rs              # Context builder (thread state + project docs + capabilities)
       intent.rs               # Tool intent nudge detection
 
@@ -109,7 +111,7 @@ crates/ironclaw_engine/
 
 Dependencies (minimal — no main crate dependency):
 - `tokio` (sync, time, macros, rt), `serde` + `serde_json`, `thiserror`, `tracing`, `uuid`, `chrono`, `async-trait`
-- Phase 3 adds: `starlark` or `rhai` (embedded scripting)
+- `monty` (git dep) — embedded Python interpreter for CodeAct (Tier 1)
 
 ---
 
@@ -242,80 +244,124 @@ cargo test
 
 ---
 
-## Phase 3: CodeAct Executor (Tier 1 — Embedded Scripting)
+## Phase 3: CodeAct Executor (Tier 1 — Monty Python + RLM Pattern)
 
-**Goal:** LLMs can write code (Starlark or Rhai) that composes tools, uses control flow, and queries thread context. This is the key differentiator from the current tool-call model.
+**Goal:** LLMs write Python code that composes tools, uses control flow, queries thread context as data, and recursively spawns sub-agents. Uses the Monty interpreter (Pydantic) for sandboxed in-process execution. Follows the Recursive Language Model (RLM) pattern: context as a variable, not attention input.
 
-### 3.1 Code runner trait
-```rust
-#[async_trait]
-pub trait CodeRunner: Send + Sync {
-    async fn execute(
-        &self,
-        code: &str,
-        runtime_api: &dyn RuntimeApi,
-        config: &CodeRunnerConfig,
-    ) -> Result<CodeResult, EngineError>;
-}
-```
+**Status:** Implemented (Phases 3.1–3.3). Phases 3.4–3.5 are the RLM enhancements.
 
-### 3.2 Runtime API
-The API surface that code executes against:
+### 3.1 Monty integration (DONE)
+
+`executor/scripting.rs` — Embeds the Monty Python interpreter (git dep, v0.0.8).
+
+**Execution model:**
+1. `MontyRun::new(code, "step.py", input_names)` — parse Python code
+2. `runner.start(inputs, tracker, print_writer)` — begin execution with resource limits
+3. Loop over `RunProgress` suspension points:
+   - `FunctionCall` → find lease → check policy → call `EffectExecutor` → resume with result
+   - `NameLookup` → resolve or raise `NameError`
+   - `OsCall` → deny with `OSError`
+   - `ResolveFutures` → error (async not supported)
+   - `Complete` → return value + captured stdout
+4. All execution wrapped in `catch_unwind` (Monty 0.0.x can panic)
+
+**Resource limits:** 30s timeout, 64MB memory, 1M allocations, recursion depth 1000.
+
+**Tool dispatch:** Unknown function calls in Python suspend the VM via `RunProgress::FunctionCall`. The engine routes through the same lease → policy → `EffectExecutor` pipeline as structured tool calls:
 ```python
-# Thread operations (read-only access to thread state)
-thread.messages                    # list of messages
-thread.messages[-1]                # last message
-thread.messages.filter(role="tool") # filter by role
-thread.goal                        # thread's goal
-thread.state                       # current state
-
-# Capability actions (tool calls)
-tools.web_fetch(url="...")         # invoke capability action
-tools.memory_search(query="...")   # invoke capability action
-result = tools.shell(cmd="...")    # invoke capability action
-
-# Output
-thread.reply("response")          # send final response
-thread.think("note")              # add to context, not visible to user
-
-# Thread spawning
-child = thread.spawn(goal="...", capabilities=["web_fetch"])
-results = thread.join([child1, child2, child3])  # fan-out/fan-in
+result = web_fetch(url="https://example.com")   # suspends → EffectExecutor
+data = memory_search(query="deployment")          # suspends → EffectExecutor
+for item in result["items"]:                      # control flow in Python
+    memory_write(key=item["id"], value=item["summary"])
 ```
 
-### 3.3 Tier selection
-The executor analyzes the LLM response to route:
-- JSON tool calls → Tier 0 (structured, existing path)
-- Code block with only `tools.*` calls → Tier 1 (embedded scripting)
-- Code with `import os`, `tools.shell` → Tier 3 (Docker, Phase 6)
+**Type conversion:** `monty_to_json()` / `json_to_monty()` bidirectional conversion between `MontyObject` and `serde_json::Value`.
 
-### 3.4 Starlark/Rhai integration
-Add `starlark` or `rhai` as dependency. Implement `CodeRunner`:
-- Parse code
-- Bind `thread.*` and `tools.*` namespaces to Rust callbacks
-- Fuel metering (prevent infinite loops)
-- Execute with timeout
-- Capture output + side effects
+### 3.2 LlmResponse::Code variant (DONE)
 
-### 3.5 Prompt transformation
-When CodeAct is enabled, the system prompt changes from prose tool descriptions to API documentation:
+New `LlmResponse::Code { code, content }` variant alongside `Text` and `ActionCalls`. The `ExecutionLoop` routes `Code` responses to `scripting::execute_code()` instead of `structured::execute_action_calls()`.
+
+### 3.3 ExecutionLoop integration (DONE)
+
+The loop handles `LlmResponse::Code`:
+- Records assistant message with code
+- Sets `step.tier = ExecutionTier::Scripting`
+- Executes via `scripting::execute_code()`
+- Records events and action results
+- Captures stdout + return value as context for next iteration
+- Handles `NeedApproval` outcome (pauses thread)
+
+### 3.4 RLM: Context as variables (TO IMPLEMENT)
+
+Inspired by Recursive Language Models (arXiv:2512.24601). The key insight: **the prompt is an environment variable, not attention input.** The LLM never sees the full thread context in its window — it writes code to access it selectively.
+
+**Implementation:**
+- Pass thread state as Monty input variables via `MontyRun::new(code, "step.py", input_names)`:
+  - `context` — full thread message history as a Python list of dicts
+  - `goal` — the thread's goal string
+  - `step_number` — current step index
+  - `previous_results` — dict of `{call_id: result}` from prior steps
+- Use compact output metadata between code steps: `"[code output: 4,532 chars]"` instead of full stdout in chat history
+- The LLM's chat context stays lean; the full data lives in REPL variables
+
+**Before (current):** Full context in LLM attention window
 ```
-Available API:
-  tools.web_fetch(url: str, headers: dict = None) -> Response
-  tools.memory_search(query: str, limit: int = 10) -> List[Memory]
-  thread.reply(content: str)
-  thread.spawn(goal: str, capabilities: list = None) -> Thread
-
-Write code to accomplish the user's request.
+System: You are an agent...
+User: Analyze these 1000 items...
+[1000 items in context]
+Assistant: ```python result = web_fetch(...)```
 ```
+
+**After (RLM pattern):** Context as a variable
+```
+System: You have access to `context` (1000 items) and `previous_results`.
+Write Python to accomplish the goal.
+Assistant: ```python
+items = context  # never loaded into LLM window
+for batch in [items[i:i+100] for i in range(0, len(items), 100)]:
+    result = llm_query("summarize these items", batch)
+    # result is a variable, not injected into parent context
+```
+
+### 3.5 RLM: Recursive `llm_query()` within code (TO IMPLEMENT)
+
+Expose `llm_query(prompt, context)` as a callable inside the Monty environment. When code calls it, Monty suspends via `FunctionCall`. The engine:
+1. Spawns a child thread with the given prompt and context
+2. Runs the child to completion (inline, blocking the parent's code)
+3. Returns the child's result as a `MontyObject`
+
+This enables the core RLM patterns:
+```python
+# Partition + Map + Reduce
+chunks = [context[i:i+1000] for i in range(0, len(context), 1000)]
+summaries = []
+for chunk in chunks:
+    summary = llm_query("Summarize this section", chunk)
+    summaries.append(summary)  # variable, not in parent's LLM context
+final = llm_query("Combine these summaries", summaries)
+
+# Verification
+answer = llm_query("What is X?", context)
+verified = llm_query(f"Is this answer correct: {answer}", context)
+```
+
+**Key RLM properties preserved:**
+- **Symbolic handle to context** — the parent LLM never sees child outputs in its attention window
+- **Unbounded output** — variables in the REPL can exceed the context window
+- **Recursive decomposition** — the model decides how to partition work, not the architect
 
 ### 3.6 Tests
-- Simple code: `tools.web_fetch(url="...")` → action executed, result captured
-- Control flow: `for item in tools.search(...): tools.memory_write(...)` → multiple actions
-- Thread data access: `thread.messages[-1].content` → correct value
-- Fuel exhaustion: infinite loop → timeout error
-- Tier selection: structured JSON → Tier 0, code block → Tier 1
-- Error handling: code raises exception → step fails gracefully
+- **Simple code execution:** `x = 1 + 2` → returns 3, no tool calls
+- **Tool call from code:** `result = web_fetch(url="...")` → `FunctionCall` suspension → effect executor called → result returned to Python
+- **Multiple tool calls in loop:** `for i in range(3): fetch(url=urls[i])` → 3 effect executor calls
+- **Context as variable:** Code accesses `context[0]` → correct value from thread messages
+- **Compact metadata:** After code step, context has metadata summary not full stdout
+- **`llm_query()` recursive call:** Code calls `llm_query("summarize", data)` → child thread spawned → result returned as variable
+- **Resource limits:** Infinite loop → Monty `TimeoutError`
+- **OS call denied:** `import os; os.listdir(".")` → `OSError`
+- **VM panic recovery:** Monty panics → `catch_unwind` returns `EngineError`, thread doesn't crash
+- **Policy deny in code:** Code calls denied action → Python `RuntimeError` raised
+- **Approval needed in code:** Code calls approval-required action → `NeedApproval` returned, code halted
 
 ---
 

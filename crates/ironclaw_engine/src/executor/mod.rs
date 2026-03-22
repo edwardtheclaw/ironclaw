@@ -8,6 +8,7 @@
 pub mod context;
 pub mod intent;
 pub mod loop_engine;
+pub mod scripting;
 pub mod structured;
 
 pub use loop_engine::ExecutionLoop;

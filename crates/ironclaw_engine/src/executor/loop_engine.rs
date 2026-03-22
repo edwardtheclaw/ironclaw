@@ -21,7 +21,7 @@ use crate::traits::llm::{LlmBackend, LlmCallConfig};
 use crate::types::error::EngineError;
 use crate::types::event::EventKind;
 use crate::types::message::ThreadMessage;
-use crate::types::step::{LlmResponse, Step, StepStatus};
+use crate::types::step::{ExecutionTier, LlmResponse, Step, StepStatus};
 use crate::types::thread::{Thread, ThreadState};
 
 /// The core execution loop for a thread.
@@ -211,6 +211,82 @@ impl ExecutionLoop {
 
                     // Check if approval is needed
                     if let Some(outcome) = batch.need_approval {
+                        self.thread
+                            .transition_to(ThreadState::Waiting, Some("awaiting approval".into()))?;
+                        return Ok(outcome);
+                    }
+                }
+
+                LlmResponse::Code { code, content } => {
+                    nudge_count = 0;
+
+                    // Record assistant message with the code
+                    self.thread.add_message(ThreadMessage::assistant(
+                        content.unwrap_or_else(|| format!("```python\n{code}\n```")),
+                    ));
+
+                    step.status = StepStatus::Executing;
+                    step.tier = ExecutionTier::Scripting;
+
+                    let exec_ctx = ThreadExecutionContext {
+                        thread_id: self.thread.id,
+                        thread_type: self.thread.thread_type,
+                        project_id: self.thread.project_id,
+                        user_id: self.user_id.clone(),
+                        step_id: step.id,
+                    };
+
+                    // Execute via Monty (with LLM for recursive llm_query)
+                    let code_result = crate::executor::scripting::execute_code(
+                        &code,
+                        &self.thread,
+                        &self.llm,
+                        &self.effects,
+                        &self.leases,
+                        &self.policy,
+                        &exec_ctx,
+                        &[],
+                    )
+                    .await?;
+
+                    // Track recursive LLM token usage
+                    self.thread.total_tokens_used +=
+                        code_result.recursive_tokens.total();
+
+                    // Record events
+                    for event_kind in code_result.events {
+                        self.thread.add_event(event_kind);
+                    }
+
+                    // Add action results as messages
+                    for result in &code_result.action_results {
+                        self.thread.add_message(ThreadMessage::action_result(
+                            &result.call_id,
+                            &result.action_name,
+                            serde_json::to_string(&result.output).unwrap_or_default(),
+                        ));
+                    }
+
+                    step.action_results = code_result.action_results;
+
+                    // Use compact metadata for output (RLM pattern:
+                    // keep LLM context lean, full data in REPL variables)
+                    let metadata = crate::executor::scripting::compact_output_metadata(
+                        &code_result.stdout,
+                        &code_result.return_value,
+                    );
+                    self.thread.add_message(ThreadMessage::system(metadata));
+
+                    step.status = StepStatus::Completed;
+                    step.completed_at = Some(chrono::Utc::now());
+                    self.thread.add_event(EventKind::StepCompleted {
+                        step_id: step.id,
+                        tokens: step.tokens_used,
+                    });
+                    self.thread.step_count += 1;
+
+                    // Check if approval is needed
+                    if let Some(outcome) = code_result.need_approval {
                         self.thread
                             .transition_to(ThreadState::Waiting, Some("awaiting approval".into()))?;
                         return Ok(outcome);

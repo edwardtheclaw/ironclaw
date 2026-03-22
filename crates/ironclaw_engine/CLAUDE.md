@@ -86,15 +86,34 @@ The engine defines three traits that the host crate implements:
 
 ## Execution Loop
 
-`ExecutionLoop::run()` mirrors `run_agentic_loop()`:
+`ExecutionLoop::run()` handles three `LlmResponse` variants:
 
 1. Check signals (Stop, InjectMessage) via `mpsc::Receiver`
 2. Build context (messages + available actions from active leases)
 3. Call LLM via `LlmBackend::complete()`
-4. If text: check tool intent nudge, return if final response
-5. If action calls: for each call, find lease → check policy → consume use → execute via `EffectExecutor` → record result
-6. Record Step, emit ThreadEvents
-7. Repeat until: text response, stop signal, max iterations, or approval needed
+4. **If `Text`**: check tool intent nudge, return if final response
+5. **If `ActionCalls`** (Tier 0): for each call, find lease → check policy → consume use → execute via `EffectExecutor` → record result
+6. **If `Code`** (Tier 1): execute Python via Monty with context-as-variables and `llm_query()` support → compact metadata in context
+7. Record Step, emit ThreadEvents
+8. Repeat until: text response, stop signal, max iterations, or approval needed
+
+## CodeAct / Monty Integration (Tier 1)
+
+Python execution via Monty interpreter (`executor/scripting.rs`). Follows the RLM (Recursive Language Model) pattern.
+
+**Context as variables** (not attention input):
+- Thread messages injected as `context` Python variable
+- Thread goal as `goal`, step index as `step_number`
+- Prior action results as `previous_results` dict
+- The LLM's chat context stays lean; full data lives in REPL variables
+
+**Tool dispatch**: Unknown function calls suspend the VM → lease check → policy check → `EffectExecutor` → result returned to Python.
+
+**`llm_query(prompt, context)`**: Recursive subagent call. Suspends VM → spawns single-shot LLM call → returns text result as Python string. Results stay as variables (symbolic composition), not injected into parent's attention window.
+
+**Compact output metadata**: Between code steps, only a summary is added to chat context (`"[code output] stdout (4532 chars): The results show..."`) — not the full output. This prevents context bloat across iterations.
+
+**Resource limits**: 30s timeout, 64MB memory, 1M allocations. All execution wrapped in `catch_unwind` for Monty panic safety.
 
 ## Capability Leases
 
@@ -125,8 +144,9 @@ CredentialedNetwork, Compute, Financial
 1. **No dependency on main `ironclaw` crate** — clean separation, testable in isolation
 2. **No safety logic** — sanitization/leak detection is applied at the adapter boundary (`EffectExecutor` impl)
 3. **Event sourcing from day one** — every thread records a complete event log via `ThreadEvent`
-4. **Tier 0 only (MVP)** — structured tool calls. CodeAct (Tier 1-3) added in Phase 3
+4. **Tier 0 + Tier 1** — structured tool calls (Tier 0) and embedded Python via Monty (Tier 1, CodeAct)
 5. **Engine owns its message type** — `ThreadMessage` is simpler than `ChatMessage`; bridge adapters handle conversion
+6. **RLM pattern** — context as variable (not attention input), recursive `llm_query()`, compact output metadata between steps
 
 ## Code Style
 
