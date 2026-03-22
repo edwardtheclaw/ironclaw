@@ -326,64 +326,31 @@ The existing `Channel` trait stays. A bridge adapter translates:
 
 ---
 
-## Phase 6: Advanced Execution (Tier 2-3 + Two-Phase Commit)
+## Phase 6: Main Crate Integration
 
-**Goal:** Full CodeAct with WASM sandbox (Tier 2) and Docker container (Tier 3). Two-phase commit for high-stakes effects.
+**Goal:** Bridge adapters connect the engine to existing IronClaw infrastructure. Prove the engine works end-to-end via acceptance tests.
 
-### 6.1 Tier 2: WASM sandbox
-- Leverage existing `wasmtime` infrastructure from `src/tools/wasm/`
-- Fuel metering, memory limits, network allowlisting (all existing)
-- Runtime API exposed via WIT interface (extend existing `wit/tool.wit`)
-- Candidate runtimes: RustPython compiled to WASM, or Monty if it gains WASM support
+### 6.1 Bridge adapters (`src/bridge/`)
+- `LlmBridgeAdapter` — wraps `Arc<dyn LlmProvider>`, converts `ThreadMessage` ↔ `ChatMessage`, `ActionDef` ↔ `ToolDefinition`. Implements depth-based model routing via existing `cheap_llm` in `AgentDeps`
+- `StoreBridgeAdapter` — wraps `Arc<dyn Database>`, maps engine CRUD to existing sub-traits. New tables for threads/projects/docs/leases/events (migration V14+)
+- `EffectBridgeAdapter` — wraps `ToolRegistry` + `SafetyLayer`. On `execute_action()`: lookup tool → validate params → execute → sanitize output → return. Safety logic lives here, not in the engine
 
-### 6.2 Tier 3: Docker container
-- Leverage existing `src/sandbox/` + `src/orchestrator/` infrastructure
-- Full CPython with pip packages, shell access, filesystem
-- `llm_query()` / `llm_query_batched()` / tool calls available via HTTP proxy to orchestrator
-- Network access through existing sandbox proxy (domain allowlist, credential injection)
-- This is the production path for complex CodeAct (data science, system admin, etc.)
+### 6.2 Database migrations
+New tables (both PostgreSQL and libSQL):
+- `engine_threads`, `engine_steps`, `engine_events`, `engine_projects`, `engine_memory_docs`, `engine_capability_leases`
 
-### 6.3 Automatic tier selection
-Analyze LLM-generated code statically or try-and-promote:
-- Pure function calls, no I/O → Tier 1 (Monty, in-process)
-- Uses HTTP/network tools → Tier 2 (WASM, allowlisted network)
-- Uses `import os`, shell, filesystem, pip packages → Tier 3 (Docker)
-- Falls back gracefully: if Tier 1 fails with capability error, promote to Tier 3
+### 6.3 Integration strategy
+Implement `EngineV2Delegate` that wraps `ExecutionLoop` but presents the `LoopDelegate` interface. The existing dispatcher calls `run_agentic_loop()` with either ChatDelegate or EngineV2Delegate. This enables gradual migration without a flag day.
 
-### 6.4 Two-phase commit
+### 6.4 Two-phase commit for high-stakes effects
 For `WriteExternal` + `Financial` effects:
 1. **Simulate** — dry-run, return preview
 2. **Approve** — user or policy approves
 3. **Execute** — actual effect
 
-Commit policies: `Direct` (ReadLocal, ReadExternal), `Approved` (WriteExternal), `TwoPhase` (Financial, production deploys).
+Commit policies: `Direct` (ReadLocal, ReadExternal), `Approved` (WriteExternal), `TwoPhase` (Financial, production deploys). Implemented in `EffectBridgeAdapter` at the boundary.
 
-### 6.5 Tests
-- Tier selection routes correctly based on code analysis
-- WASM sandbox enforces fuel limits
-- Docker container executes with proper isolation
-- Two-phase commit: simulate returns preview, approve triggers execution
-- Tier escalation: Tier 1 failure promotes to Tier 3
-
----
-
-## Phase 7: Main Crate Integration
-
-**Goal:** Bridge adapters connect the engine to existing IronClaw infrastructure.
-
-### 7.1 Bridge adapters (`src/bridge/`)
-- `LlmBridgeAdapter` — wraps `Arc<dyn LlmProvider>`, converts `ThreadMessage` ↔ `ChatMessage`, `ActionDef` ↔ `ToolDefinition`. Implements depth-based model routing via existing `cheap_llm` in `AgentDeps`
-- `StoreBridgeAdapter` — wraps `Arc<dyn Database>`, maps engine CRUD to existing sub-traits. New tables for threads/projects/docs/leases/events (migration V14+)
-- `EffectBridgeAdapter` — wraps `ToolRegistry` + `SafetyLayer`. On `execute_action()`: lookup tool → validate params → execute → sanitize output → return. Safety logic lives here, not in the engine
-
-### 7.2 Database migrations
-New tables (both PostgreSQL and libSQL):
-- `engine_threads`, `engine_steps`, `engine_events`, `engine_projects`, `engine_memory_docs`, `engine_capability_leases`
-
-### 7.3 Integration strategy
-Implement `EngineV2Delegate` that wraps `ExecutionLoop` but presents the `LoopDelegate` interface. The existing dispatcher calls `run_agentic_loop()` with either ChatDelegate or EngineV2Delegate. This enables gradual migration without a flag day.
-
-### 7.4 Acceptance testing
+### 6.5 Acceptance testing
 Use existing `TestRig` + `TraceLlm`:
 - Load pre-recorded LLM trace fixtures
 - Drive engine via bridge adapters
@@ -392,19 +359,19 @@ Use existing `TestRig` + `TraceLlm`:
 
 When all tests pass: make engine the default, deprecate old path.
 
-### 7.5 Tests
+### 6.6 Tests
 - Bridge adapter conversion: ThreadMessage ↔ ChatMessage round-trips
 - End-to-end: TestRig drives engine, same output as old loop
 - Migration: new tables for both backends
-- Both paths compile and pass
+- Two-phase commit: simulate returns preview, approve triggers execution
 
 ---
 
-## Phase 8: Cleanup and Migration
+## Phase 7: Cleanup and Migration
 
 **Goal:** Remove old abstractions, migrate all code to engine model.
 
-### 8.1 Deprecate old types
+### 7.1 Deprecate old types
 - `Session` / `Thread` / `Turn` → engine `Thread` + `Step`
 - `JobState` / `JobContext` → engine `ThreadState` + `Thread`
 - `RoutineEngine` / `Routine` → engine `Mission` + `Thread`
@@ -412,17 +379,43 @@ When all tests pass: make engine the default, deprecate old path.
 - `HookPipeline` → engine `Capability` (policies)
 - `ApprovalRequirement` / `ApprovalContext` → engine `CapabilityLease` + `PolicyEngine`
 
-### 8.2 Slim down main crate
+### 7.2 Slim down main crate
 - Agent module becomes thin adapter over engine
 - `app.rs` orchestrates engine startup
 - Remove `LoopDelegate` and its three implementations
 - Remove `SessionManager`, `Scheduler` (replaced by `ThreadManager`)
 
-### 8.3 Sub-crate extraction
+### 7.3 Sub-crate extraction
 Once boundaries stabilize, split if beneficial:
 - `ironclaw_types` — shared types for WASM extensions
 - `ironclaw_capability` — if used by tooling/CLI independently
-- `ironclaw_codeact` — if code runner grows complex
+
+---
+
+## Phase 8: Sandboxed Execution + Infrastructure Integration
+
+**Goal:** Leverage existing IronClaw infrastructure for sandboxed execution. This is NOT about running CodeAct/RLM in different runtimes — Monty is the sole Python executor. This is about isolating threads and running third-party tools safely.
+
+### 8.1 WASM tool sandbox (existing infrastructure)
+- Third-party tools from `tools-src/` and the registry run in WASM via existing `src/tools/wasm/`
+- The engine's `EffectExecutor` bridge routes tool calls to WASM-sandboxed tools transparently
+- No change to the engine crate — this is purely adapter-layer routing in `EffectBridgeAdapter`
+- Fuel metering, memory limits, network allowlisting all come from existing `wasmtime` infrastructure
+
+### 8.2 Docker thread isolation
+- Threads tagged with `ThreadType::Research` or high-compute tasks can optionally execute inside Docker containers via existing `src/sandbox/` infrastructure
+- The `ThreadManager` bridge decides whether to spawn a thread in-process or in a container based on the thread's capability leases (if it needs `Compute` or `WriteExternal` effects, sandbox it)
+- Inside the container: Monty still executes the Python code, but the entire thread runs in isolation with credential injection via the sandbox proxy
+- Maps to existing `ContainerDelegate` pattern but unified under the thread model
+
+### 8.3 WASM channel sandbox (existing infrastructure)
+- Channel implementations (Telegram, Slack, Discord, etc.) continue running as WASM modules via existing `src/channels/wasm/`
+- `ConversationManager` bridge routes channel messages through existing `ChannelManager` → WASM channel → engine thread
+
+### 8.4 Tests
+- WASM tool executes through EffectBridgeAdapter with fuel limits
+- Docker-isolated thread completes and returns outcome to parent
+- Channel WASM module produces entries in ConversationSurface
 
 ---
 
@@ -432,9 +425,11 @@ Once boundaries stabilize, split if beneficial:
 - **Capability leases** replace static permissions. Scoped, time-limited, use-limited. Blast radius bounded
 - **Effect typing** on every action. Policy engine uses effect types for allow/deny
 - **Provenance tracking** (Phase 4). Taint analysis at effect boundaries
-- **Two-phase commit** (Phase 6) for WriteExternal + Financial effects
+- **Two-phase commit** (Phase 6) for WriteExternal + Financial effects at the adapter boundary
 - **Safety at adapter boundary**. Engine is pure orchestration; `SafetyLayer` applied in `EffectBridgeAdapter`
-- **Monty sandboxing**: no filesystem (OsCall denied), no network (no imports), resource-limited, catch_unwind for panics
+- **Monty sandboxing**: no filesystem (OsCall denied), no network (no imports), resource-limited, catch_unwind for panics. Monty is the sole CodeAct/RLM executor — no need for WASM/Docker Python runtimes
+- **WASM for third-party tools** (Phase 8). Untrusted tool code runs in wasmtime sandbox with fuel metering
+- **Docker for thread isolation** (Phase 8). High-risk threads run in containers with credential injection
 
 ### Observability
 - **Event sourcing** replaces ad-hoc `ObserverEvent`. Every thread has complete event log (16 event kinds)
@@ -466,13 +461,13 @@ Once boundaries stabilize, split if beneficial:
 | **1** | Types + traits + state machine | **DONE** | 32 | `8be19a4` |
 | **2** | Tier 0 executor + capability + runtime | **DONE** | 74 | `bf7dfb8` |
 | **3** | CodeAct (Monty + RLM pattern) | **DONE** | 74 | `b59a0b9`, `9538332` |
-| **4** | Reflection + retrieval + compaction + rlm_query + budget | Planned | — | — |
-| **5** | Conversation surface + channel integration | Planned | — | — |
-| **6** | Tier 2-3 + two-phase commit | Planned | — | — |
-| **7** | Main crate bridge + acceptance tests | Planned | — | — |
-| **8** | Cleanup + migration | Planned | — | — |
+| **4** | Budget controls + compaction + reflection | **DONE** | 78 | `4bc7ffd` |
+| **5** | Conversation surface | **DONE** | 85 | `0827235` |
+| **6** | Main crate bridge + acceptance tests | Next | — | — |
+| **7** | Cleanup + migration | Planned | — | — |
+| **8** | WASM tools + Docker isolation | Planned | — | — |
 
-Phases 4, 5, 6 can proceed in parallel. Phase 7 depends on Phase 2+ being stable. Phase 8 depends on Phase 7 passing acceptance tests.
+Phase 6 depends on Phases 1-5 being stable. Phase 7 depends on Phase 6 passing acceptance. Phase 8 is infrastructure integration with existing WASM/Docker systems.
 
 ---
 

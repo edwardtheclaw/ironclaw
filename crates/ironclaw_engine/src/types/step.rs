@@ -39,15 +39,16 @@ pub enum StepStatus {
 }
 
 /// Which execution tier handles the step's code/actions.
+///
+/// Monty is the sole CodeAct/RLM executor. WASM and Docker are used for
+/// third-party tool isolation and thread sandboxing (Phase 8), not for
+/// running LLM-generated Python.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionTier {
-    /// Tier 0: structured tool calls.
+    /// Structured tool calls (JSON action calls from LLM).
     Structured,
-    /// Tier 1: embedded Python via Monty.
+    /// Embedded Python via Monty (CodeAct/RLM pattern).
     Scripting,
-    // Future tiers:
-    // Wasm,       // Tier 2: WASM sandbox
-    // Container,  // Tier 3: Docker container
 }
 
 /// A single execution step within a thread.
