@@ -64,7 +64,10 @@ impl ExecutionLoop {
         let max_iterations = self.thread.config.max_iterations;
         let max_nudges = self.thread.config.max_tool_intent_nudges;
         let nudge_enabled = self.thread.config.enable_tool_intent_nudge;
+        let start_time = std::time::Instant::now();
         let mut nudge_count: u32 = 0;
+        let mut consecutive_errors: u32 = 0;
+        let mut compaction_count: u32 = 0;
 
         for iteration in 0..max_iterations {
             // 1. Check signals
@@ -80,24 +83,90 @@ impl ExecutionLoop {
                 }
             }
 
-            // 2. Get active leases
+            // 2. Check budget limits
+            if let Some(max_tokens) = self.thread.config.max_tokens_total
+                && self.thread.total_tokens_used >= max_tokens
+            {
+                warn!(
+                    thread_id = %self.thread.id,
+                    used = self.thread.total_tokens_used,
+                    limit = max_tokens,
+                    "token limit exceeded"
+                );
+                self.thread.transition_to(
+                    ThreadState::Completed,
+                    Some("token limit exceeded".into()),
+                )?;
+                return Ok(ThreadOutcome::Failed {
+                    error: format!(
+                        "Token limit exceeded: {} of {} tokens",
+                        self.thread.total_tokens_used, max_tokens
+                    ),
+                });
+            }
+
+            if let Some(max_dur) = self.thread.config.max_duration {
+                let elapsed = start_time.elapsed();
+                if elapsed >= max_dur {
+                    warn!(
+                        thread_id = %self.thread.id,
+                        elapsed = ?elapsed,
+                        limit = ?max_dur,
+                        "thread timeout"
+                    );
+                    self.thread
+                        .transition_to(ThreadState::Completed, Some("timeout".into()))?;
+                    return Ok(ThreadOutcome::Failed {
+                        error: format!("Thread timeout: {elapsed:?} of {max_dur:?}"),
+                    });
+                }
+            }
+
+            // 3. Check compaction
+            if self.thread.config.enable_compaction {
+                let ctx_limit = self.thread.config.model_context_limit;
+                let threshold = self.thread.config.compaction_threshold;
+                if crate::executor::compaction::should_compact(
+                    &self.thread.messages,
+                    ctx_limit,
+                    threshold,
+                ) {
+                    debug!(
+                        thread_id = %self.thread.id,
+                        compaction_count,
+                        "triggering context compaction"
+                    );
+                    let result = crate::executor::compaction::compact_messages(
+                        &self.thread.messages,
+                        &self.llm,
+                        compaction_count,
+                    )
+                    .await?;
+                    self.thread.total_tokens_used += result.tokens_used.total();
+                    self.thread.messages = result.compacted_messages;
+                    compaction_count += 1;
+                }
+            }
+
+            // 4. Get active leases
             let active_leases = self.leases.active_for_thread(self.thread.id).await;
 
-            // 3. Build context
+            // 5. Build context
             let (messages, actions) =
                 build_step_context(&self.thread.messages, &active_leases, &self.effects).await?;
 
-            // 4. Create step
+            // 6. Create step
             let mut step = Step::new(self.thread.id, iteration + 1);
             step.status = StepStatus::LlmCalling;
             self.thread.add_event(EventKind::StepStarted {
                 step_id: step.id,
             });
 
-            // 5. Call LLM
+            // 7. Call LLM
             let force_text = iteration >= max_iterations.saturating_sub(1);
             let config = LlmCallConfig {
                 force_text,
+                depth: self.thread.config.depth,
                 ..LlmCallConfig::default()
             };
 
@@ -308,9 +377,36 @@ impl ExecutionLoop {
                         return Ok(outcome);
                     }
 
-                    // If code had errors, the error text is already in the
-                    // metadata message — the LLM can self-correct on next turn.
+                    // Track consecutive errors for budget enforcement
+                    if code_result.had_error {
+                        consecutive_errors += 1;
+                    } else {
+                        consecutive_errors = 0;
+                    }
                 }
+            }
+
+            // Check consecutive error threshold after each step
+            if let Some(max_errors) = self.thread.config.max_consecutive_errors
+                && consecutive_errors >= max_errors
+            {
+                warn!(
+                    thread_id = %self.thread.id,
+                    consecutive_errors,
+                    max_errors,
+                    "consecutive error threshold exceeded"
+                );
+                self.thread.transition_to(
+                    ThreadState::Failed,
+                    Some(format!(
+                        "consecutive error threshold: {consecutive_errors} errors"
+                    )),
+                )?;
+                return Ok(ThreadOutcome::Failed {
+                    error: format!(
+                        "Consecutive error threshold exceeded: {consecutive_errors} of {max_errors}"
+                    ),
+                });
             }
         }
 

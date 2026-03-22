@@ -65,3 +65,7 @@ pub use executor::ExecutionLoop;
 
 pub use memory::MemoryStore;
 pub use memory::RetrievalEngine;
+
+// ── Re-exports: reflection ────────────────────────────────────
+
+pub use reflection::ReflectionResult;

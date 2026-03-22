@@ -1,5 +1,11 @@
 //! Post-thread reflection pipeline.
 //!
-//! After a thread completes, the reflection pipeline produces structured
-//! knowledge (summaries, lessons, playbooks, issue docs) from the thread's
-//! execution trace. Implemented in Phase 4.
+//! After a thread completes, [`reflect()`] uses the LLM to produce structured
+//! knowledge (MemoryDocs) from the thread's execution trace:
+//! - Summary — what the thread accomplished
+//! - Lesson — what was learned from errors/workarounds
+//! - Issue — unresolved problems for follow-up
+
+pub mod pipeline;
+
+pub use pipeline::{reflect, ReflectionResult};

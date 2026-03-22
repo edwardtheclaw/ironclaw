@@ -21,6 +21,9 @@ pub struct LlmCallConfig {
     pub temperature: Option<f32>,
     /// When true, the LLM should not return action calls.
     pub force_text: bool,
+    /// Depth in the recursive call tree (0 = root, 1+ = sub-call).
+    /// Implementations can use this to route to cheaper models for sub-calls.
+    pub depth: u32,
     /// Opaque metadata forwarded to the LLM provider.
     pub metadata: HashMap<String, String>,
 }

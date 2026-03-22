@@ -43,6 +43,18 @@ pub enum EngineError {
 
     #[error("max iterations reached: {limit}")]
     MaxIterations { limit: usize },
+
+    #[error("token limit exceeded: {used} of {limit}")]
+    TokenLimitExceeded { used: u64, limit: u64 },
+
+    #[error("consecutive error threshold exceeded: {count} errors (limit: {threshold})")]
+    ConsecutiveErrors { count: u32, threshold: u32 },
+
+    #[error("thread timeout: {elapsed:?} of {limit:?}")]
+    Timeout {
+        elapsed: std::time::Duration,
+        limit: std::time::Duration,
+    },
 }
 
 use crate::types::project::ProjectId;

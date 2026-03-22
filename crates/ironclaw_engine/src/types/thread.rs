@@ -130,6 +130,27 @@ pub struct ThreadConfig {
     pub enable_tool_intent_nudge: bool,
     /// Maximum number of tool intent nudges per thread.
     pub max_tool_intent_nudges: u32,
+
+    // ── Budget controls (Phase 4, from RLM cross-reference) ──
+
+    /// Maximum cumulative input+output tokens before termination.
+    pub max_tokens_total: Option<u64>,
+    /// Maximum consecutive steps with errors before termination.
+    /// Resets to 0 on any successful step (matching official RLM behavior).
+    pub max_consecutive_errors: Option<u32>,
+    /// Model context limit in tokens (for compaction threshold calculation).
+    /// Default: 128,000. Used to trigger compaction at 85% usage.
+    pub model_context_limit: usize,
+    /// Whether to enable automatic compaction when context grows large.
+    pub enable_compaction: bool,
+    /// Compaction threshold as fraction of model_context_limit (0.0-1.0).
+    /// Default: 0.85 (matching official RLM).
+    pub compaction_threshold: f64,
+    /// Depth of this thread in the recursive call tree.
+    /// Root threads are depth 0. Sub-calls via rlm_query() increment depth.
+    pub depth: u32,
+    /// Maximum recursion depth for rlm_query() sub-calls.
+    pub max_depth: u32,
 }
 
 impl Default for ThreadConfig {
@@ -140,6 +161,13 @@ impl Default for ThreadConfig {
             enable_reflection: false,
             enable_tool_intent_nudge: true,
             max_tool_intent_nudges: 2,
+            max_tokens_total: None,
+            max_consecutive_errors: None,
+            model_context_limit: 128_000,
+            enable_compaction: false,
+            compaction_threshold: 0.85,
+            depth: 0,
+            max_depth: 1,
         }
     }
 }
