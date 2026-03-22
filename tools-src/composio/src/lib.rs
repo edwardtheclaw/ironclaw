@@ -1,0 +1,425 @@
+//! Composio WASM Tool for IronClaw.
+//!
+//! Connects to 250+ third-party apps via Composio's REST API (v3).
+//! Provides a single multiplexed tool with actions: list, execute, connect,
+//! connected_accounts.
+//!
+//! # Authentication
+//!
+//! Store your Composio API key:
+//! `ironclaw secret set composio_api_key <key>`
+//!
+//! Get a key at: https://app.composio.dev/
+
+wit_bindgen::generate!({
+    world: "sandboxed-tool",
+    path: "../../wit/tool.wit",
+});
+
+use serde::Deserialize;
+
+const API_BASE: &str = "https://backend.composio.dev/api/v3";
+const MAX_RETRIES: u32 = 3;
+
+struct ComposioTool;
+
+impl exports::near::agent::tool::Guest for ComposioTool {
+    fn execute(req: exports::near::agent::tool::Request) -> exports::near::agent::tool::Response {
+        match execute_inner(&req.params, req.context.as_deref()) {
+            Ok(result) => exports::near::agent::tool::Response {
+                output: Some(result),
+                error: None,
+            },
+            Err(e) => exports::near::agent::tool::Response {
+                output: None,
+                error: Some(e),
+            },
+        }
+    }
+
+    fn schema() -> String {
+        SCHEMA.to_string()
+    }
+
+    fn description() -> String {
+        "Connect to 250+ apps (Gmail, GitHub, Slack, Notion, etc.) via Composio. \
+         Actions: \"list\" (browse tools), \"execute\" (run a tool), \
+         \"connect\" (OAuth-link an app), \"connected_accounts\" (list linked accounts). \
+         Authentication is handled via the 'composio_api_key' secret injected by the host."
+            .to_string()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct Params {
+    action: String,
+    app: Option<String>,
+    tool_slug: Option<String>,
+    params: Option<serde_json::Value>,
+    connected_account_id: Option<String>,
+}
+
+fn execute_inner(params_str: &str, context: Option<&str>) -> Result<String, String> {
+    let params: Params =
+        serde_json::from_str(params_str).map_err(|e| format!("Invalid parameters: {e}"))?;
+
+    if params.action.is_empty() {
+        return Err("'action' must not be empty".into());
+    }
+
+    // Pre-flight: verify API key is available.
+    if !near::agent::host::secret_exists("composio_api_key") {
+        return Err(
+            "Composio API key not found in secret store. Set it with: \
+             ironclaw secret set composio_api_key <key>. \
+             Get a key at: https://app.composio.dev/"
+                .into(),
+        );
+    }
+
+    // Extract an entity identifier from context if provided; prefer `entity_id`,
+    // then `user_id` (from JobContext), then `requester_id`, otherwise "default".
+    let entity_id = context
+        .and_then(|ctx| serde_json::from_str::<serde_json::Value>(ctx).ok())
+        .and_then(|v| {
+            v.get("entity_id")
+                .or_else(|| v.get("user_id"))
+                .or_else(|| v.get("requester_id"))
+                .and_then(|e| e.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| "default".to_string());
+
+    match params.action.as_str() {
+        "list" => list_tools(params.app.as_deref()),
+        "execute" => {
+            let tool_slug = params
+                .tool_slug
+                .as_deref()
+                .ok_or("missing 'tool_slug' for execute action")?;
+            let action_params = params.params.unwrap_or(serde_json::json!({}));
+            execute_action(
+                tool_slug,
+                &action_params,
+                &entity_id,
+                params.connected_account_id.as_deref(),
+            )
+        }
+        "connect" => {
+            let app = params
+                .app
+                .as_deref()
+                .ok_or("missing 'app' for connect action")?;
+            connect_app(app, &entity_id)
+        }
+        "connected_accounts" => list_accounts(params.app.as_deref(), &entity_id),
+        other => Err(format!(
+            "unknown action \"{other}\", expected: list, execute, connect, connected_accounts"
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// API helpers
+// ---------------------------------------------------------------------------
+
+fn api_get(path: &str, query: &[(&str, &str)]) -> Result<serde_json::Value, String> {
+    let url = build_url(path, query);
+
+    let headers = serde_json::json!({
+        "Accept": "application/json",
+        "User-Agent": "IronClaw-Composio-Tool/0.1"
+    });
+
+    let response = http_with_retry("GET", &url, &headers.to_string(), None)?;
+    parse_json_response(&response.body, response.status)
+}
+
+fn api_post(path: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let url = build_url(path, &[]);
+
+    let headers = serde_json::json!({
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "IronClaw-Composio-Tool/0.1"
+    });
+
+    let body_bytes = serde_json::to_vec(body).map_err(|e| format!("JSON serialize error: {e}"))?;
+
+    let response = http_with_retry("POST", &url, &headers.to_string(), Some(&body_bytes))?;
+    parse_json_response(&response.body, response.status)
+}
+
+fn http_with_retry(
+    method: &str,
+    url: &str,
+    headers: &str,
+    body: Option<&[u8]>,
+) -> Result<near::agent::host::HttpResponse, String> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+
+        let resp = near::agent::host::http_request(method, url, headers, body, None)
+            .map_err(|e| format!("HTTP request failed: {e}"))?;
+
+        if resp.status >= 200 && resp.status < 300 {
+            return Ok(resp);
+        }
+
+        if attempt < MAX_RETRIES && (resp.status == 429 || resp.status >= 500) {
+            near::agent::host::log(
+                near::agent::host::LogLevel::Warn,
+                &format!(
+                    "Composio API error {} (attempt {}/{}). Retrying...",
+                    resp.status, attempt, MAX_RETRIES
+                ),
+            );
+            continue;
+        }
+
+        // Truncate at byte level before UTF-8 conversion to avoid
+        // panicking on multibyte character boundaries.
+        let truncated_bytes = if resp.body.len() > 512 {
+            &resp.body[..512]
+        } else {
+            &resp.body
+        };
+        let truncated = String::from_utf8_lossy(truncated_bytes);
+        return Err(format!("Composio API error (HTTP {}): {truncated}", resp.status));
+    }
+}
+
+fn parse_json_response(body: &[u8], status: u16) -> Result<serde_json::Value, String> {
+    if !(200..300).contains(&status) {
+        // Truncate at byte level before UTF-8 conversion to avoid
+        // panicking on multibyte character boundaries.
+        let truncated_bytes = if body.len() > 512 { &body[..512] } else { body };
+        let truncated = String::from_utf8_lossy(truncated_bytes);
+        return Err(format!("Composio API {status}: {truncated}"));
+    }
+
+    let text = String::from_utf8(body.to_vec())
+        .map_err(|e| format!("non-UTF8 response: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("invalid JSON: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Actions
+// ---------------------------------------------------------------------------
+
+fn list_tools(app: Option<&str>) -> Result<String, String> {
+    let query: Vec<(&str, &str)> = match app {
+        Some(a) => vec![("toolkit_slug", a)],
+        None => vec![],
+    };
+    let result = api_get("/tools", &query)?;
+    serde_json::to_string(&result).map_err(|e| format!("Failed to serialize output: {e}"))
+}
+
+fn execute_action(
+    tool_slug: &str,
+    params: &serde_json::Value,
+    entity_id: &str,
+    connected_account_id: Option<&str>,
+) -> Result<String, String> {
+    // Auto-resolve connected account if not provided
+    let account_id = match connected_account_id {
+        Some(id) => id.to_string(),
+        None => resolve_account(tool_slug, entity_id)?,
+    };
+
+    let body = serde_json::json!({
+        "connected_account_id": account_id,
+        "entity_id": entity_id,
+        "input": params,
+    });
+    let result = api_post(&format!("/tools/execute/{}", url_encode(tool_slug)), &body)?;
+    serde_json::to_string(&result).map_err(|e| format!("Failed to serialize output: {e}"))
+}
+
+fn connect_app(app: &str, entity_id: &str) -> Result<String, String> {
+    // Resolve auth config for this app
+    let configs = api_get("/auth_configs", &[("toolkit_slug", app)])?;
+    let auth_config_id = configs
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("id"))
+        .and_then(|id| id.as_str())
+        .ok_or_else(|| {
+            format!("no auth config found for {app} — configure it at app.composio.dev")
+        })?;
+
+    let body = serde_json::json!({
+        "auth_config_id": auth_config_id,
+        "user_id": entity_id,
+    });
+    let result = api_post("/connected_accounts/link", &body)?;
+    serde_json::to_string(&result).map_err(|e| format!("Failed to serialize output: {e}"))
+}
+
+fn list_accounts(app: Option<&str>, entity_id: &str) -> Result<String, String> {
+    let mut query = vec![("user_id", entity_id)];
+    if let Some(a) = app {
+        query.push(("toolkit_slug", a));
+    }
+    let result = api_get("/connected_accounts", &query)?;
+    serde_json::to_string(&result).map_err(|e| format!("Failed to serialize output: {e}"))
+}
+
+/// Look up the toolkit/app slug for a tool via the Composio API.
+///
+/// Querying the API is more reliable than parsing the tool slug string,
+/// which breaks for multi-word app names (e.g., `GOOGLE_DRIVE_UPLOAD`
+/// would incorrectly resolve to `"google"` instead of `"google_drive"`).
+fn lookup_app_for_tool(tool_slug: &str) -> Result<String, String> {
+    let tools = api_get("/tools", &[("search", tool_slug)])?;
+    tools
+        .as_array()
+        .and_then(|arr| {
+            arr.iter().find(|t| {
+                t.get("slug")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.eq_ignore_ascii_case(tool_slug))
+                    .unwrap_or(false)
+            })
+        })
+        .and_then(|t| t.get("toolkit_slug").or_else(|| t.get("appName")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase())
+        .ok_or_else(|| {
+            format!("could not determine app for tool \"{tool_slug}\" — verify the slug is correct")
+        })
+}
+
+/// Auto-resolve connected account for a tool slug.
+fn resolve_account(tool_slug: &str, entity_id: &str) -> Result<String, String> {
+    let app = lookup_app_for_tool(tool_slug)?;
+
+    let accounts = api_get("/connected_accounts", &[("user_id", entity_id), ("toolkit_slug", &app)])?;
+
+    accounts
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .filter(|a| a.get("status").and_then(|s| s.as_str()) == Some("ACTIVE"))
+                .max_by_key(|a| {
+                    a.get("updatedAt")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+        })
+        .and_then(|a| a.get("id"))
+        .and_then(|id| id.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            format!("no connected account for {app} — use composio with action=\"connect\" first")
+        })
+}
+
+// ---------------------------------------------------------------------------
+// URL helpers
+// ---------------------------------------------------------------------------
+
+fn build_url(path: &str, query: &[(&str, &str)]) -> String {
+    let mut url = format!("{API_BASE}{path}");
+    if !query.is_empty() {
+        url.push('?');
+        for (i, (k, v)) in query.iter().enumerate() {
+            if i > 0 {
+                url.push('&');
+            }
+            url.push_str(&url_encode(k));
+            url.push('=');
+            url.push_str(&url_encode(v));
+        }
+    }
+    url
+}
+
+/// Percent-encode a string for safe use in URL query parameters.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push_str("%20"),
+            _ => {
+                out.push('%');
+                out.push(char::from(b"0123456789ABCDEF"[(b >> 4) as usize]));
+                out.push(char::from(b"0123456789ABCDEF"[(b & 0xf) as usize]));
+            }
+        }
+    }
+    out
+}
+
+const SCHEMA: &str = r#"{
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["list", "execute", "connect", "connected_accounts"],
+            "description": "Action to perform"
+        },
+        "app": {
+            "type": "string",
+            "description": "App/toolkit slug (e.g., \"gmail\", \"github\", \"notion\")"
+        },
+        "tool_slug": {
+            "type": "string",
+            "description": "Tool action slug for execute (e.g., \"GMAIL_SEND_EMAIL\")"
+        },
+        "params": {
+            "description": "Parameters for the tool action (JSON object)"
+        },
+        "connected_account_id": {
+            "type": "string",
+            "description": "Specific connected account ID (auto-resolved if omitted)"
+        }
+    },
+    "required": ["action"],
+    "additionalProperties": false
+}"#;
+
+export!(ComposioTool);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_url_encode() {
+        assert_eq!(url_encode("hello world"), "hello%20world");
+        assert_eq!(url_encode("foo&bar=baz"), "foo%26bar%3Dbaz");
+        assert_eq!(url_encode("simple"), "simple");
+    }
+
+    #[test]
+    fn test_url_encode_multibyte() {
+        assert_eq!(url_encode("café"), "caf%C3%A9");
+    }
+
+    #[test]
+    fn test_build_url_no_query() {
+        let url = build_url("/tools", &[]);
+        assert_eq!(url, format!("{API_BASE}/tools"));
+    }
+
+    #[test]
+    fn test_build_url_with_query() {
+        let url = build_url("/tools", &[("toolkit_slug", "gmail"), ("search", "send")]);
+        assert!(url.starts_with(&format!("{API_BASE}/tools?")));
+        assert!(url.contains("toolkit_slug=gmail"));
+        assert!(url.contains("search=send"));
+    }
+
+    #[test]
+    fn test_build_url_encodes_special_chars() {
+        let url = build_url("/tools", &[("q", "my app+1")]);
+        assert!(url.contains("q=my%20app%2B1"));
+    }
+}
