@@ -95,6 +95,9 @@ impl ThreadManager {
             thread.capability_leases.push(lease.id);
         }
 
+        // Add the goal as the initial user message so the LLM has context
+        thread.add_message(crate::types::message::ThreadMessage::user(&thread.goal));
+
         // Persist
         self.store.save_thread(&thread).await?;
 

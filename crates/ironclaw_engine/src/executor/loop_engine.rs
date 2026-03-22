@@ -61,6 +61,17 @@ impl ExecutionLoop {
         // Transition to Running
         self.thread.transition_to(ThreadState::Running, None)?;
 
+        // Inject system prompt if none exists
+        if !self.thread.messages.iter().any(|m| m.role == crate::types::message::MessageRole::System) {
+            self.thread.messages.insert(
+                0,
+                ThreadMessage::system(
+                    "You are a helpful assistant. Use the available tools to accomplish the user's request. \
+                     Respond concisely.",
+                ),
+            );
+        }
+
         let max_iterations = self.thread.config.max_iterations;
         let max_nudges = self.thread.config.max_tool_intent_nudges;
         let nudge_enabled = self.thread.config.enable_tool_intent_nudge;
