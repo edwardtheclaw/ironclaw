@@ -1144,15 +1144,6 @@ impl Agent {
             std::any::type_name_of_val(&submission)
         );
 
-        if let Submission::UserInput { ref content } = submission
-            && let Some(credential) = detect_sensitive_chat_credential(content)
-        {
-            return Ok(Some(
-                self.intercept_sensitive_chat_credential(message, credential)
-                    .await,
-            ));
-        }
-
         // Hook: BeforeInbound — allow hooks to modify or reject user input
         if let Submission::UserInput { ref content } = submission {
             let event = crate::hooks::HookEvent::Inbound {
@@ -1299,6 +1290,15 @@ impl Agent {
                         // Fall through to normal handling
                     }
                 }
+            }
+        }
+
+        if let Submission::UserInput { ref content } = submission {
+            if let Some(credential) = detect_sensitive_chat_credential(content) {
+                return Ok(Some(
+                    self.intercept_sensitive_chat_credential(message, credential)
+                        .await,
+                ));
             }
         }
 
