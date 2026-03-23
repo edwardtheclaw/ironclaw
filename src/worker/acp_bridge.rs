@@ -549,9 +549,68 @@ mod tests {
     }
 
     #[test]
+    fn test_session_update_tool_call() {
+        let update = acp::SessionUpdate::ToolCall(acp::ToolCall::new("tc-1", "Running tests"));
+        let payload = session_update_to_payload(&update).unwrap();
+        assert_eq!(payload.event_type, "tool_use");
+        assert_eq!(payload.data["tool_name"], "Running tests");
+        assert_eq!(payload.data["tool_use_id"], "tc-1");
+    }
+
+    #[test]
+    fn test_session_update_tool_call_update() {
+        let fields = acp::ToolCallUpdateFields::new();
+        let update = acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new("tc-1", fields));
+        let payload = session_update_to_payload(&update).unwrap();
+        assert_eq!(payload.event_type, "tool_result");
+        assert_eq!(payload.data["tool_use_id"], "tc-1");
+    }
+
+    #[test]
+    fn test_session_update_thought_image_ignored() {
+        let update = acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(
+            acp::ContentBlock::Image(acp::ImageContent::new("data", "image/png")),
+        ));
+        assert!(session_update_to_payload(&update).is_none());
+    }
+
+    #[test]
+    fn test_stop_reason_max_turn_requests() {
+        let payload = stop_reason_to_result(&acp::StopReason::MaxTurnRequests, "sid-1");
+        assert_eq!(payload.data["status"], "error");
+        assert_eq!(payload.data["message"], "Agent reached max turn requests");
+    }
+
+    #[test]
+    fn test_stop_reason_includes_session_id() {
+        let payload = stop_reason_to_result(&acp::StopReason::EndTurn, "my-session-42");
+        assert_eq!(payload.data["session_id"], "my-session-42");
+    }
+
+    #[test]
+    fn test_text_from_content_block_text() {
+        let block = acp::ContentBlock::Text(acp::TextContent::new("hello"));
+        assert_eq!(text_from_content_block(&block), Some("hello"));
+    }
+
+    #[test]
+    fn test_text_from_content_block_image_returns_none() {
+        let block = acp::ContentBlock::Image(acp::ImageContent::new("data", "image/png"));
+        assert!(text_from_content_block(&block).is_none());
+    }
+
+    #[test]
     fn test_truncate() {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world", 5), "hello");
         assert_eq!(truncate("", 5), "");
+    }
+
+    #[test]
+    fn test_truncate_multibyte_safe() {
+        // 2-byte UTF-8 char: "é" is 0xC3 0xA9
+        let s = "café";
+        assert_eq!(truncate(s, 3), "caf"); // doesn't split the é
+        assert_eq!(truncate(s, 5), "café"); // includes full char
     }
 }

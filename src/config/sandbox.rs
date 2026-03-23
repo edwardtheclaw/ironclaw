@@ -700,4 +700,44 @@ mod tests {
         let sandbox = config.to_sandbox_config();
         assert_eq!(sandbox.policy, crate::sandbox::SandboxPolicy::ReadOnly);
     }
+
+    // ── AcpModeConfig defaults ──────────────────────────────────
+
+    #[test]
+    fn acp_mode_config_default_values() {
+        let cfg = AcpModeConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.memory_limit_mb, 4096);
+        assert_eq!(cfg.timeout_secs, 1800);
+    }
+
+    #[test]
+    fn acp_mode_config_resolve_uses_settings() {
+        let _guard = crate::config::helpers::lock_env();
+        let mut settings = crate::settings::Settings::default();
+        settings.sandbox.acp_enabled = true;
+
+        let cfg = AcpModeConfig::resolve(&settings).expect("resolve");
+        assert!(cfg.enabled);
+    }
+
+    #[test]
+    fn acp_mode_config_env_overrides_settings() {
+        let _guard = crate::config::helpers::lock_env();
+        let mut settings = crate::settings::Settings::default();
+        settings.sandbox.acp_enabled = true;
+
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe { std::env::set_var("ACP_ENABLED", "false") };
+        unsafe { std::env::set_var("ACP_MEMORY_LIMIT_MB", "8192") };
+        unsafe { std::env::set_var("ACP_TIMEOUT_SECS", "3600") };
+        let cfg = AcpModeConfig::resolve(&settings).expect("resolve");
+        unsafe { std::env::remove_var("ACP_ENABLED") };
+        unsafe { std::env::remove_var("ACP_MEMORY_LIMIT_MB") };
+        unsafe { std::env::remove_var("ACP_TIMEOUT_SECS") };
+
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.memory_limit_mb, 8192);
+        assert_eq!(cfg.timeout_secs, 3600);
+    }
 }

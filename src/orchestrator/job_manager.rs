@@ -737,4 +737,20 @@ mod tests {
         assert_eq!(handle.worker_iteration, 3);
         assert_eq!(handle.last_worker_status.as_deref(), Some("Iteration 3"));
     }
+
+    #[test]
+    fn test_job_mode_acp_as_str() {
+        assert_eq!(JobMode::Acp.as_str(), "acp");
+    }
+
+    #[test]
+    fn test_job_mode_acp_display() {
+        assert_eq!(format!("{}", JobMode::Acp), "acp");
+    }
+
+    #[test]
+    fn test_container_job_config_acp_memory_default() {
+        let config = ContainerJobConfig::default();
+        assert_eq!(config.acp_memory_limit_mb, 4096);
+    }
 }

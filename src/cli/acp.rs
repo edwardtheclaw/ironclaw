@@ -306,3 +306,37 @@ async fn save_agents(
             .map_err(|e| anyhow::anyhow!("{}", e)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_env_var_valid() {
+        let (k, v) = parse_env_var("FOO=bar").unwrap();
+        assert_eq!(k, "FOO");
+        assert_eq!(v, "bar");
+    }
+
+    #[test]
+    fn test_parse_env_var_with_equals_in_value() {
+        let (k, v) = parse_env_var("KEY=val=ue").unwrap();
+        assert_eq!(k, "KEY");
+        assert_eq!(v, "val=ue");
+    }
+
+    #[test]
+    fn test_parse_env_var_invalid() {
+        let result = parse_env_var("no-equals-sign");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_acp_command_variants() {
+        // Verify all variants exist (compile-time check)
+        let _ = AcpCommand::List;
+        let _ = AcpCommand::Remove { name: "x".into() };
+        let _ = AcpCommand::Toggle { name: "x".into() };
+        let _ = AcpCommand::Test { name: "x".into() };
+    }
+}
