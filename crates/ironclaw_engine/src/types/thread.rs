@@ -146,6 +146,9 @@ pub struct ThreadConfig {
     /// Compaction threshold as fraction of model_context_limit (0.0-1.0).
     /// Default: 0.85 (matching official RLM).
     pub compaction_threshold: f64,
+    /// Maximum cumulative USD cost before termination.
+    /// Requires the LlmBackend to populate `TokenUsage::cost_usd`.
+    pub max_budget_usd: Option<f64>,
     /// Depth of this thread in the recursive call tree.
     /// Root threads are depth 0. Sub-calls via rlm_query() increment depth.
     pub depth: u32,
@@ -163,6 +166,7 @@ impl Default for ThreadConfig {
             max_tool_intent_nudges: 2,
             max_tokens_total: None,
             max_consecutive_errors: None,
+            max_budget_usd: None,
             model_context_limit: 128_000,
             enable_compaction: false,
             compaction_threshold: 0.85,
@@ -193,6 +197,8 @@ pub struct Thread {
     pub completed_at: Option<DateTime<Utc>>,
     pub step_count: usize,
     pub total_tokens_used: u64,
+    /// Cumulative USD cost across all steps.
+    pub total_cost_usd: f64,
 }
 
 impl Thread {
@@ -221,6 +227,7 @@ impl Thread {
             completed_at: None,
             step_count: 0,
             total_tokens_used: 0,
+            total_cost_usd: 0.0,
         }
     }
 
@@ -270,8 +277,9 @@ impl Thread {
 
     /// Add a message to this thread's conversation.
     pub fn add_message(&mut self, message: ThreadMessage) {
-        let preview = if message.content.len() > 80 {
-            format!("{}...", &message.content[..80])
+        let preview = if message.content.chars().count() > 80 {
+            let p: String = message.content.chars().take(80).collect();
+            format!("{p}...")
         } else {
             message.content.clone()
         };

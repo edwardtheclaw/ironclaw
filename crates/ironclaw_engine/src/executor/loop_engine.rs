@@ -167,6 +167,27 @@ impl ExecutionLoop {
                 }
             }
 
+            if let Some(max_usd) = self.thread.config.max_budget_usd
+                && self.thread.total_cost_usd >= max_usd
+            {
+                warn!(
+                    thread_id = %self.thread.id,
+                    used = self.thread.total_cost_usd,
+                    limit = max_usd,
+                    "USD budget exceeded"
+                );
+                self.thread.transition_to(
+                    ThreadState::Completed,
+                    Some("USD budget exceeded".into()),
+                )?;
+                return Ok(ThreadOutcome::Failed {
+                    error: format!(
+                        "USD budget exceeded: ${:.4} of ${:.4}",
+                        self.thread.total_cost_usd, max_usd
+                    ),
+                });
+            }
+
             // 3. Check compaction
             if self.thread.config.enable_compaction {
                 let ctx_limit = self.thread.config.model_context_limit;
@@ -253,6 +274,7 @@ impl ExecutionLoop {
             let llm_output = self.llm.complete(&messages, &[], &config).await?;
             step.tokens_used = llm_output.usage;
             self.thread.total_tokens_used += llm_output.usage.total();
+            self.thread.total_cost_usd += llm_output.usage.cost_usd;
             step.llm_response = Some(llm_output.response.clone());
 
             debug!(
@@ -318,7 +340,7 @@ impl ExecutionLoop {
                         self.thread
                             .add_message(ThreadMessage::assistant(text));
                         self.thread
-                            .add_message(ThreadMessage::system(intent::TOOL_INTENT_NUDGE));
+                            .add_message(ThreadMessage::user(intent::TOOL_INTENT_NUDGE));
 
                         step.status = StepStatus::Completed;
                         step.completed_at = Some(chrono::Utc::now());
@@ -437,7 +459,7 @@ impl ExecutionLoop {
                     if self.thread.step_count == 0 {
                         let preamble =
                             crate::executor::scripting::build_orientation_preamble(&self.thread);
-                        self.thread.add_message(ThreadMessage::system(preamble));
+                        self.thread.add_message(ThreadMessage::user(preamble));
                     }
 
                     let exec_ctx = ThreadExecutionContext {
@@ -531,7 +553,8 @@ impl ExecutionLoop {
                     for result in &step.action_results {
                         let output_str = serde_json::to_string(&result.output).unwrap_or_default();
                         let truncated = if output_str.len() > 4000 {
-                            format!("{}... [truncated, {} total chars]", &output_str[..4000], output_str.len())
+                            let prefix: String = output_str.chars().take(4000).collect();
+                            format!("{prefix}... [truncated, {} total chars]", output_str.len())
                         } else {
                             output_str
                         };
@@ -553,8 +576,9 @@ impl ExecutionLoop {
                         output_parts.join("\n")
                     };
                     // Truncate total output to prevent context bloat
-                    let mut metadata = if output_text.len() > 8000 {
-                        format!("[TRUNCATED: last 8000 of {} chars]\n{}", output_text.len(), &output_text[output_text.len()-8000..])
+                    let mut metadata = if output_text.chars().count() > 8000 {
+                        let tail: String = output_text.chars().skip(output_text.chars().count() - 8000).collect();
+                        format!("[TRUNCATED: last 8000 of {} chars]\n{tail}", output_text.chars().count())
                     } else {
                         output_text
                     };
@@ -571,7 +595,7 @@ impl ExecutionLoop {
                         ));
                     }
 
-                    self.thread.add_message(ThreadMessage::system(metadata));
+                    self.thread.add_message(ThreadMessage::user(metadata));
 
                     step.status = StepStatus::Completed;
                     step.completed_at = Some(chrono::Utc::now());

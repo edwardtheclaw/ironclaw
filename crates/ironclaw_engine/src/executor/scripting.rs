@@ -78,8 +78,8 @@ pub fn compact_output_metadata(stdout: &str, return_value: &serde_json::Value) -
     let mut parts = Vec::new();
 
     if !stdout.is_empty() {
-        if stdout.len() > OUTPUT_TRUNCATE_LEN {
-            let truncated = &stdout[stdout.len() - OUTPUT_TRUNCATE_LEN..];
+        if stdout.chars().count() > OUTPUT_TRUNCATE_LEN {
+            let truncated: String = stdout.chars().skip(stdout.chars().count() - OUTPUT_TRUNCATE_LEN).collect();
             parts.push(format!(
                 "[TRUNCATED: last {OUTPUT_TRUNCATE_LEN} of {} chars shown]\n{truncated}",
                 stdout.len()
@@ -369,6 +369,21 @@ pub async fn execute_code(
                             &call.args,
                             &call.kwargs,
                             llm,
+                            &mut recursive_tokens,
+                        )
+                        .await
+                    }
+
+                    // rlm_query(prompt) — full recursive sub-agent with own CodeAct loop
+                    "rlm_query" => {
+                        handle_rlm_query(
+                            &call.args,
+                            &call.kwargs,
+                            thread,
+                            llm,
+                            effects,
+                            leases,
+                            policy,
                             &mut recursive_tokens,
                         )
                         .await
@@ -677,6 +692,153 @@ async fn handle_llm_query_batched(
     recursive_tokens.output_tokens += total_output;
 
     ExtFunctionResult::Return(MontyObject::List(results))
+}
+
+// ── rlm_query() — full recursive sub-agent (RLM 3.5) ─────────
+
+/// Handle `rlm_query(prompt)` — spawn a child CodeAct thread with its own
+/// execution loop, tools, and iteration budget.
+///
+/// Unlike `llm_query()` (single-shot LLM call), `rlm_query()` creates a
+/// child thread with full CodeAct capabilities. The child inherits the
+/// parent's remaining budget and tool access.
+#[allow(clippy::too_many_arguments)]
+async fn handle_rlm_query(
+    args: &[MontyObject],
+    kwargs: &[(MontyObject, MontyObject)],
+    parent_thread: &Thread,
+    llm: &Arc<dyn LlmBackend>,
+    effects: &Arc<dyn EffectExecutor>,
+    leases: &LeaseManager,
+    policy: &PolicyEngine,
+    recursive_tokens: &mut TokenUsage,
+) -> ExtFunctionResult {
+    let prompt = extract_string_arg(args, kwargs, "prompt", 0);
+    let prompt = match prompt {
+        Some(p) => p,
+        None => {
+            return ExtFunctionResult::Error(MontyException::new(
+                ExcType::TypeError,
+                Some("rlm_query() requires a 'prompt' argument".into()),
+            ));
+        }
+    };
+
+    // Depth check — refuse if at max recursion depth
+    let current_depth = parent_thread.config.depth;
+    let max_depth = parent_thread.config.max_depth;
+    if current_depth >= max_depth {
+        return ExtFunctionResult::Error(MontyException::new(
+            ExcType::RuntimeError,
+            Some(format!(
+                "rlm_query() depth limit reached: depth {current_depth} >= max {max_depth}"
+            )),
+        ));
+    }
+
+    // Build child thread with inherited budget
+    let child_config = crate::types::thread::ThreadConfig {
+        max_iterations: parent_thread.config.max_iterations.min(20), // cap child iterations
+        enable_reflection: false,
+        enable_tool_intent_nudge: false,
+        max_tokens_total: parent_thread.config.max_tokens_total.map(|max| {
+            max.saturating_sub(parent_thread.total_tokens_used)
+        }),
+        max_budget_usd: parent_thread.config.max_budget_usd.map(|max| {
+            (max - parent_thread.total_cost_usd).max(0.0)
+        }),
+        max_duration: parent_thread.config.max_duration,
+        depth: current_depth + 1,
+        max_depth,
+        ..crate::types::thread::ThreadConfig::default()
+    };
+
+    let mut child_thread = crate::types::thread::Thread::new(
+        &prompt,
+        crate::types::thread::ThreadType::Research,
+        parent_thread.project_id,
+        child_config,
+    )
+    .with_parent(parent_thread.id);
+
+    // Add the prompt as a user message
+    child_thread.add_message(ThreadMessage::user(&prompt));
+
+    // Create signal channel and child's lease manager
+    let (_tx, rx) = crate::runtime::messaging::signal_channel(8);
+    let child_leases = Arc::new(LeaseManager::new());
+
+    // Grant the child the same leases as the parent (in the child's manager)
+    let parent_leases = leases.active_for_thread(parent_thread.id).await;
+    let now = chrono::Utc::now();
+    for parent_lease in &parent_leases {
+        // Convert parent's expires_at to remaining duration
+        let remaining_duration = parent_lease
+            .expires_at
+            .and_then(|exp| (exp - now).to_std().ok())
+            .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::hours(1)));
+        let lease = child_leases
+            .grant(
+                child_thread.id,
+                &parent_lease.capability_name,
+                parent_lease.granted_actions.clone(),
+                remaining_duration,
+                parent_lease.max_uses,
+            )
+            .await;
+        child_thread.capability_leases.push(lease.id);
+    }
+    let mut child_policy_engine = PolicyEngine::new();
+    // Copy denied effects from parent policy
+    for effect in &policy.denied_effects {
+        child_policy_engine.deny_effect(*effect);
+    }
+    let child_policy = Arc::new(child_policy_engine);
+
+    let mut child_loop = crate::executor::ExecutionLoop::new(
+        child_thread,
+        Arc::clone(llm),
+        Arc::clone(effects),
+        child_leases,
+        child_policy,
+        rx,
+        "rlm_child".to_string(),
+    );
+
+    debug!(
+        parent_thread = %parent_thread.id,
+        depth = current_depth + 1,
+        prompt_len = prompt.len(),
+        "rlm_query: spawning child CodeAct thread"
+    );
+
+    // Run the child loop (Box::pin to avoid infinite future size from recursion)
+    match Box::pin(child_loop.run()).await {
+        Ok(outcome) => {
+            // Track child's token usage
+            recursive_tokens.input_tokens += child_loop.thread.total_tokens_used;
+            recursive_tokens.cost_usd += child_loop.thread.total_cost_usd;
+
+            let response = match outcome {
+                crate::runtime::messaging::ThreadOutcome::Completed { response } => {
+                    response.unwrap_or_default()
+                }
+                crate::runtime::messaging::ThreadOutcome::Failed { error } => {
+                    format!("rlm_query child failed: {error}")
+                }
+                crate::runtime::messaging::ThreadOutcome::MaxIterations => {
+                    "rlm_query child reached max iterations".to_string()
+                }
+                _ => String::new(),
+            };
+
+            ExtFunctionResult::Return(MontyObject::String(response))
+        }
+        Err(e) => ExtFunctionResult::Error(MontyException::new(
+            ExcType::RuntimeError,
+            Some(format!("rlm_query failed: {e}")),
+        )),
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────
