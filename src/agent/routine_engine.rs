@@ -1205,7 +1205,7 @@ async fn execute_routine(ctx: EngineContext, mut routine: Routine, mut run: Rout
                         description,
                         max_iterations: *max_iterations,
                     };
-                    execute_full_job(&ctx, &routine, &run, &execution).await
+                    execute_full_job(&ctx, &routine, &mut run, &execution).await
                 }
             };
 
