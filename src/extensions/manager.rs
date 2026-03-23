@@ -427,6 +427,8 @@ pub struct ExtensionManager {
     installed_relay_extensions: RwLock<HashSet<String>>,
     /// Last activation error for each WASM channel (ephemeral, cleared on success).
     activation_errors: RwLock<HashMap<String, String>>,
+    /// Cached per-user extension summaries used in LLM prompt injection.
+    llm_extension_state_summaries: RwLock<HashMap<String, Option<String>>>,
     /// SSE broadcast manager (set post-construction via `set_sse_sender()`).
     sse_manager: RwLock<Option<Arc<crate::channels::web::sse::SseManager>>>,
     /// Shared registry of pending OAuth flows for gateway-routed callbacks.
@@ -566,6 +568,7 @@ impl ExtensionManager {
             active_channel_names: RwLock::new(HashSet::new()),
             installed_relay_extensions: RwLock::new(HashSet::new()),
             activation_errors: RwLock::new(HashMap::new()),
+            llm_extension_state_summaries: RwLock::new(HashMap::new()),
             sse_manager: RwLock::new(None),
             pending_oauth_flows: crate::cli::oauth_defaults::new_pending_oauth_registry(),
             oauth_proxy_auth_token: crate::cli::oauth_defaults::oauth_proxy_auth_token(),
@@ -590,6 +593,29 @@ impl ExtensionManager {
     #[cfg(test)]
     async fn set_test_telegram_binding_resolver(&self, resolver: TestTelegramBindingResolver) {
         *self.test_telegram_binding_resolver.write().await = Some(resolver);
+    }
+
+    async fn invalidate_llm_extension_state_summary(&self, user_id: &str) {
+        self.llm_extension_state_summaries
+            .write()
+            .await
+            .remove(user_id);
+    }
+
+    async fn invalidate_all_llm_extension_state_summaries(&self) {
+        self.llm_extension_state_summaries.write().await.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_test_llm_extension_state_summary(
+        &self,
+        user_id: &str,
+        summary: Option<String>,
+    ) {
+        self.llm_extension_state_summaries
+            .write()
+            .await
+            .insert(user_id.to_string(), summary);
     }
 
     #[cfg(test)]
@@ -1303,7 +1329,11 @@ impl ExtensionManager {
 
         // If we have a registry entry, use it (prefer kind_hint to resolve collisions)
         if let Some(entry) = self.registry.get_with_kind(name, kind_hint).await {
-            return self.install_from_entry(&entry, user_id).await.map_err(|e| {
+            let result = self.install_from_entry(&entry, user_id).await;
+            if result.is_ok() {
+                self.invalidate_all_llm_extension_state_summaries().await;
+            }
+            return result.map_err(|e| {
                 tracing::error!(extension = %name, error = %e, "Extension install failed");
                 e
             });
@@ -1312,7 +1342,7 @@ impl ExtensionManager {
         // If a URL was provided, determine kind and install
         if let Some(url) = url {
             let kind = kind_hint.unwrap_or_else(|| infer_kind_from_url(url));
-            return match kind {
+            let result = match kind {
                 ExtensionKind::McpServer => self.install_mcp_from_url(name, url, user_id).await,
                 ExtensionKind::WasmTool => self.install_wasm_tool_from_url(name, url).await,
                 ExtensionKind::WasmChannel => {
@@ -1324,8 +1354,11 @@ impl ExtensionManager {
                         "Channel relay extensions cannot be installed by URL".to_string(),
                     ))
                 }
+            };
+            if result.is_ok() {
+                self.invalidate_all_llm_extension_state_summaries().await;
             }
-            .map_err(|e| {
+            return result.map_err(|e| {
                 let sanitized = sanitize_url_for_logging(url);
                 tracing::error!(extension = %name, url = %sanitized, error = %e, "Extension install from URL failed");
                 e
@@ -1368,12 +1401,16 @@ impl ExtensionManager {
         Self::validate_extension_name(name)?;
         let kind = self.determine_installed_kind(name, user_id).await?;
 
-        match kind {
+        let result = match kind {
             ExtensionKind::McpServer => self.activate_mcp(name, user_id).await,
             ExtensionKind::WasmTool => self.activate_wasm_tool(name, user_id).await,
             ExtensionKind::WasmChannel => self.activate_wasm_channel(name, user_id).await,
             ExtensionKind::ChannelRelay => self.activate_channel_relay(name, user_id).await,
+        };
+        if result.is_ok() {
+            self.invalidate_llm_extension_state_summary(user_id).await;
         }
+        result
     }
 
     /// List extensions with their status.
@@ -1614,6 +1651,75 @@ impl ExtensionManager {
         Ok(extensions)
     }
 
+    /// Build a compact, deterministic extension snapshot for LLM prompt context.
+    pub async fn llm_extension_state_summary(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<String>, ExtensionError> {
+        if let Some(summary) = self
+            .llm_extension_state_summaries
+            .read()
+            .await
+            .get(user_id)
+            .cloned()
+        {
+            return Ok(summary);
+        }
+
+        let mut extensions = self.list(None, false, user_id).await?;
+        extensions.sort_by(|a, b| {
+            llm_extension_sort_key(a.kind)
+                .cmp(&llm_extension_sort_key(b.kind))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        let mut channels = Vec::new();
+        let mut tools = Vec::new();
+        let mut servers = Vec::new();
+
+        for extension in extensions {
+            let owner_bound = matches!(extension.kind, ExtensionKind::WasmChannel)
+                && self.has_wasm_channel_owner_binding(&extension.name).await;
+            if !(extension.active || extension.authenticated || owner_bound) {
+                continue;
+            }
+
+            let item = llm_extension_summary_item(&extension, owner_bound);
+            match extension.kind {
+                ExtensionKind::WasmChannel | ExtensionKind::ChannelRelay => channels.push(item),
+                ExtensionKind::WasmTool => tools.push(item),
+                ExtensionKind::McpServer => servers.push(item),
+            }
+        }
+
+        let mut sections = serde_json::Map::new();
+        if !channels.is_empty() {
+            sections.insert("channels".to_string(), serde_json::Value::Array(channels));
+        }
+        if !tools.is_empty() {
+            sections.insert("tools".to_string(), serde_json::Value::Array(tools));
+        }
+        if !servers.is_empty() {
+            sections.insert("mcp_servers".to_string(), serde_json::Value::Array(servers));
+        }
+
+        let summary = if sections.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string_pretty(&serde_json::Value::Object(sections))
+                    .map_err(|err| ExtensionError::Other(err.to_string()))?,
+            )
+        };
+
+        self.llm_extension_state_summaries
+            .write()
+            .await
+            .insert(user_id.to_string(), summary.clone());
+
+        Ok(summary)
+    }
+
     /// Remove an installed extension.
     pub async fn remove(&self, name: &str, user_id: &str) -> Result<String, ExtensionError> {
         Self::validate_extension_name(name)?;
@@ -1632,7 +1738,7 @@ impl ExtensionManager {
             .await
             .retain(|_, flow| flow.extension_name != name);
 
-        match kind {
+        let result = match kind {
             ExtensionKind::McpServer => {
                 let cleanup_plan = self
                     .collect_secret_cleanup_plan(name, kind, user_id)
@@ -1813,7 +1919,11 @@ impl ExtensionManager {
 
                 Ok(format!("Removed channel relay '{}'", name))
             }
+        };
+        if result.is_ok() {
+            self.invalidate_all_llm_extension_state_summaries().await;
         }
+        result
     }
 
     /// Upgrade installed WASM extensions to match the current host WIT version.
@@ -5780,6 +5890,8 @@ impl ExtensionManager {
             self.save_tool_setup_fields(name, &stored_fields).await?;
         }
 
+        self.invalidate_llm_extension_state_summary(user_id).await;
+
         for field_def in setup_field_defs.values() {
             if field_def.optional {
                 continue;
@@ -6333,6 +6445,69 @@ fn combine_install_errors(
     }
 }
 
+fn llm_extension_sort_key(kind: ExtensionKind) -> u8 {
+    match kind {
+        ExtensionKind::WasmChannel | ExtensionKind::ChannelRelay => 0,
+        ExtensionKind::WasmTool => 1,
+        ExtensionKind::McpServer => 2,
+    }
+}
+
+fn llm_extension_summary_item(
+    extension: &InstalledExtension,
+    owner_bound: bool,
+) -> serde_json::Value {
+    let mut states = Vec::new();
+    if extension.authenticated {
+        states.push(serde_json::Value::String("authenticated".to_string()));
+    }
+    if extension.active {
+        states.push(serde_json::Value::String("active".to_string()));
+    } else if extension.authenticated {
+        states.push(serde_json::Value::String("inactive".to_string()));
+    }
+    if owner_bound {
+        states.push(serde_json::Value::String("owner-bound".to_string()));
+    }
+
+    let mut item = serde_json::Map::new();
+    item.insert(
+        "name".to_string(),
+        serde_json::Value::String(sanitize_llm_summary_text(&extension.name)),
+    );
+    if !states.is_empty() {
+        item.insert("status".to_string(), serde_json::Value::Array(states));
+    }
+    if !extension.tools.is_empty() {
+        item.insert(
+            "loaded_tool_count".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(extension.tools.len())),
+        );
+    }
+
+    serde_json::Value::Object(item)
+}
+
+fn sanitize_llm_summary_text(value: &str) -> String {
+    let collapsed = value
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | ':' | '/' | '@' | '+') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let collapsed = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        "unnamed_extension".to_string()
+    } else {
+        collapsed.chars().take(80).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt::Debug;
@@ -6356,6 +6531,7 @@ mod tests {
         normalize_hosted_callback_url, send_telegram_text_message,
         telegram_message_matches_verification_code,
     };
+    use crate::extensions::InstalledExtension;
     use crate::extensions::{
         ExtensionError, ExtensionKind, ExtensionSource, InstallResult, ToolAuthState,
         VerificationChallenge,
@@ -7338,6 +7514,188 @@ mod tests {
             Some(serde_json::json!("test_hot_bot")),
             "bot username setting",
         )
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_llm_extension_state_summary_reports_active_owner_bound_telegram()
+    -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|err| format!("temp dir: {err}"))?;
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&channels_dir).map_err(|err| format!("channels dir: {err}"))?;
+        std::fs::write(channels_dir.join("telegram.wasm"), b"mock")
+            .map_err(|err| format!("write wasm: {err}"))?;
+        std::fs::write(
+            channels_dir.join("telegram.capabilities.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "type": "channel",
+                "name": "telegram",
+                "setup": {
+                    "required_secrets": [
+                        {
+                            "name": "telegram_bot_token",
+                            "prompt": "Enter your Telegram Bot API token (from @BotFather)",
+                            "optional": false
+                        }
+                    ]
+                },
+                "capabilities": {
+                    "channel": {
+                        "allowed_paths": ["/webhook/telegram"]
+                    }
+                },
+                "config": {
+                    "owner_id": null
+                }
+            }))
+            .map_err(|err| format!("serialize capabilities: {err}"))?,
+        )
+        .map_err(|err| format!("write capabilities: {err}"))?;
+
+        let (db, _db_tmp) = crate::testing::test_db().await;
+        let manager = {
+            use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+            use crate::testing::credentials::TEST_CRYPTO_KEY;
+            use crate::tools::ToolRegistry;
+            use crate::tools::mcp::process::McpProcessManager;
+            use crate::tools::mcp::session::McpSessionManager;
+
+            let master_key = secrecy::SecretString::from(TEST_CRYPTO_KEY.to_string());
+            let crypto = Arc::new(
+                SecretsCrypto::new(master_key)
+                    .map_err(|err| format!("failed to construct test crypto: {err}"))?,
+            );
+
+            ExtensionManager::new(
+                Arc::new(McpSessionManager::new()),
+                Arc::new(McpProcessManager::new()),
+                Arc::new(InMemorySecretsStore::new(crypto)),
+                Arc::new(ToolRegistry::new()),
+                None,
+                None,
+                dir.path().join("tools"),
+                channels_dir.clone(),
+                None,
+                "test".to_string(),
+                Some(db),
+                Vec::new(),
+            )
+        };
+
+        let channel_manager = Arc::new(ChannelManager::new());
+        let runtime = Arc::new(
+            WasmChannelRuntime::new(WasmChannelRuntimeConfig::for_testing())
+                .map_err(|err| format!("runtime: {err}"))?,
+        );
+        let pairing_store = Arc::new(PairingStore::with_base_dir(
+            dir.path().join("pairing-state"),
+        ));
+        let router = Arc::new(WasmChannelRouter::new());
+        manager
+            .set_channel_runtime(
+                Arc::clone(&channel_manager),
+                Arc::clone(&runtime),
+                Arc::clone(&pairing_store),
+                Arc::clone(&router),
+                std::collections::HashMap::new(),
+            )
+            .await;
+        manager
+            .set_test_wasm_channel_loader(Arc::new({
+                let runtime = Arc::clone(&runtime);
+                let pairing_store = Arc::clone(&pairing_store);
+                move |name| {
+                    Ok(make_test_loaded_channel(
+                        Arc::clone(&runtime),
+                        name,
+                        Arc::clone(&pairing_store),
+                    ))
+                }
+            }))
+            .await;
+        manager
+            .set_test_telegram_binding_resolver(Arc::new(|_token, existing_owner_id| {
+                if existing_owner_id.is_some() {
+                    return Err(ExtensionError::Other(
+                        "owner binding should be derived during setup".to_string(),
+                    ));
+                }
+                Ok(TelegramBindingResult::Bound(TelegramBindingData {
+                    owner_id: 424242,
+                    bot_username: Some("test_hot_bot".to_string()),
+                    binding_state: TelegramOwnerBindingState::VerifiedNow,
+                }))
+            }))
+            .await;
+
+        manager
+            .configure(
+                "telegram",
+                &std::collections::HashMap::from([(
+                    "telegram_bot_token".to_string(),
+                    "123456789:ABCdefGhI".to_string(),
+                )]),
+                &std::collections::HashMap::new(),
+                "test",
+            )
+            .await
+            .map_err(|err| format!("configure succeeds: {err}"))?;
+
+        let summary = manager
+            .llm_extension_state_summary("test")
+            .await
+            .map_err(|err| format!("summary: {err}"))?
+            .ok_or_else(|| "expected extension summary".to_string())?;
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&summary).map_err(|err| format!("parse summary: {err}"))?;
+        let channels = parsed
+            .get("channels")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| format!("missing channels array: {parsed}"))?;
+        let telegram = channels
+            .iter()
+            .find(|item| item.get("name") == Some(&serde_json::Value::String("telegram".into())))
+            .ok_or_else(|| format!("missing telegram item: {parsed}"))?;
+        require_eq(
+            telegram.get("status"),
+            Some(&serde_json::json!(["authenticated", "active", "owner-bound"])),
+            "telegram summary status",
+        )
+    }
+
+    #[test]
+    fn test_llm_extension_summary_item_sanitizes_names_and_uses_tool_counts() {
+        let extension = InstalledExtension {
+            name: "evil\nname```ignore".to_string(),
+            kind: ExtensionKind::McpServer,
+            display_name: None,
+            description: None,
+            url: None,
+            authenticated: true,
+            active: true,
+            tools: vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "gamma".to_string(),
+                "delta".to_string(),
+                "epsilon".to_string(),
+                "zeta".to_string(),
+            ],
+            needs_setup: false,
+            has_auth: false,
+            installed: true,
+            activation_error: None,
+            version: None,
+        };
+
+        let parsed = super::llm_extension_summary_item(&extension, false);
+        assert_eq!(
+            parsed["name"],
+            serde_json::Value::String("evilname___ignore".to_string())
+        );
+        assert_eq!(parsed["loaded_tool_count"], serde_json::json!(6));
+        assert!(!parsed.to_string().contains("alpha"));
     }
 
     #[tokio::test]

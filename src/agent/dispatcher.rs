@@ -137,6 +137,23 @@ impl Agent {
             }
         }
 
+        if !is_group_chat
+            && let Some(extension_manager) = self.deps.extension_manager.as_ref()
+        {
+            match extension_manager
+                .llm_extension_state_summary(&message.user_id)
+                .await
+            {
+                Ok(Some(summary)) => {
+                    reasoning = reasoning.with_extension_state_summary(summary);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!("Could not load extension state summary: {}", e);
+                }
+            }
+        }
+
         if let Some(prompt) = system_prompt {
             reasoning = reasoning.with_system_prompt(prompt);
         }
@@ -1351,6 +1368,72 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingLlmProvider {
+        last_system_prompt: std::sync::Mutex<Option<String>>,
+    }
+
+    impl RecordingLlmProvider {
+        fn capture_system_prompt(&self, messages: &[crate::llm::ChatMessage]) {
+            if let Some(message) = messages
+                .iter()
+                .find(|message| matches!(message.role, crate::llm::Role::System))
+            {
+                *self.last_system_prompt.lock().expect("system prompt lock") =
+                    Some(message.content.clone());
+            }
+        }
+
+        fn last_system_prompt(&self) -> Option<String> {
+            self.last_system_prompt
+                .lock()
+                .expect("system prompt lock")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for RecordingLlmProvider {
+        fn model_name(&self) -> &str {
+            "recording-mock"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, crate::error::LlmError> {
+            self.capture_system_prompt(&request.messages);
+            Ok(CompletionResponse {
+                content: "ok".to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
+            self.capture_system_prompt(&request.messages);
+            Ok(ToolCompletionResponse {
+                content: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+    }
+
     /// Build a minimal `Agent` for unit testing (no DB, no workspace, no extensions).
     fn make_test_agent() -> Agent {
         let deps = AgentDeps {
@@ -2295,6 +2378,107 @@ mod tests {
         )
     }
 
+    fn make_test_agent_with_extension_manager(
+        llm: Arc<dyn LlmProvider>,
+        extension_manager: Arc<crate::extensions::ExtensionManager>,
+    ) -> Agent {
+        let deps = AgentDeps {
+            owner_id: "default".to_string(),
+            store: None,
+            llm,
+            cheap_llm: None,
+            safety: Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 100_000,
+                injection_check_enabled: false,
+            })),
+            tools: Arc::new(ToolRegistry::new()),
+            workspace: None,
+            extension_manager: Some(extension_manager),
+            skill_registry: None,
+            skill_catalog: None,
+            skills_config: SkillsConfig::default(),
+            hooks: Arc::new(HookRegistry::new()),
+            cost_guard: Arc::new(CostGuard::new(CostGuardConfig::default())),
+            sse_tx: None,
+            http_interceptor: None,
+            transcription: None,
+            document_extraction: None,
+            sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            builder: None,
+            llm_backend: "nearai".to_string(),
+            tenant_rates: Arc::new(crate::tenant::TenantRateRegistry::new(4, 3)),
+        };
+
+        Agent::new(
+            AgentConfig {
+                name: "test-agent".to_string(),
+                max_parallel_jobs: 1,
+                job_timeout: Duration::from_secs(60),
+                stuck_threshold: Duration::from_secs(60),
+                repair_check_interval: Duration::from_secs(30),
+                max_repair_attempts: 1,
+                use_planning: false,
+                session_idle_timeout: Duration::from_secs(300),
+                allow_local_tools: false,
+                max_cost_per_day_cents: None,
+                max_actions_per_hour: None,
+                max_cost_per_user_per_day_cents: None,
+                max_tool_iterations: 5,
+                auto_approve_tools: true,
+                default_timezone: "UTC".to_string(),
+                max_jobs_per_user: None,
+                max_tokens_per_job: 0,
+                multi_tenant: false,
+                max_llm_concurrent_per_user: None,
+                max_jobs_concurrent_per_user: None,
+            },
+            deps,
+            Arc::new(ChannelManager::new()),
+            None,
+            None,
+            None,
+            Some(Arc::new(ContextManager::new(1))),
+            None,
+        )
+    }
+
+    fn make_test_extension_manager() -> (
+        Arc<crate::extensions::ExtensionManager>,
+        tempfile::TempDir,
+    ) {
+        use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+        use crate::tools::mcp::process::McpProcessManager;
+        use crate::tools::mcp::session::McpSessionManager;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let tools_dir = tempdir.path().join("tools");
+        let channels_dir = tempdir.path().join("channels");
+        std::fs::create_dir_all(&tools_dir).expect("tools dir");
+        std::fs::create_dir_all(&channels_dir).expect("channels dir");
+
+        let key = secrecy::SecretString::from(crate::secrets::keychain::generate_master_key_hex());
+        let crypto = Arc::new(SecretsCrypto::new(key).expect("crypto"));
+        let secrets: Arc<dyn crate::secrets::SecretsStore + Send + Sync> =
+            Arc::new(InMemorySecretsStore::new(crypto));
+
+        let manager = Arc::new(crate::extensions::ExtensionManager::new(
+            Arc::new(McpSessionManager::new()),
+            Arc::new(McpProcessManager::new()),
+            secrets,
+            Arc::new(crate::tools::ToolRegistry::new()),
+            None,
+            None,
+            tools_dir,
+            channels_dir,
+            None,
+            "test".to_string(),
+            None,
+            vec![],
+        ));
+
+        (manager, tempdir)
+    }
+
     /// Regression test for the infinite loop bug (PR #252) where `continue`
     /// skipped the index increment. When every tool call fails (e.g., tool not
     /// found), the dispatcher must still advance through all calls and
@@ -2464,6 +2648,94 @@ mod tests {
                 panic!("Expected text response, got NeedApproval");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_private_chat_prompt_includes_extension_state_summary() {
+        use crate::agent::session::Session;
+        use crate::channels::IncomingMessage;
+        use crate::llm::ChatMessage;
+        use tokio::sync::Mutex;
+
+        let llm = Arc::new(RecordingLlmProvider::default());
+        let (extension_manager, _tempdir) = make_test_extension_manager();
+        let summary = serde_json::to_string_pretty(&serde_json::json!({
+            "channels": [
+                {
+                    "name": "telegram",
+                    "status": ["authenticated", "active", "owner-bound"]
+                }
+            ]
+        }))
+        .expect("summary");
+        extension_manager
+            .set_test_llm_extension_state_summary("test-user", Some(summary))
+            .await;
+
+        let agent = make_test_agent_with_extension_manager(llm.clone(), extension_manager);
+        let session = Arc::new(Mutex::new(Session::new("test-user")));
+        let thread_id = {
+            let mut sess = session.lock().await;
+            sess.create_thread().id
+        };
+
+        let message = IncomingMessage::new("telegram", "test-user", "hello");
+        let initial_messages = vec![ChatMessage::user("hello")];
+        let tenant = agent.tenant_ctx("test-user").await;
+
+        let result = agent
+            .run_agentic_loop(&message, tenant, session, thread_id, initial_messages)
+            .await;
+        assert!(result.is_ok());
+
+        let prompt = llm.last_system_prompt().expect("captured system prompt");
+        assert!(prompt.contains("## Extensions"));
+        assert!(prompt.contains("Current extension state for this user"));
+        assert!(prompt.contains("\"name\": \"telegram\""));
+    }
+
+    #[tokio::test]
+    async fn test_group_chat_prompt_excludes_extension_state_summary() {
+        use crate::agent::session::Session;
+        use crate::channels::IncomingMessage;
+        use crate::llm::ChatMessage;
+        use tokio::sync::Mutex;
+
+        let llm = Arc::new(RecordingLlmProvider::default());
+        let (extension_manager, _tempdir) = make_test_extension_manager();
+        let summary = serde_json::to_string_pretty(&serde_json::json!({
+            "channels": [
+                {
+                    "name": "telegram",
+                    "status": ["authenticated", "active", "owner-bound"]
+                }
+            ]
+        }))
+        .expect("summary");
+        extension_manager
+            .set_test_llm_extension_state_summary("test-user", Some(summary))
+            .await;
+
+        let agent = make_test_agent_with_extension_manager(llm.clone(), extension_manager);
+        let session = Arc::new(Mutex::new(Session::new("test-user")));
+        let thread_id = {
+            let mut sess = session.lock().await;
+            sess.create_thread().id
+        };
+
+        let mut message = IncomingMessage::new("telegram", "test-user", "hello");
+        message.metadata = serde_json::json!({ "chat_type": "group" });
+        let initial_messages = vec![ChatMessage::user("hello")];
+        let tenant = agent.tenant_ctx("test-user").await;
+
+        let result = agent
+            .run_agentic_loop(&message, tenant, session, thread_id, initial_messages)
+            .await;
+        assert!(result.is_ok());
+
+        let prompt = llm.last_system_prompt().expect("captured system prompt");
+        assert!(!prompt.contains("Current extension state for this user"));
+        assert!(!prompt.contains("\"name\": \"telegram\""));
     }
 
     #[test]
