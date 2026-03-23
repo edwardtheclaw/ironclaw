@@ -156,11 +156,51 @@ impl ThreadManager {
 
         // Spawn background task
         let store_for_task = Arc::clone(&self.store);
+        let llm_for_reflection = Arc::clone(&self.llm);
         let handle = tokio::spawn(async move {
             let mut exec = exec_loop;
             let result = exec.run().await;
             debug!(thread_id = %thread_id, "thread execution finished");
-            // Save final thread state to store (for trace recording)
+
+            // Run retrospective trace analysis (non-LLM, always runs)
+            let trace = crate::executor::trace::build_trace(&exec.thread);
+            if !trace.issues.is_empty() {
+                crate::executor::trace::log_trace_summary(&trace);
+            }
+
+            // Write trace file if enabled
+            if crate::executor::trace::is_trace_enabled() {
+                crate::executor::trace::write_trace(&trace);
+            }
+
+            // Run LLM reflection if enabled and thread completed
+            if exec.thread.config.enable_reflection
+                && (exec.thread.state == crate::types::thread::ThreadState::Completed
+                    || exec.thread.state == crate::types::thread::ThreadState::Done)
+            {
+                debug!(thread_id = %thread_id, "running reflection pipeline");
+                match crate::reflection::reflect(&exec.thread, &llm_for_reflection).await {
+                    Ok(reflection) => {
+                        debug!(
+                            thread_id = %thread_id,
+                            docs = reflection.docs.len(),
+                            tokens = reflection.tokens_used.total(),
+                            "reflection complete"
+                        );
+                        for doc in &reflection.docs {
+                            let _ = store_for_task.save_memory_doc(doc).await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            thread_id = %thread_id,
+                            "reflection failed: {e}"
+                        );
+                    }
+                }
+            }
+
+            // Save final thread state to store
             let _ = store_for_task.save_thread(&exec.thread).await;
             result
         });

@@ -168,7 +168,10 @@ pub async fn handle_with_engine(
             content,
             state.default_project_id,
             &message.user_id,
-            ThreadConfig::default(),
+            ThreadConfig {
+                enable_reflection: true,
+                ..ThreadConfig::default()
+            },
         )
         .await
         .map_err(|e| {
@@ -222,14 +225,9 @@ pub async fn handle_with_engine(
         .record_thread_outcome(conv_id, thread_id, &outcome)
         .await;
 
-    // Trace recording + retrospective analysis
-    if ironclaw_engine::executor::trace::is_trace_enabled()
-        && let Ok(Some(thread)) = state.store.load_thread(thread_id).await
-    {
-        let trace = ironclaw_engine::executor::trace::build_trace(&thread);
-        ironclaw_engine::executor::trace::log_trace_summary(&trace);
-        ironclaw_engine::executor::trace::write_trace(&trace);
-    }
+    // Note: trace recording, retrospective analysis, and LLM reflection
+    // all run automatically inside ThreadManager after the thread completes.
+    // See crates/ironclaw_engine/src/runtime/manager.rs.
 
     // Convert outcome to response
     match outcome {
