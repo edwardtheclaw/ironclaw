@@ -176,19 +176,24 @@ pub(crate) fn parse_string_env(
     Ok(optional_env(key)?.unwrap_or_else(|| default.into()))
 }
 
-/// Redact userinfo (username:password) from a URL for safe inclusion in error messages.
+/// Redact userinfo (username:password) from a parsed URL for safe inclusion in error messages.
+fn redact_parsed_url(parsed: &reqwest::Url) -> String {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        let mut redacted = parsed.clone();
+        let _ = redacted.set_username("");
+        let _ = redacted.set_password(None);
+        format!("{} (credentials redacted)", redacted)
+    } else {
+        parsed.to_string()
+    }
+}
+
+/// Redact userinfo (username:password) from a URL string for safe inclusion in error messages.
+///
+/// Use this when you only have the raw string and no parsed URL (e.g., on a parse-error path).
 fn redact_url(url: &str) -> String {
     match reqwest::Url::parse(url) {
-        Ok(mut parsed) => {
-            if !parsed.username().is_empty() || parsed.password().is_some() {
-                // Clear credentials before displaying
-                let _ = parsed.set_username("");
-                let _ = parsed.set_password(None);
-                format!("{} (credentials redacted)", parsed)
-            } else {
-                parsed.to_string()
-            }
-        }
+        Ok(parsed) => redact_parsed_url(&parsed),
         Err(_) => "<invalid URL>".to_string(),
     }
 }
@@ -205,11 +210,10 @@ fn redact_url(url: &str) -> String {
 pub(crate) fn validate_base_url(url: &str, field_name: &str) -> Result<(), ConfigError> {
     use std::net::{IpAddr, Ipv4Addr};
 
-    let safe_url = redact_url(url);
-
+    // Parse once and reuse — on parse failure, fall back to `redact_url()` for the error message.
     let parsed = reqwest::Url::parse(url).map_err(|e| ConfigError::InvalidValue {
         key: field_name.to_string(),
-        message: format!("invalid URL '{}': {}", safe_url, e),
+        message: format!("invalid URL '{}': {}", redact_url(url), e),
     })?;
 
     let scheme = parsed.scheme();
