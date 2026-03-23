@@ -60,13 +60,21 @@ impl EffectExecutor for EffectBridgeAdapter {
         .await;
 
         match result {
-            Ok(output) => Ok(ActionResult {
-                call_id: String::new(), // Caller fills this in
-                action_name: action_name.to_string(),
-                output: serde_json::json!(output),
-                is_error: false,
-                duration: Duration::from_millis(1), // TODO: measure actual duration
-            }),
+            Ok(output) => {
+                // Tool output is a String. If it's valid JSON, parse it so the
+                // Python code gets a dict/list instead of a string that needs
+                // manual parsing. This prevents double-serialization.
+                let output_value = serde_json::from_str::<serde_json::Value>(&output)
+                    .unwrap_or(serde_json::Value::String(output));
+
+                Ok(ActionResult {
+                    call_id: String::new(), // Caller fills this in
+                    action_name: action_name.to_string(),
+                    output: output_value,
+                    is_error: false,
+                    duration: Duration::from_millis(1), // TODO: measure actual duration
+                })
+            }
             Err(e) => Ok(ActionResult {
                 call_id: String::new(),
                 action_name: action_name.to_string(),
