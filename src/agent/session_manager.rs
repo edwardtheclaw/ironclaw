@@ -148,9 +148,8 @@ impl SessionManager {
         // We only adopt it if no thread_map entry maps to this UUID —
         // otherwise it belongs to a different channel scope.
         // Use pre-parsed UUID if available, otherwise parse from string.
-        let ext_uuid = parsed_uuid.or_else(|| {
-            external_thread_id.and_then(|ext_tid| Uuid::parse_str(ext_tid).ok())
-        });
+        let ext_uuid = parsed_uuid
+            .or_else(|| external_thread_id.and_then(|ext_tid| Uuid::parse_str(ext_tid).ok()));
 
         if let Some(ext_uuid) = ext_uuid {
             let thread_map = self.thread_map.read().await;
@@ -1010,12 +1009,7 @@ mod tests {
         // Resolve with parsed_uuid=None but a valid UUID string -- should
         // fall back to parsing the string and still adopt the thread
         let (_, resolved) = manager
-            .resolve_thread_with_parsed_uuid(
-                "user2",
-                "chan2",
-                Some(&known_id.to_string()),
-                None,
-            )
+            .resolve_thread_with_parsed_uuid("user2", "chan2", Some(&known_id.to_string()), None)
             .await;
         assert_eq!(resolved, known_id);
     }
