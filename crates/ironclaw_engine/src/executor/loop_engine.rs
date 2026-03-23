@@ -35,6 +35,8 @@ pub struct ExecutionLoop {
     user_id: String,
     /// Optional broadcast sender for live event streaming.
     event_tx: Option<tokio::sync::broadcast::Sender<crate::types::event::ThreadEvent>>,
+    /// Optional retrieval engine for injecting prior knowledge into context.
+    retrieval: Option<crate::memory::RetrievalEngine>,
 }
 
 impl ExecutionLoop {
@@ -56,6 +58,7 @@ impl ExecutionLoop {
             signal_rx,
             user_id,
             event_tx: None,
+            retrieval: None,
         }
     }
 
@@ -65,6 +68,12 @@ impl ExecutionLoop {
         tx: tokio::sync::broadcast::Sender<crate::types::event::ThreadEvent>,
     ) -> Self {
         self.event_tx = Some(tx);
+        self
+    }
+
+    /// Set the retrieval engine for injecting prior knowledge into context.
+    pub fn with_retrieval(mut self, retrieval: crate::memory::RetrievalEngine) -> Self {
+        self.retrieval = Some(retrieval);
         self
     }
 
@@ -187,9 +196,21 @@ impl ExecutionLoop {
             // 4. Get active leases
             let active_leases = self.leases.active_for_thread(self.thread.id).await;
 
-            // 5. Build context
-            let (messages, _actions) =
-                build_step_context(&self.thread.messages, &active_leases, &self.effects).await?;
+            // 5. Build context (inject prior knowledge on first iteration only)
+            let retrieval_ref = if iteration == 0 {
+                self.retrieval.as_ref()
+            } else {
+                None
+            };
+            let (messages, _actions) = build_step_context(
+                &self.thread.messages,
+                &active_leases,
+                &self.effects,
+                retrieval_ref,
+                self.thread.project_id,
+                &self.thread.goal,
+            )
+            .await?;
 
             // 6. Create step
             let mut step = Step::new(self.thread.id, iteration + 1);
@@ -532,11 +553,24 @@ impl ExecutionLoop {
                         output_parts.join("\n")
                     };
                     // Truncate total output to prevent context bloat
-                    let metadata = if output_text.len() > 8000 {
+                    let mut metadata = if output_text.len() > 8000 {
                         format!("[TRUNCATED: last 8000 of {} chars]\n{}", output_text.len(), &output_text[output_text.len()-8000..])
                     } else {
                         output_text
                     };
+
+                    // If code had errors, remind the model about `state`
+                    if code_result.had_error && !persisted_state.as_object().is_some_and(|m| m.is_empty()) {
+                        let keys: Vec<&str> = persisted_state
+                            .as_object()
+                            .map(|m| m.keys().map(String::as_str).collect())
+                            .unwrap_or_default();
+                        metadata.push_str(&format!(
+                            "\n\n[HINT] Variables don't persist between code blocks. Use the `state` dict to access data from previous steps. Available keys: {:?}",
+                            keys
+                        ));
+                    }
+
                     self.thread.add_message(ThreadMessage::system(metadata));
 
                     step.status = StepStatus::Completed;

@@ -151,8 +151,12 @@ impl ThreadManager {
         let leases = Arc::clone(&self.leases);
         let policy = Arc::clone(&self.policy);
 
+        let store_for_retrieval = Arc::clone(&self.store);
+        let retrieval = crate::memory::RetrievalEngine::new(store_for_retrieval);
+
         let exec_loop = ExecutionLoop::new(thread, llm, effects, leases, policy, rx, user_id)
-            .with_event_tx(self.event_tx.clone());
+            .with_event_tx(self.event_tx.clone())
+            .with_retrieval(retrieval);
 
         // Spawn background task
         let store_for_task = Arc::clone(&self.store);

@@ -77,6 +77,42 @@ pub async fn reflect(
         total_tokens.output_tokens += tokens.output_tokens;
     }
 
+    // 4. Missing capabilities (if tool-not-found errors detected)
+    let has_missing_tools = thread.events.iter().any(|e| {
+        if let EventKind::ActionFailed { error, .. } = &e.kind {
+            error.contains("not found") || error.contains("not available")
+        } else {
+            false
+        }
+    });
+    if has_missing_tools {
+        let (spec_doc, tokens) =
+            produce_doc(thread, llm, DocType::Spec, &transcript, SPEC_PROMPT).await?;
+        if spec_doc.content.len() > 20 {
+            docs.push(spec_doc);
+        }
+        total_tokens.input_tokens += tokens.input_tokens;
+        total_tokens.output_tokens += tokens.output_tokens;
+    }
+
+    // 5. Playbook (successful threads with multiple tool-using steps)
+    let action_count = thread
+        .events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::ActionExecuted { .. }))
+        .count();
+    let thread_succeeded =
+        thread.state == crate::types::thread::ThreadState::Completed && !thread_failed;
+    if thread_succeeded && action_count >= 2 {
+        let (playbook_doc, tokens) =
+            produce_doc(thread, llm, DocType::Playbook, &transcript, PLAYBOOK_PROMPT).await?;
+        if playbook_doc.content.len() > 20 {
+            docs.push(playbook_doc);
+        }
+        total_tokens.input_tokens += tokens.input_tokens;
+        total_tokens.output_tokens += tokens.output_tokens;
+    }
+
     debug!(
         thread_id = %thread.id,
         docs_produced = docs.len(),
@@ -114,6 +150,21 @@ Identify any unresolved issues from this thread. Focus on:
 - Missing tools or capabilities that were needed
 - Data quality issues encountered
 If there are no unresolved issues, write 'No issues.'.";
+
+const SPEC_PROMPT: &str = "\
+This thread encountered missing tools or capabilities. Analyze the errors and identify:
+- Which tool names were attempted but not found
+- What the correct tool name might be (if a similar tool exists under a different name)
+- What capabilities would need to be added to handle this task
+For each missing capability, write one line: MISSING: <attempted_name> -> <suggestion or description>.
+If the tool exists under a different name, write: ALIAS: <attempted_name> -> <correct_name>.";
+
+const PLAYBOOK_PROMPT: &str = "\
+This thread successfully completed a multi-step task. Extract a reusable playbook:
+- List the steps taken in order (tool calls, queries, transformations)
+- Note which tools were used and in what sequence
+- Describe the pattern so it can be reused for similar tasks
+Write the playbook as a numbered list of steps. Be specific about tool names and parameters used.";
 
 // ── Helpers ─────────────────────────────────────────────────
 
@@ -207,4 +258,199 @@ async fn produce_doc(
         .with_source_thread(thread.id);
 
     Ok((doc, output.usage))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::llm::{LlmCallConfig, LlmOutput};
+    use crate::types::capability::ActionDef;
+    use crate::types::event::ThreadEvent;
+    use crate::types::project::ProjectId;
+    use crate::types::step::TokenUsage;
+    use crate::types::thread::{ThreadConfig, ThreadType};
+    use std::sync::Mutex;
+
+    struct MockLlm {
+        responses: Mutex<Vec<String>>,
+    }
+
+    impl MockLlm {
+        fn with_responses(responses: Vec<&str>) -> Arc<dyn crate::traits::llm::LlmBackend> {
+            Arc::new(Self {
+                responses: Mutex::new(responses.into_iter().map(String::from).collect()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::traits::llm::LlmBackend for MockLlm {
+        async fn complete(
+            &self,
+            _: &[ThreadMessage],
+            _: &[ActionDef],
+            _: &LlmCallConfig,
+        ) -> Result<LlmOutput, EngineError> {
+            let mut r = self.responses.lock().unwrap();
+            let text = if r.is_empty() {
+                "mock response".to_string()
+            } else {
+                r.remove(0)
+            };
+            Ok(LlmOutput {
+                response: LlmResponse::Text(text),
+                usage: TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    ..TokenUsage::default()
+                },
+            })
+        }
+
+        fn model_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    fn make_completed_thread() -> Thread {
+        let mut thread = Thread::new(
+            "test task",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            ThreadConfig::default(),
+        );
+        thread.state = crate::types::thread::ThreadState::Completed;
+        thread
+    }
+
+    #[tokio::test]
+    async fn reflect_produces_summary_for_clean_thread() {
+        let thread = make_completed_thread();
+        let llm = MockLlm::with_responses(vec!["Thread accomplished the test task successfully."]);
+
+        let result = reflect(&thread, &llm).await.unwrap();
+        assert_eq!(result.docs.len(), 1);
+        assert_eq!(result.docs[0].doc_type, DocType::Summary);
+    }
+
+    #[tokio::test]
+    async fn reflect_produces_lesson_on_errors() {
+        let mut thread = make_completed_thread();
+        thread.events.push(ThreadEvent::new(
+            thread.id,
+            EventKind::ActionFailed {
+                step_id: crate::types::step::StepId::new(),
+                action_name: "web_search".into(),
+                call_id: String::new(),
+                error: "Tool web_search not found".into(),
+            },
+        ));
+
+        let llm = MockLlm::with_responses(vec![
+            "Summary of thread with errors.",
+            "Lesson: use web-search instead of web_search.",
+            "Issue: web_search tool is missing.",
+            "ALIAS: web_search -> web-search",
+        ]);
+
+        let result = reflect(&thread, &llm).await.unwrap();
+        let types: Vec<DocType> = result.docs.iter().map(|d| d.doc_type).collect();
+        assert!(types.contains(&DocType::Summary));
+        assert!(types.contains(&DocType::Lesson));
+        assert!(types.contains(&DocType::Issue));
+        assert!(types.contains(&DocType::Spec));
+    }
+
+    #[tokio::test]
+    async fn reflect_produces_spec_on_tool_not_found() {
+        let mut thread = make_completed_thread();
+        thread.events.push(ThreadEvent::new(
+            thread.id,
+            EventKind::ActionFailed {
+                step_id: crate::types::step::StepId::new(),
+                action_name: "missing_tool".into(),
+                call_id: String::new(),
+                error: "Tool missing_tool not found".into(),
+            },
+        ));
+
+        let llm = MockLlm::with_responses(vec![
+            "Summary.",
+            "Lesson learned.",
+            "Issues found.",
+            "MISSING: missing_tool -> needs implementation",
+        ]);
+
+        let result = reflect(&thread, &llm).await.unwrap();
+        let spec_docs: Vec<&MemoryDoc> = result
+            .docs
+            .iter()
+            .filter(|d| d.doc_type == DocType::Spec)
+            .collect();
+        assert_eq!(spec_docs.len(), 1);
+        assert!(spec_docs[0].content.contains("MISSING"));
+    }
+
+    #[tokio::test]
+    async fn reflect_produces_playbook_on_successful_multi_step() {
+        let mut thread = make_completed_thread();
+        // Add 2+ action executed events to trigger playbook
+        thread.events.push(ThreadEvent::new(
+            thread.id,
+            EventKind::ActionExecuted {
+                step_id: crate::types::step::StepId::new(),
+                action_name: "web-search".into(),
+                call_id: String::new(),
+                duration_ms: 100,
+            },
+        ));
+        thread.events.push(ThreadEvent::new(
+            thread.id,
+            EventKind::ActionExecuted {
+                step_id: crate::types::step::StepId::new(),
+                action_name: "llm_query".into(),
+                call_id: String::new(),
+                duration_ms: 200,
+            },
+        ));
+
+        let llm = MockLlm::with_responses(vec![
+            "Summary of successful thread.",
+            "1. Search web for topic\n2. Analyze results with llm_query\n3. Return summary",
+        ]);
+
+        let result = reflect(&thread, &llm).await.unwrap();
+        let playbook_docs: Vec<&MemoryDoc> = result
+            .docs
+            .iter()
+            .filter(|d| d.doc_type == DocType::Playbook)
+            .collect();
+        assert_eq!(playbook_docs.len(), 1);
+        assert!(playbook_docs[0].title.starts_with("Playbook:"));
+    }
+
+    #[tokio::test]
+    async fn reflect_skips_playbook_for_single_action() {
+        let mut thread = make_completed_thread();
+        // Only 1 action — not enough for a playbook
+        thread.events.push(ThreadEvent::new(
+            thread.id,
+            EventKind::ActionExecuted {
+                step_id: crate::types::step::StepId::new(),
+                action_name: "echo".into(),
+                call_id: String::new(),
+                duration_ms: 5,
+            },
+        ));
+
+        let llm = MockLlm::with_responses(vec!["Simple summary."]);
+
+        let result = reflect(&thread, &llm).await.unwrap();
+        let playbook_docs: Vec<&MemoryDoc> = result
+            .docs
+            .iter()
+            .filter(|d| d.doc_type == DocType::Playbook)
+            .collect();
+        assert!(playbook_docs.is_empty());
+    }
 }
