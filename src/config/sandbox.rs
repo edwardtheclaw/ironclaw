@@ -329,6 +329,42 @@ fn parse_oauth_access_token(json: &str) -> Option<String> {
     Some(token.to_string())
 }
 
+/// ACP (Agent Client Protocol) mode configuration.
+///
+/// Controls whether ACP agent delegation is available. Agent definitions
+/// are stored separately in a DB blob (key `"acp_agents"`) or disk file
+/// (`~/.ironclaw/acp-agents.json`), following the MCP server pattern.
+#[derive(Debug, Clone)]
+pub struct AcpModeConfig {
+    /// Whether ACP agent mode is available.
+    pub enabled: bool,
+    /// Memory limit in MB for ACP containers.
+    pub memory_limit_mb: u64,
+    /// Maximum timeout for an ACP session in seconds.
+    pub timeout_secs: u64,
+}
+
+impl Default for AcpModeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            memory_limit_mb: 4096,
+            timeout_secs: 1800,
+        }
+    }
+}
+
+impl AcpModeConfig {
+    pub(crate) fn resolve(settings: &crate::settings::Settings) -> Result<Self, ConfigError> {
+        let defaults = Self::default();
+        Ok(Self {
+            enabled: parse_bool_env("ACP_ENABLED", settings.sandbox.acp_enabled)?,
+            memory_limit_mb: parse_optional_env("ACP_MEMORY_LIMIT_MB", defaults.memory_limit_mb)?,
+            timeout_secs: parse_optional_env("ACP_TIMEOUT_SECS", defaults.timeout_secs)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::sandbox::*;
