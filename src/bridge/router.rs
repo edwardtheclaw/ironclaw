@@ -13,7 +13,7 @@ use ironclaw_engine::{
 use crate::agent::Agent;
 use crate::bridge::effect_adapter::EffectBridgeAdapter;
 use crate::bridge::llm_adapter::LlmBridgeAdapter;
-use crate::bridge::store_adapter::InMemoryStore;
+use crate::bridge::store_adapter::HybridStore;
 use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::error::Error;
 
@@ -37,7 +37,7 @@ struct EngineState {
     conversation_manager: ConversationManager,
     effect_adapter: Arc<EffectBridgeAdapter>,
     #[allow(dead_code)]
-    store: Arc<InMemoryStore>,
+    store: Arc<HybridStore>,
     default_project_id: ironclaw_engine::ProjectId,
     /// Currently pending approval (if any).
     pending_approval: RwLock<Option<PendingApproval>>,
@@ -74,7 +74,10 @@ async fn get_or_init_engine(agent: &Agent) -> Result<(), Error> {
         agent.hooks().clone(),
     ));
 
-    let store = Arc::new(InMemoryStore::new());
+    let store = Arc::new(HybridStore::new(agent.workspace().cloned()));
+
+    // Load existing reflection docs from workspace (lessons from prior sessions)
+    store.load_docs_from_workspace().await;
 
     // Build capability registry from available tools
     let mut capabilities = CapabilityRegistry::new();

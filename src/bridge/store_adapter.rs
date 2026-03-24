@@ -1,55 +1,132 @@
-//! In-memory store adapter — implements `ironclaw_engine::Store` without database tables.
+//! Hybrid store adapter — in-memory for ephemeral data, workspace for durable knowledge.
 //!
-//! Phase 6: threads and state live in memory during execution. Persistent
-//! storage comes in Phase 7 when we add database migrations.
+//! Threads, steps, events, and leases are ephemeral (per-session).
+//! MemoryDocs (lessons, specs, playbooks from reflection) persist to the
+//! workspace so the engine learns across restarts.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use tokio::sync::RwLock;
+use tracing::debug;
 
 use ironclaw_engine::{
-    CapabilityLease, DocId, EngineError, LeaseId, MemoryDoc, Project, ProjectId, Step, Store,
-    Thread, ThreadEvent, ThreadId, ThreadState,
+    CapabilityLease, DocId, DocType, EngineError, LeaseId, MemoryDoc, Project, ProjectId, Step,
+    Store, Thread, ThreadEvent, ThreadId, ThreadState,
     types::mission::{Mission, MissionId, MissionStatus},
 };
 
-/// In-memory implementation of the engine's `Store` trait.
-///
-/// All state is discarded when the agent process restarts. This is
-/// sufficient for Phase 6 (proving the engine works end-to-end).
-pub struct InMemoryStore {
+use crate::workspace::Workspace;
+
+/// Workspace path prefix for engine memory docs.
+const ENGINE_DOCS_PREFIX: &str = "engine/docs";
+
+/// Hybrid store: in-memory for session data, workspace for durable knowledge.
+pub struct HybridStore {
+    // ── Ephemeral (in-memory, per-session) ──
     threads: RwLock<HashMap<ThreadId, Thread>>,
     steps: RwLock<HashMap<ThreadId, Vec<Step>>>,
     events: RwLock<HashMap<ThreadId, Vec<ThreadEvent>>>,
     projects: RwLock<HashMap<ProjectId, Project>>,
-    docs: RwLock<HashMap<DocId, MemoryDoc>>,
     leases: RwLock<HashMap<LeaseId, CapabilityLease>>,
     missions: RwLock<HashMap<MissionId, Mission>>,
+
+    // ── Durable (workspace-backed, survives restarts) ──
+    /// In-memory cache of docs (always in sync with workspace).
+    docs: RwLock<HashMap<DocId, MemoryDoc>>,
+    /// Workspace for persistent storage. None if workspace unavailable.
+    workspace: Option<Arc<Workspace>>,
 }
 
-impl InMemoryStore {
-    pub fn new() -> Self {
+impl HybridStore {
+    pub fn new(workspace: Option<Arc<Workspace>>) -> Self {
         Self {
             threads: RwLock::new(HashMap::new()),
             steps: RwLock::new(HashMap::new()),
             events: RwLock::new(HashMap::new()),
             projects: RwLock::new(HashMap::new()),
-            docs: RwLock::new(HashMap::new()),
             leases: RwLock::new(HashMap::new()),
             missions: RwLock::new(HashMap::new()),
+            docs: RwLock::new(HashMap::new()),
+            workspace,
+        }
+    }
+
+    /// Load existing docs from workspace on startup.
+    pub async fn load_docs_from_workspace(&self) {
+        let Some(ref ws) = self.workspace else {
+            return;
+        };
+
+        // List all engine doc files
+        let entries = match ws.list(ENGINE_DOCS_PREFIX).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                debug!("no engine docs in workspace: {e}");
+                return;
+            }
+        };
+
+        let mut loaded = 0;
+        for entry in &entries {
+            if entry.is_directory || !entry.path.ends_with(".json") {
+                continue;
+            }
+            match ws.read(&entry.path).await {
+                Ok(ws_doc) => {
+                    if let Ok(doc) = serde_json::from_str::<MemoryDoc>(&ws_doc.content) {
+                        self.docs.write().await.insert(doc.id, doc);
+                        loaded += 1;
+                    }
+                }
+                Err(e) => {
+                    debug!(path = %entry.path, "failed to read engine doc: {e}");
+                }
+            }
+        }
+
+        if loaded > 0 {
+            debug!(loaded, "loaded engine docs from workspace");
+        }
+    }
+
+    /// Persist a MemoryDoc to workspace.
+    async fn persist_doc(&self, doc: &MemoryDoc) {
+        let Some(ref ws) = self.workspace else {
+            return;
+        };
+
+        let path = doc_workspace_path(doc);
+        let json = match serde_json::to_string_pretty(doc) {
+            Ok(j) => j,
+            Err(e) => {
+                debug!("failed to serialize doc: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = ws.write(&path, &json).await {
+            debug!(path = %path, "failed to persist engine doc: {e}");
         }
     }
 }
 
-impl Default for InMemoryStore {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Build workspace path for a MemoryDoc.
+fn doc_workspace_path(doc: &MemoryDoc) -> String {
+    let type_dir = match doc.doc_type {
+        DocType::Summary => "summaries",
+        DocType::Lesson => "lessons",
+        DocType::Playbook => "playbooks",
+        DocType::Issue => "issues",
+        DocType::Spec => "specs",
+        DocType::Note => "notes",
+    };
+    format!("{ENGINE_DOCS_PREFIX}/{type_dir}/{}.json", doc.id.0)
 }
 
 #[async_trait::async_trait]
-impl Store for InMemoryStore {
-    // ── Thread ──────────────────────────────────────────────
+impl Store for HybridStore {
+    // ── Thread (ephemeral) ──────────────────────────────────
 
     async fn save_thread(&self, thread: &Thread) -> Result<(), EngineError> {
         self.threads.write().await.insert(thread.id, thread.clone());
@@ -82,7 +159,7 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    // ── Step ────────────────────────────────────────────────
+    // ── Step (ephemeral) ────────────────────────────────────
 
     async fn save_step(&self, step: &Step) -> Result<(), EngineError> {
         self.steps
@@ -104,7 +181,7 @@ impl Store for InMemoryStore {
             .unwrap_or_default())
     }
 
-    // ── Event ───────────────────────────────────────────────
+    // ── Event (ephemeral) ───────────────────────────────────
 
     async fn append_events(&self, events: &[ThreadEvent]) -> Result<(), EngineError> {
         let mut store = self.events.write().await;
@@ -127,7 +204,7 @@ impl Store for InMemoryStore {
             .unwrap_or_default())
     }
 
-    // ── Project ─────────────────────────────────────────────
+    // ── Project (ephemeral) ─────────────────────────────────
 
     async fn save_project(&self, project: &Project) -> Result<(), EngineError> {
         self.projects
@@ -141,10 +218,13 @@ impl Store for InMemoryStore {
         Ok(self.projects.read().await.get(&id).cloned())
     }
 
-    // ── MemoryDoc ───────────────────────────────────────────
+    // ── MemoryDoc (DURABLE — persisted to workspace) ────────
 
     async fn save_memory_doc(&self, doc: &MemoryDoc) -> Result<(), EngineError> {
+        // Save to in-memory cache
         self.docs.write().await.insert(doc.id, doc.clone());
+        // Persist to workspace
+        self.persist_doc(doc).await;
         Ok(())
     }
 
@@ -163,7 +243,7 @@ impl Store for InMemoryStore {
             .collect())
     }
 
-    // ── Lease ───────────────────────────────────────────────
+    // ── Lease (ephemeral) ───────────────────────────────────
 
     async fn save_lease(&self, lease: &CapabilityLease) -> Result<(), EngineError> {
         self.leases.write().await.insert(lease.id, lease.clone());
@@ -191,7 +271,7 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    // ── Mission ──────────────────────────────────────────────
+    // ── Mission (ephemeral) ──────────────────────────────────
 
     async fn save_mission(&self, mission: &Mission) -> Result<(), EngineError> {
         self.missions

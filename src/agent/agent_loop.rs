@@ -300,7 +300,7 @@ impl Agent {
         &self.deps.tools
     }
 
-    pub(super) fn workspace(&self) -> Option<&Arc<Workspace>> {
+    pub(crate) fn workspace(&self) -> Option<&Arc<Workspace>> {
         self.deps.workspace.as_ref()
     }
 
