@@ -3605,6 +3605,7 @@ dependencies = [
  "hyper-util",
  "iana-time-zone",
  "insta",
+ "ironclaw_common",
  "ironclaw_engine",
  "ironclaw_safety",
  "json5",
@@ -3661,6 +3662,14 @@ dependencies = [
  "wasmtime-wasi",
  "zbus",
  "zip",
+]
+
+[[package]]
+name = "ironclaw_common"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4310,7 +4319,7 @@ dependencies = [
 [[package]]
 name = "monty"
 version = "0.0.8"
-source = "git+https://github.com/pydantic/monty.git?branch=main#60538204fd9cd420d1a93042bb52f7168fb9fca2"
+source = "git+https://github.com/pydantic/monty.git?branch=main#982709bd52b10a1cf3f244a67951523a0b016a7f"
 dependencies = [
  "ahash 0.8.12",
  "fancy-regex",
