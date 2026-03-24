@@ -411,6 +411,19 @@ The web gateway is completely disconnected from engine v2. Three gaps:
 3. After thread completion, write user message + response to v1 DB via `store.add_conversation_message()`
 4. Gateway reads from DB as usual — no gateway code changes needed
 
+#### Routines / Jobs (NOT HOOKED UP)
+
+Routines are entirely v1 — `RoutineEngine` fires via cron/event triggers and runs through `run_agentic_loop()` with its own delegate. Engine v2 routing only intercepts `UserInput` and `ApprovalResponse` in `handle_message`. Routine execution doesn't go through `handle_message`.
+
+**Known issue:** When a user asks "create a routine for..." as natural language, engine v2 processes it via CodeAct. The model calls `routine_create(...)` which needs `Arc<RoutineEngine>` + `Arc<dyn Database>` — these exist on the tool but the `JobContext` built by the bridge has minimal fields. This can cause crashes (observed: SIGKILL during routine creation attempt).
+
+**Options:**
+- Short term: block routine/job tools in engine v2 (return "use /routine command instead")
+- Medium term: pass `RoutineEngine` + DB refs through `JobContext.metadata` or a dedicated context field
+- Long term: replace routines with engine v2 `Mission` system
+
+Engine v2 has `Mission` types (`MissionManager`, `MissionCadence`, `MissionStatus`) defined but not wired to trigger infrastructure.
+
 #### Acceptance testing (NOT YET IMPLEMENTED)
 - Drive engine via TestRig + TraceLlm fixtures
 - Compare output with `verify_trace_expects()`
