@@ -79,7 +79,10 @@ pub fn compact_output_metadata(stdout: &str, return_value: &serde_json::Value) -
 
     if !stdout.is_empty() {
         if stdout.chars().count() > OUTPUT_TRUNCATE_LEN {
-            let truncated: String = stdout.chars().skip(stdout.chars().count() - OUTPUT_TRUNCATE_LEN).collect();
+            let truncated: String = stdout
+                .chars()
+                .skip(stdout.chars().count() - OUTPUT_TRUNCATE_LEN)
+                .collect();
             parts.push(format!(
                 "[TRUNCATED: last {OUTPUT_TRUNCATE_LEN} of {} chars shown]\n{truncated}",
                 stdout.len()
@@ -130,7 +133,7 @@ pub fn build_orientation_preamble(thread: &Thread) -> String {
         .find(|m| m.role == MessageRole::User)
     {
         let content_preview: String = last_user.content.chars().take(500).collect();
-        let truncated = if last_user.content.len() > 500 {
+        let truncated = if last_user.content.chars().count() > 500 {
             "..."
         } else {
             ""
@@ -332,11 +335,7 @@ pub async fn execute_code(
                 let ext_result = match action_name.as_str() {
                     // FINAL(answer) — explicit termination
                     "FINAL" => {
-                        let answer = call
-                            .args
-                            .first()
-                            .map(monty_to_string)
-                            .unwrap_or_default();
+                        let answer = call.args.first().map(monty_to_string).unwrap_or_default();
                         final_answer = Some(answer);
                         ExtFunctionResult::Return(MontyObject::None)
                     }
@@ -359,8 +358,7 @@ pub async fn execute_code(
 
                     // llm_query(prompt, context) — recursive sub-call
                     "llm_query" => {
-                        handle_llm_query(&call.args, &call.kwargs, llm, &mut recursive_tokens)
-                            .await
+                        handle_llm_query(&call.args, &call.kwargs, llm, &mut recursive_tokens).await
                     }
 
                     // llm_query_batched(prompts) — parallel sub-calls
@@ -741,12 +739,14 @@ async fn handle_rlm_query(
         max_iterations: parent_thread.config.max_iterations.min(20), // cap child iterations
         enable_reflection: false,
         enable_tool_intent_nudge: false,
-        max_tokens_total: parent_thread.config.max_tokens_total.map(|max| {
-            max.saturating_sub(parent_thread.total_tokens_used)
-        }),
-        max_budget_usd: parent_thread.config.max_budget_usd.map(|max| {
-            (max - parent_thread.total_cost_usd).max(0.0)
-        }),
+        max_tokens_total: parent_thread
+            .config
+            .max_tokens_total
+            .map(|max| max.saturating_sub(parent_thread.total_tokens_used)),
+        max_budget_usd: parent_thread
+            .config
+            .max_budget_usd
+            .map(|max| (max - parent_thread.total_cost_usd).max(0.0)),
         max_duration: parent_thread.config.max_duration,
         depth: current_depth + 1,
         max_depth,
@@ -1031,9 +1031,7 @@ fn json_to_monty(val: &serde_json::Value) -> MontyObject {
             }
         }
         serde_json::Value::String(s) => MontyObject::String(s.clone()),
-        serde_json::Value::Array(arr) => {
-            MontyObject::List(arr.iter().map(json_to_monty).collect())
-        }
+        serde_json::Value::Array(arr) => MontyObject::List(arr.iter().map(json_to_monty).collect()),
         serde_json::Value::Object(map) => MontyObject::dict(
             map.iter()
                 .map(|(k, v)| (MontyObject::String(k.clone()), json_to_monty(v)))

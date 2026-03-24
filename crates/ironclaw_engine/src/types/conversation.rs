@@ -210,10 +210,7 @@ mod tests {
         // Thread starts
         let tid = ThreadId::new();
         conv.track_thread(tid);
-        conv.add_entry(ConversationEntry::system_for_thread(
-            tid,
-            "Thread started",
-        ));
+        conv.add_entry(ConversationEntry::system_for_thread(tid, "Thread started"));
         assert_eq!(conv.active_threads.len(), 1);
 
         // Agent responds
@@ -222,7 +219,10 @@ mod tests {
 
         // Thread completes
         conv.untrack_thread(tid);
-        conv.add_entry(ConversationEntry::system_for_thread(tid, "Thread completed"));
+        conv.add_entry(ConversationEntry::system_for_thread(
+            tid,
+            "Thread completed",
+        ));
         assert!(conv.active_threads.is_empty());
         assert_eq!(conv.entries.len(), 4);
     }

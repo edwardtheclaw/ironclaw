@@ -15,7 +15,7 @@ use crate::capability::lease::LeaseManager;
 use crate::capability::policy::PolicyEngine;
 use crate::capability::registry::CapabilityRegistry;
 use crate::executor::ExecutionLoop;
-use crate::reflection::executor::{build_reflection_prompt, ReflectionExecutor};
+use crate::reflection::executor::{ReflectionExecutor, build_reflection_prompt};
 use crate::runtime::messaging::{self, ThreadOutcome};
 use crate::traits::llm::LlmBackend;
 use crate::traits::store::Store;
@@ -177,7 +177,7 @@ pub async fn reflect_simple(
     if thread_failed || had_errors {
         let (issue_doc, tokens) =
             produce_doc(thread, llm, DocType::Issue, &transcript, ISSUE_PROMPT).await?;
-        if issue_doc.content.len() > 20 {
+        if issue_doc.content.chars().count() > 20 {
             docs.push(issue_doc);
         }
         total_tokens.input_tokens += tokens.input_tokens;
@@ -195,7 +195,7 @@ pub async fn reflect_simple(
     if has_missing_tools {
         let (spec_doc, tokens) =
             produce_doc(thread, llm, DocType::Spec, &transcript, SPEC_PROMPT).await?;
-        if spec_doc.content.len() > 20 {
+        if spec_doc.content.chars().count() > 20 {
             docs.push(spec_doc);
         }
         total_tokens.input_tokens += tokens.input_tokens;
@@ -213,7 +213,7 @@ pub async fn reflect_simple(
     if thread_succeeded && action_count >= 2 {
         let (playbook_doc, tokens) =
             produce_doc(thread, llm, DocType::Playbook, &transcript, PLAYBOOK_PROMPT).await?;
-        if playbook_doc.content.len() > 20 {
+        if playbook_doc.content.chars().count() > 20 {
             docs.push(playbook_doc);
         }
         total_tokens.input_tokens += tokens.input_tokens;
@@ -263,14 +263,16 @@ fn parse_reflection_output(response: &str, source_thread: &Thread) -> Vec<Memory
     }
 
     // Fallback: treat the entire response as a summary
-    if response.len() > 20 {
-        vec![MemoryDoc::new(
-            source_thread.project_id,
-            DocType::Summary,
-            format!("Summary: {}", source_thread.goal),
-            response,
-        )
-        .with_source_thread(source_thread.id)]
+    if response.chars().count() > 20 {
+        vec![
+            MemoryDoc::new(
+                source_thread.project_id,
+                DocType::Summary,
+                format!("Summary: {}", source_thread.goal),
+                response,
+            )
+            .with_source_thread(source_thread.id),
+        ]
     } else {
         vec![]
     }
@@ -282,7 +284,7 @@ fn parse_doc_entry(value: &serde_json::Value, source_thread: &Thread) -> Option<
     let title = value.get("title")?.as_str()?;
     let content = value.get("content")?.as_str()?;
 
-    if content.len() <= 20 {
+    if content.chars().count() <= 20 {
         return None;
     }
 
@@ -365,7 +367,11 @@ pub(crate) fn build_transcript(thread: &Thread) -> String {
     for msg in messages {
         let role = format!("{:?}", msg.role);
         let content_preview: String = msg.content.chars().take(500).collect();
-        let truncated = if msg.content.len() > 500 { "..." } else { "" };
+        let truncated = if msg.content.chars().count() > 500 {
+            "..."
+        } else {
+            ""
+        };
         parts.push(format!("[{role}] {content_preview}{truncated}"));
     }
 
@@ -429,8 +435,8 @@ async fn produce_doc(
         DocType::Note => format!("Note: {}", thread.goal),
     };
 
-    let doc = MemoryDoc::new(thread.project_id, doc_type, title, content)
-        .with_source_thread(thread.id);
+    let doc =
+        MemoryDoc::new(thread.project_id, doc_type, title, content).with_source_thread(thread.id);
 
     Ok((doc, output.usage))
 }
@@ -503,8 +509,7 @@ mod tests {
     #[tokio::test]
     async fn reflect_simple_produces_summary() {
         let thread = make_completed_thread();
-        let llm =
-            MockLlm::with_responses(vec!["Thread accomplished the test task successfully."]);
+        let llm = MockLlm::with_responses(vec!["Thread accomplished the test task successfully."]);
 
         let result = reflect_simple(&thread, &llm).await.unwrap();
         assert_eq!(result.docs.len(), 1);
@@ -597,10 +602,7 @@ mod tests {
         ]);
 
         let result = reflect_simple(&thread, &llm).await.unwrap();
-        assert!(result
-            .docs
-            .iter()
-            .any(|d| d.doc_type == DocType::Playbook));
+        assert!(result.docs.iter().any(|d| d.doc_type == DocType::Playbook));
     }
 
     #[tokio::test]
@@ -619,10 +621,7 @@ mod tests {
         let llm = MockLlm::with_responses(vec!["Simple summary."]);
 
         let result = reflect_simple(&thread, &llm).await.unwrap();
-        assert!(!result
-            .docs
-            .iter()
-            .any(|d| d.doc_type == DocType::Playbook));
+        assert!(!result.docs.iter().any(|d| d.doc_type == DocType::Playbook));
     }
 
     // ── parse_reflection_output tests ──────────────────────────
@@ -663,8 +662,7 @@ mod tests {
     #[test]
     fn parse_skips_short_content() {
         let thread = make_completed_thread();
-        let json =
-            r#"{"docs": [{"type": "summary", "title": "test", "content": "too short"}]}"#;
+        let json = r#"{"docs": [{"type": "summary", "title": "test", "content": "too short"}]}"#;
 
         let docs = parse_reflection_output(json, &thread);
         assert!(docs.is_empty());

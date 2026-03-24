@@ -26,9 +26,7 @@ pub fn estimate_tokens(messages: &[ThreadMessage]) -> usize {
     let total_chars: usize = messages
         .iter()
         .map(|m| {
-            m.content.len()
-                + m.action_name.as_ref().map_or(0, |n| n.len())
-                + 4 // overhead per message (role token, delimiters)
+            m.content.len() + m.action_name.as_ref().map_or(0, |n| n.len()) + 4 // overhead per message (role token, delimiters)
         })
         .sum();
     total_chars.div_ceil(CHARS_PER_TOKEN)

@@ -132,7 +132,6 @@ pub struct ThreadConfig {
     pub max_tool_intent_nudges: u32,
 
     // ── Budget controls (Phase 4, from RLM cross-reference) ──
-
     /// Maximum cumulative input+output tokens before termination.
     pub max_tokens_total: Option<u64>,
     /// Maximum consecutive steps with errors before termination.

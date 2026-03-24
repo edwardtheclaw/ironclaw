@@ -24,13 +24,23 @@ pub fn is_engine_v2_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Pending approval info stored between the NeedApproval outcome and the user's response.
+struct PendingApproval {
+    action_name: String,
+    /// The user message that triggered this (for re-submission after approval).
+    original_content: String,
+}
+
 /// Persistent engine state that lives across messages.
 struct EngineState {
     thread_manager: Arc<ThreadManager>,
     conversation_manager: ConversationManager,
+    effect_adapter: Arc<EffectBridgeAdapter>,
     #[allow(dead_code)]
     store: Arc<InMemoryStore>,
     default_project_id: ironclaw_engine::ProjectId,
+    /// Currently pending approval (if any).
+    pending_approval: RwLock<Option<PendingApproval>>,
 }
 
 /// Global engine state, initialized on first use.
@@ -93,7 +103,7 @@ async fn get_or_init_engine(agent: &Agent) -> Result<(), Error> {
 
     let thread_manager = Arc::new(ThreadManager::new(
         llm_adapter,
-        effect_adapter,
+        effect_adapter.clone(),
         store.clone(),
         Arc::new(capabilities),
         leases,
@@ -115,18 +125,88 @@ async fn get_or_init_engine(agent: &Agent) -> Result<(), Error> {
     *guard = Some(EngineState {
         thread_manager,
         conversation_manager,
+        effect_adapter,
         store: store.clone(),
         default_project_id: project_id,
+        pending_approval: RwLock::new(None),
     });
 
     Ok(())
 }
 
-/// Handle a user message through the engine v2 pipeline.
+/// Handle an approval response (yes/no/always) for engine v2.
 ///
-/// Conversations and threads persist across messages within the same
-/// agent lifetime. Each (channel, user) pair gets a conversation;
-/// consecutive messages inject into the active thread or spawn a new one.
+/// Called from `handle_message` when the user responds to an approval request.
+pub async fn handle_approval(
+    agent: &Agent,
+    message: &IncomingMessage,
+    approved: bool,
+    always: bool,
+) -> Result<Option<String>, Error> {
+    get_or_init_engine(agent).await?;
+
+    let lock = ENGINE_STATE.get().expect("engine initialized");
+    let guard = lock.read().await;
+    let state = guard.as_ref().expect("engine initialized");
+
+    // Take the pending approval
+    let pending = state.pending_approval.write().await.take();
+    let pending = match pending {
+        Some(p) => p,
+        None => {
+            debug!("engine v2: no pending approval, ignoring");
+            return Ok(Some("No pending approval.".into()));
+        }
+    };
+
+    if !approved {
+        let _ = agent
+            .channels
+            .send_status(
+                &message.channel,
+                StatusUpdate::Status("Tool call denied.".into()),
+                &message.metadata,
+            )
+            .await;
+        return Ok(Some(format!(
+            "Denied: tool '{}' was not executed.",
+            pending.action_name
+        )));
+    }
+
+    // Approved — add to auto-approved set
+    info!(
+        tool = %pending.action_name,
+        always,
+        "engine v2: tool approved"
+    );
+
+    // Convert Python name back to registry name for auto-approve
+    let registry_name = pending.action_name.replace('_', "-");
+    state
+        .effect_adapter
+        .auto_approve_tool(&pending.action_name)
+        .await;
+    state.effect_adapter.auto_approve_tool(&registry_name).await;
+
+    if always {
+        info!(tool = %pending.action_name, "engine v2: tool auto-approved for session");
+    }
+
+    // Re-process the original message — the tool will now pass approval
+    let _ = agent
+        .channels
+        .send_status(
+            &message.channel,
+            StatusUpdate::Thinking("Re-executing with approval...".into()),
+            &message.metadata,
+        )
+        .await;
+
+    handle_with_engine(agent, message, &pending.original_content).await
+}
+
+/// Handle a user message through the engine v2 pipeline.
 pub async fn handle_with_engine(
     agent: &Agent,
     message: &IncomingMessage,
@@ -193,17 +273,15 @@ pub async fn handle_with_engine(
     // Forward events to the channel while waiting for thread completion
     loop {
         tokio::select! {
-            // Check for events from the execution loop
             event = event_rx.recv() => {
                 match event {
                     Ok(ref evt) if evt.thread_id == thread_id => {
                         forward_event_to_channel(evt, channels, channel_name, metadata).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    _ => {} // Event for a different thread, or lagged
+                    _ => {}
                 }
             }
-            // Also check if the thread has finished (in case we miss the events)
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                 if !state.thread_manager.is_running(thread_id).await {
                     break;
@@ -213,12 +291,16 @@ pub async fn handle_with_engine(
     }
 
     // Join the thread to get the outcome
-    let outcome = state.thread_manager.join_thread(thread_id).await.map_err(|e| {
-        crate::error::Error::from(crate::error::JobError::ContextError {
-            id: uuid::Uuid::nil(),
-            reason: format!("engine v2 join error: {e}"),
-        })
-    })?;
+    let outcome = state
+        .thread_manager
+        .join_thread(thread_id)
+        .await
+        .map_err(|e| {
+            crate::error::Error::from(crate::error::JobError::ContextError {
+                id: uuid::Uuid::nil(),
+                reason: format!("engine v2 join error: {e}"),
+            })
+        })?;
 
     // Record outcome in conversation
     state
@@ -228,7 +310,6 @@ pub async fn handle_with_engine(
 
     // Note: trace recording, retrospective analysis, and LLM reflection
     // all run automatically inside ThreadManager after the thread completes.
-    // See crates/ironclaw_engine/src/runtime/manager.rs.
 
     // Convert outcome to response
     match outcome {
@@ -237,17 +318,45 @@ pub async fn handle_with_engine(
             Ok(response)
         }
         ThreadOutcome::Stopped => Ok(Some("Thread was stopped.".into())),
-        ThreadOutcome::MaxIterations => {
-            Ok(Some("Reached maximum iterations without completing.".into()))
-        }
+        ThreadOutcome::MaxIterations => Ok(Some(
+            "Reached maximum iterations without completing.".into(),
+        )),
         ThreadOutcome::Failed { error } => Ok(Some(format!("Error: {error}"))),
         ThreadOutcome::NeedApproval {
             action_name,
             call_id: _,
-            parameters: _,
-        } => Ok(Some(format!(
-            "Action '{action_name}' requires approval (not yet supported in engine v2)"
-        ))),
+            parameters,
+        } => {
+            // Store pending approval for when the user responds
+            *state.pending_approval.write().await = Some(PendingApproval {
+                action_name: action_name.clone(),
+                original_content: content.to_string(),
+            });
+
+            // Send approval request to channel (matches v1 ApprovalNeeded format)
+            let _ = agent
+                .channels
+                .send_status(
+                    &message.channel,
+                    StatusUpdate::ApprovalNeeded {
+                        request_id: uuid::Uuid::new_v4().to_string(),
+                        tool_name: action_name.clone(),
+                        description: format!(
+                            "Tool '{}' requires approval to execute.",
+                            action_name
+                        ),
+                        parameters,
+                        allow_always: true,
+                    },
+                    &message.metadata,
+                )
+                .await;
+
+            Ok(Some(format!(
+                "Tool '{}' requires approval. Reply 'yes' to approve, 'always' to auto-approve, or 'no' to deny.",
+                action_name
+            )))
+        }
     }
 }
 
@@ -270,10 +379,7 @@ async fn forward_event_to_channel(
                 )
                 .await;
         }
-        EventKind::ActionExecuted {
-            action_name,
-            ..
-        } => {
+        EventKind::ActionExecuted { action_name, .. } => {
             let _ = channels
                 .send_status(
                     channel_name,
@@ -288,9 +394,7 @@ async fn forward_event_to_channel(
                 .await;
         }
         EventKind::ActionFailed {
-            action_name,
-            error,
-            ..
+            action_name, error, ..
         } => {
             let _ = channels
                 .send_status(
@@ -314,6 +418,6 @@ async fn forward_event_to_channel(
                 )
                 .await;
         }
-        _ => {} // Other events don't need channel status
+        _ => {}
     }
 }

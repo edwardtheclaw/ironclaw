@@ -58,8 +58,7 @@ pub fn signals_tool_intent(response: &str) -> bool {
 }
 
 /// The nudge message injected into context when tool intent is detected.
-pub const TOOL_INTENT_NUDGE: &str =
-    "You expressed intent to use a tool but didn't make an action call. \
+pub const TOOL_INTENT_NUDGE: &str = "You expressed intent to use a tool but didn't make an action call. \
      Please go ahead and call the appropriate action.";
 
 #[cfg(test)]

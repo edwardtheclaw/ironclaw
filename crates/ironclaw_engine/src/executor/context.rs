@@ -6,12 +6,12 @@
 use std::sync::Arc;
 
 use crate::memory::RetrievalEngine;
+use crate::traits::effect::EffectExecutor;
 use crate::types::capability::{ActionDef, CapabilityLease};
 use crate::types::error::EngineError;
 use crate::types::memory::MemoryDoc;
 use crate::types::message::ThreadMessage;
 use crate::types::project::ProjectId;
-use crate::traits::effect::EffectExecutor;
 
 /// Maximum number of memory docs to inject into context.
 const MAX_CONTEXT_DOCS: usize = 5;
@@ -74,7 +74,11 @@ fn format_docs_as_context(docs: &[MemoryDoc]) -> String {
         };
         // Truncate long docs to avoid context bloat
         let content: String = doc.content.chars().take(500).collect();
-        let truncated = if doc.content.len() > 500 { "..." } else { "" };
+        let truncated = if doc.content.chars().count() > 500 {
+            "..."
+        } else {
+            ""
+        };
         parts.push(format!(
             "### [{type_label}] {}\n{content}{truncated}\n",
             doc.title
@@ -126,36 +130,102 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::traits::store::Store for DocStore {
-        async fn save_thread(&self, _: &Thread) -> Result<(), EngineError> { Ok(()) }
-        async fn load_thread(&self, _: ThreadId) -> Result<Option<Thread>, EngineError> { Ok(None) }
-        async fn list_threads(&self, _: ProjectId) -> Result<Vec<Thread>, EngineError> { Ok(vec![]) }
-        async fn update_thread_state(&self, _: ThreadId, _: ThreadState) -> Result<(), EngineError> { Ok(()) }
-        async fn save_step(&self, _: &Step) -> Result<(), EngineError> { Ok(()) }
-        async fn load_steps(&self, _: ThreadId) -> Result<Vec<Step>, EngineError> { Ok(vec![]) }
-        async fn append_events(&self, _: &[ThreadEvent]) -> Result<(), EngineError> { Ok(()) }
-        async fn load_events(&self, _: ThreadId) -> Result<Vec<ThreadEvent>, EngineError> { Ok(vec![]) }
-        async fn save_project(&self, _: &Project) -> Result<(), EngineError> { Ok(()) }
-        async fn load_project(&self, _: ProjectId) -> Result<Option<Project>, EngineError> { Ok(None) }
-        async fn save_memory_doc(&self, _: &MemoryDoc) -> Result<(), EngineError> { Ok(()) }
-        async fn load_memory_doc(&self, _: DocId) -> Result<Option<MemoryDoc>, EngineError> { Ok(None) }
-        async fn list_memory_docs(&self, pid: ProjectId) -> Result<Vec<MemoryDoc>, EngineError> {
-            Ok(self.0.iter().filter(|d| d.project_id == pid).cloned().collect())
+        async fn save_thread(&self, _: &Thread) -> Result<(), EngineError> {
+            Ok(())
         }
-        async fn save_lease(&self, _: &CapabilityLease) -> Result<(), EngineError> { Ok(()) }
-        async fn load_active_leases(&self, _: ThreadId) -> Result<Vec<CapabilityLease>, EngineError> { Ok(vec![]) }
-        async fn revoke_lease(&self, _: LeaseId, _: &str) -> Result<(), EngineError> { Ok(()) }
-        async fn save_mission(&self, _: &crate::types::mission::Mission) -> Result<(), EngineError> { Ok(()) }
-        async fn load_mission(&self, _: crate::types::mission::MissionId) -> Result<Option<crate::types::mission::Mission>, EngineError> { Ok(None) }
-        async fn list_missions(&self, _: ProjectId) -> Result<Vec<crate::types::mission::Mission>, EngineError> { Ok(vec![]) }
-        async fn update_mission_status(&self, _: crate::types::mission::MissionId, _: crate::types::mission::MissionStatus) -> Result<(), EngineError> { Ok(()) }
+        async fn load_thread(&self, _: ThreadId) -> Result<Option<Thread>, EngineError> {
+            Ok(None)
+        }
+        async fn list_threads(&self, _: ProjectId) -> Result<Vec<Thread>, EngineError> {
+            Ok(vec![])
+        }
+        async fn update_thread_state(
+            &self,
+            _: ThreadId,
+            _: ThreadState,
+        ) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn save_step(&self, _: &Step) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load_steps(&self, _: ThreadId) -> Result<Vec<Step>, EngineError> {
+            Ok(vec![])
+        }
+        async fn append_events(&self, _: &[ThreadEvent]) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load_events(&self, _: ThreadId) -> Result<Vec<ThreadEvent>, EngineError> {
+            Ok(vec![])
+        }
+        async fn save_project(&self, _: &Project) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load_project(&self, _: ProjectId) -> Result<Option<Project>, EngineError> {
+            Ok(None)
+        }
+        async fn save_memory_doc(&self, _: &MemoryDoc) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load_memory_doc(&self, _: DocId) -> Result<Option<MemoryDoc>, EngineError> {
+            Ok(None)
+        }
+        async fn list_memory_docs(&self, pid: ProjectId) -> Result<Vec<MemoryDoc>, EngineError> {
+            Ok(self
+                .0
+                .iter()
+                .filter(|d| d.project_id == pid)
+                .cloned()
+                .collect())
+        }
+        async fn save_lease(&self, _: &CapabilityLease) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load_active_leases(
+            &self,
+            _: ThreadId,
+        ) -> Result<Vec<CapabilityLease>, EngineError> {
+            Ok(vec![])
+        }
+        async fn revoke_lease(&self, _: LeaseId, _: &str) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn save_mission(
+            &self,
+            _: &crate::types::mission::Mission,
+        ) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load_mission(
+            &self,
+            _: crate::types::mission::MissionId,
+        ) -> Result<Option<crate::types::mission::Mission>, EngineError> {
+            Ok(None)
+        }
+        async fn list_missions(
+            &self,
+            _: ProjectId,
+        ) -> Result<Vec<crate::types::mission::Mission>, EngineError> {
+            Ok(vec![])
+        }
+        async fn update_mission_status(
+            &self,
+            _: crate::types::mission::MissionId,
+            _: crate::types::mission::MissionStatus,
+        ) -> Result<(), EngineError> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
     async fn context_injects_docs_after_system_prompt() {
         let project = ProjectId::new();
-        let store: Arc<dyn crate::traits::store::Store> = Arc::new(DocStore(vec![
-            MemoryDoc::new(project, DocType::Lesson, "web tool alias", "Use web-search not web_search"),
-        ]));
+        let store: Arc<dyn crate::traits::store::Store> = Arc::new(DocStore(vec![MemoryDoc::new(
+            project,
+            DocType::Lesson,
+            "web tool alias",
+            "Use web-search not web_search",
+        )]));
         let retrieval = RetrievalEngine::new(store);
         let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects);
 
@@ -193,16 +263,10 @@ mod tests {
             ThreadMessage::user("hello"),
         ];
 
-        let (ctx_msgs, _) = build_step_context(
-            &messages,
-            &[],
-            &effects,
-            None,
-            ProjectId::new(),
-            "hello",
-        )
-        .await
-        .unwrap();
+        let (ctx_msgs, _) =
+            build_step_context(&messages, &[], &effects, None, ProjectId::new(), "hello")
+                .await
+                .unwrap();
 
         // No injection — same number of messages
         assert_eq!(ctx_msgs.len(), 2);
@@ -217,16 +281,10 @@ mod tests {
 
         let messages = vec![ThreadMessage::user("hello")];
 
-        let (ctx_msgs, _) = build_step_context(
-            &messages,
-            &[],
-            &effects,
-            Some(&retrieval),
-            project,
-            "hello",
-        )
-        .await
-        .unwrap();
+        let (ctx_msgs, _) =
+            build_step_context(&messages, &[], &effects, Some(&retrieval), project, "hello")
+                .await
+                .unwrap();
 
         assert_eq!(ctx_msgs.len(), 1);
     }

@@ -1004,10 +1004,16 @@ impl Agent {
         }
 
         // Engine V2 routing (Strategy C: parallel deployment)
-        if let Submission::UserInput { ref content } = submission
-            && crate::bridge::is_engine_v2_enabled()
-        {
-            return crate::bridge::handle_with_engine(self, message, content).await;
+        if crate::bridge::is_engine_v2_enabled() {
+            match &submission {
+                Submission::UserInput { content } => {
+                    return crate::bridge::handle_with_engine(self, message, content).await;
+                }
+                Submission::ApprovalResponse { approved, always } => {
+                    return crate::bridge::handle_approval(self, message, *approved, *always).await;
+                }
+                _ => {} // Other submissions fall through to v1
+            }
         }
 
         // Hydrate thread from DB if it's a historical thread not in memory

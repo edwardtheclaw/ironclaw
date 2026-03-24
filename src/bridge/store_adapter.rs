@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 
 use ironclaw_engine::{
-    CapabilityLease, DocId, EngineError, LeaseId, MemoryDoc, Project, ProjectId, Step, Thread,
-    ThreadEvent, ThreadId, ThreadState, Store,
+    CapabilityLease, DocId, EngineError, LeaseId, MemoryDoc, Project, ProjectId, Step, Store,
+    Thread, ThreadEvent, ThreadId, ThreadState,
     types::mission::{Mission, MissionId, MissionStatus},
 };
 
@@ -109,7 +109,10 @@ impl Store for InMemoryStore {
     async fn append_events(&self, events: &[ThreadEvent]) -> Result<(), EngineError> {
         let mut store = self.events.write().await;
         for event in events {
-            store.entry(event.thread_id).or_default().push(event.clone());
+            store
+                .entry(event.thread_id)
+                .or_default()
+                .push(event.clone());
         }
         Ok(())
     }
@@ -191,7 +194,10 @@ impl Store for InMemoryStore {
     // ── Mission ──────────────────────────────────────────────
 
     async fn save_mission(&self, mission: &Mission) -> Result<(), EngineError> {
-        self.missions.write().await.insert(mission.id, mission.clone());
+        self.missions
+            .write()
+            .await
+            .insert(mission.id, mission.clone());
         Ok(())
     }
 
@@ -200,10 +206,21 @@ impl Store for InMemoryStore {
     }
 
     async fn list_missions(&self, project_id: ProjectId) -> Result<Vec<Mission>, EngineError> {
-        Ok(self.missions.read().await.values().filter(|m| m.project_id == project_id).cloned().collect())
+        Ok(self
+            .missions
+            .read()
+            .await
+            .values()
+            .filter(|m| m.project_id == project_id)
+            .cloned()
+            .collect())
     }
 
-    async fn update_mission_status(&self, id: MissionId, status: MissionStatus) -> Result<(), EngineError> {
+    async fn update_mission_status(
+        &self,
+        id: MissionId,
+        status: MissionStatus,
+    ) -> Result<(), EngineError> {
         if let Some(mission) = self.missions.write().await.get_mut(&id) {
             mission.status = status;
         }

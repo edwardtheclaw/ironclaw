@@ -88,8 +88,8 @@ pub fn build_trace(thread: &Thread) -> ExecutionTrace {
             let preview: String = m.content.chars().take(300).collect();
             MessageRecord {
                 role: format!("{:?}", m.role),
-                content_length: m.content.len(),
-                content_preview: if m.content.len() > 300 {
+                content_length: m.content.chars().count(),
+                content_preview: if m.content.chars().count() > 300 {
                     format!("{preview}...")
                 } else {
                     preview
@@ -119,10 +119,7 @@ pub fn build_trace(thread: &Thread) -> ExecutionTrace {
 
 /// Write a trace to a JSON file.
 pub fn write_trace(trace: &ExecutionTrace) -> Option<PathBuf> {
-    let filename = format!(
-        "engine_trace_{}.json",
-        Utc::now().format("%Y%m%dT%H%M%S")
-    );
+    let filename = format!("engine_trace_{}.json", Utc::now().format("%Y%m%dT%H%M%S"));
     let path = PathBuf::from(&filename);
 
     match serde_json::to_string_pretty(trace) {
@@ -205,7 +202,11 @@ pub fn log_trace_summary(trace: &ExecutionTrace) {
         );
         for doc in &refl.docs {
             let preview: String = doc.content.chars().take(200).collect();
-            let truncated = if doc.content.len() > 200 { "..." } else { "" };
+            let truncated = if doc.content.chars().count() > 200 {
+                "..."
+            } else {
+                ""
+            };
             info!(
                 doc_type = %doc.doc_type,
                 title = %doc.title,
@@ -240,7 +241,8 @@ fn analyze_trace(thread: &Thread) -> Vec<TraceIssue> {
         issues.push(TraceIssue {
             severity: IssueSeverity::Warning,
             category: "no_response".into(),
-            description: "No assistant message in thread — model may not have generated output".into(),
+            description: "No assistant message in thread — model may not have generated output"
+                .into(),
             step: None,
         });
     }
@@ -254,9 +256,7 @@ fn analyze_trace(thread: &Thread) -> Vec<TraceIssue> {
     if !tool_errors.is_empty() {
         for event in &tool_errors {
             if let crate::types::event::EventKind::ActionFailed {
-                action_name,
-                error,
-                ..
+                action_name, error, ..
             } = &event.kind
             {
                 issues.push(TraceIssue {
@@ -313,7 +313,10 @@ fn analyze_trace(thread: &Thread) -> Vec<TraceIssue> {
         issues.push(TraceIssue {
             severity: IssueSeverity::Warning,
             category: "excessive_steps".into(),
-            description: format!("Thread took {} steps — may be stuck in a loop", thread.step_count),
+            description: format!(
+                "Thread took {} steps — may be stuck in a loop",
+                thread.step_count
+            ),
             step: None,
         });
     }
@@ -338,12 +341,7 @@ fn analyze_trace(thread: &Thread) -> Vec<TraceIssue> {
     let code_steps = thread
         .events
         .iter()
-        .filter(|e| {
-            matches!(
-                e.kind,
-                crate::types::event::EventKind::StepStarted { .. }
-            )
-        })
+        .filter(|e| matches!(e.kind, crate::types::event::EventKind::StepStarted { .. }))
         .count();
     let text_responses_without_code = thread
         .messages

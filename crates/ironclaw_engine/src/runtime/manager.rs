@@ -66,7 +66,9 @@ impl ThreadManager {
     }
 
     /// Subscribe to thread events for live status updates.
-    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<crate::types::event::ThreadEvent> {
+    pub fn subscribe_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::types::event::ThreadEvent> {
         self.event_tx.subscribe()
     }
 
@@ -155,6 +157,7 @@ impl ThreadManager {
         let retrieval = crate::memory::RetrievalEngine::new(store_for_retrieval);
 
         let exec_loop = ExecutionLoop::new(thread, llm, effects, leases, policy, rx, user_id)
+            .with_capabilities(Arc::clone(&self.capabilities))
             .with_event_tx(self.event_tx.clone())
             .with_retrieval(retrieval);
 
@@ -169,7 +172,8 @@ impl ThreadManager {
             debug!(thread_id = %thread_id, "thread execution finished");
 
             // Helper to emit events on both the thread and broadcast channel
-            let emit = |thread: &mut crate::types::thread::Thread, kind: crate::types::event::EventKind| {
+            let emit = |thread: &mut crate::types::thread::Thread,
+                        kind: crate::types::event::EventKind| {
                 let event = crate::types::event::ThreadEvent::new(thread.id, kind);
                 let _ = event_tx.send(event.clone());
                 thread.events.push(event);
@@ -193,9 +197,19 @@ impl ThreadManager {
                 ) {
                     tracing::warn!(thread_id = %thread_id, "failed to transition to Reflecting: {e}");
                 } else {
-                    emit(&mut exec.thread, crate::types::event::EventKind::ReflectionStarted);
+                    emit(
+                        &mut exec.thread,
+                        crate::types::event::EventKind::ReflectionStarted,
+                    );
 
-                    match crate::reflection::reflect(&exec.thread, &llm_for_reflection, &store_for_task, &caps_for_reflection).await {
+                    match crate::reflection::reflect(
+                        &exec.thread,
+                        &llm_for_reflection,
+                        &store_for_task,
+                        &caps_for_reflection,
+                    )
+                    .await
+                    {
                         Ok(reflection) => {
                             let doc_types: Vec<String> = reflection
                                 .docs
@@ -203,31 +217,48 @@ impl ThreadManager {
                                 .map(|d| format!("{:?}", d.doc_type))
                                 .collect();
 
-                            emit(&mut exec.thread, crate::types::event::EventKind::ReflectionComplete {
-                                docs_produced: reflection.docs.len(),
-                                doc_types,
-                                tokens_used: reflection.tokens_used.total(),
-                            });
+                            emit(
+                                &mut exec.thread,
+                                crate::types::event::EventKind::ReflectionComplete {
+                                    docs_produced: reflection.docs.len(),
+                                    doc_types,
+                                    tokens_used: reflection.tokens_used.total(),
+                                },
+                            );
 
                             // Attach reflection results to the trace
                             crate::executor::trace::attach_reflection(&mut trace, &reflection);
 
                             for doc in &reflection.docs {
-                                let _ = store_for_task.save_memory_doc(doc).await;
+                                if let Err(e) = store_for_task.save_memory_doc(doc).await {
+                                    tracing::warn!(
+                                        thread_id = %thread_id,
+                                        doc_title = %doc.title,
+                                        "failed to save reflection doc: {e}"
+                                    );
+                                }
                             }
                         }
                         Err(e) => {
-                            emit(&mut exec.thread, crate::types::event::EventKind::ReflectionFailed {
-                                error: e.to_string(),
-                            });
+                            emit(
+                                &mut exec.thread,
+                                crate::types::event::EventKind::ReflectionFailed {
+                                    error: e.to_string(),
+                                },
+                            );
                         }
                     }
 
                     // Transition: Reflecting → Done
-                    let _ = exec.thread.transition_to(
+                    if let Err(e) = exec.thread.transition_to(
                         crate::types::thread::ThreadState::Done,
                         Some("reflection finished".into()),
-                    );
+                    ) {
+                        tracing::warn!(
+                            thread_id = %thread_id,
+                            "failed to transition to Done after reflection: {e}"
+                        );
+                    }
                 }
             }
 
@@ -238,7 +269,12 @@ impl ThreadManager {
             }
 
             // Save final thread state to store
-            let _ = store_for_task.save_thread(&exec.thread).await;
+            if let Err(e) = store_for_task.save_thread(&exec.thread).await {
+                tracing::warn!(
+                    thread_id = %thread_id,
+                    "failed to save final thread state: {e}"
+                );
+            }
             result
         });
 
@@ -292,10 +328,7 @@ impl ThreadManager {
 
     /// Wait for a thread to finish and return its outcome.
     /// Removes the thread from the running set.
-    pub async fn join_thread(
-        &self,
-        thread_id: ThreadId,
-    ) -> Result<ThreadOutcome, EngineError> {
+    pub async fn join_thread(&self, thread_id: ThreadId) -> Result<ThreadOutcome, EngineError> {
         let rt = {
             let mut running = self.running.write().await;
             running.remove(&thread_id)
@@ -345,13 +378,13 @@ impl ThreadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::llm::{LlmCallConfig, LlmOutput};
     use crate::types::capability::{ActionDef, Capability, CapabilityLease, EffectType};
     use crate::types::event::ThreadEvent;
     use crate::types::memory::{DocId, MemoryDoc};
     use crate::types::project::Project;
     use crate::types::step::{ActionResult, LlmResponse, Step, TokenUsage};
     use crate::types::thread::ThreadState;
-    use crate::traits::llm::{LlmCallConfig, LlmOutput};
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -428,26 +461,90 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Store for MockStore {
-        async fn save_thread(&self, _: &Thread) -> Result<(), EngineError> { Ok(()) }
-        async fn load_thread(&self, _: ThreadId) -> Result<Option<Thread>, EngineError> { Ok(None) }
-        async fn list_threads(&self, _: ProjectId) -> Result<Vec<Thread>, EngineError> { Ok(vec![]) }
-        async fn update_thread_state(&self, _: ThreadId, _: ThreadState) -> Result<(), EngineError> { Ok(()) }
-        async fn save_step(&self, _: &Step) -> Result<(), EngineError> { Ok(()) }
-        async fn load_steps(&self, _: ThreadId) -> Result<Vec<Step>, EngineError> { Ok(vec![]) }
-        async fn append_events(&self, _: &[ThreadEvent]) -> Result<(), EngineError> { Ok(()) }
-        async fn load_events(&self, _: ThreadId) -> Result<Vec<ThreadEvent>, EngineError> { Ok(vec![]) }
-        async fn save_project(&self, _: &Project) -> Result<(), EngineError> { Ok(()) }
-        async fn load_project(&self, _: ProjectId) -> Result<Option<Project>, EngineError> { Ok(None) }
-        async fn save_memory_doc(&self, _: &MemoryDoc) -> Result<(), EngineError> { Ok(()) }
-        async fn load_memory_doc(&self, _: DocId) -> Result<Option<MemoryDoc>, EngineError> { Ok(None) }
-        async fn list_memory_docs(&self, _: ProjectId) -> Result<Vec<MemoryDoc>, EngineError> { Ok(vec![]) }
-        async fn save_lease(&self, _: &CapabilityLease) -> Result<(), EngineError> { Ok(()) }
-        async fn load_active_leases(&self, _: ThreadId) -> Result<Vec<CapabilityLease>, EngineError> { Ok(vec![]) }
-        async fn revoke_lease(&self, _: crate::types::capability::LeaseId, _: &str) -> Result<(), EngineError> { Ok(()) }
-        async fn save_mission(&self, _: &crate::types::mission::Mission) -> Result<(), EngineError> { Ok(()) }
-        async fn load_mission(&self, _: crate::types::mission::MissionId) -> Result<Option<crate::types::mission::Mission>, EngineError> { Ok(None) }
-        async fn list_missions(&self, _: ProjectId) -> Result<Vec<crate::types::mission::Mission>, EngineError> { Ok(vec![]) }
-        async fn update_mission_status(&self, _: crate::types::mission::MissionId, _: crate::types::mission::MissionStatus) -> Result<(), EngineError> { Ok(()) }
+        async fn save_thread(&self, _: &Thread) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load_thread(&self, _: ThreadId) -> Result<Option<Thread>, EngineError> {
+            Ok(None)
+        }
+        async fn list_threads(&self, _: ProjectId) -> Result<Vec<Thread>, EngineError> {
+            Ok(vec![])
+        }
+        async fn update_thread_state(
+            &self,
+            _: ThreadId,
+            _: ThreadState,
+        ) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn save_step(&self, _: &Step) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load_steps(&self, _: ThreadId) -> Result<Vec<Step>, EngineError> {
+            Ok(vec![])
+        }
+        async fn append_events(&self, _: &[ThreadEvent]) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load_events(&self, _: ThreadId) -> Result<Vec<ThreadEvent>, EngineError> {
+            Ok(vec![])
+        }
+        async fn save_project(&self, _: &Project) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load_project(&self, _: ProjectId) -> Result<Option<Project>, EngineError> {
+            Ok(None)
+        }
+        async fn save_memory_doc(&self, _: &MemoryDoc) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load_memory_doc(&self, _: DocId) -> Result<Option<MemoryDoc>, EngineError> {
+            Ok(None)
+        }
+        async fn list_memory_docs(&self, _: ProjectId) -> Result<Vec<MemoryDoc>, EngineError> {
+            Ok(vec![])
+        }
+        async fn save_lease(&self, _: &CapabilityLease) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load_active_leases(
+            &self,
+            _: ThreadId,
+        ) -> Result<Vec<CapabilityLease>, EngineError> {
+            Ok(vec![])
+        }
+        async fn revoke_lease(
+            &self,
+            _: crate::types::capability::LeaseId,
+            _: &str,
+        ) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn save_mission(
+            &self,
+            _: &crate::types::mission::Mission,
+        ) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load_mission(
+            &self,
+            _: crate::types::mission::MissionId,
+        ) -> Result<Option<crate::types::mission::Mission>, EngineError> {
+            Ok(None)
+        }
+        async fn list_missions(
+            &self,
+            _: ProjectId,
+        ) -> Result<Vec<crate::types::mission::Mission>, EngineError> {
+            Ok(vec![])
+        }
+        async fn update_mission_status(
+            &self,
+            _: crate::types::mission::MissionId,
+            _: crate::types::mission::MissionStatus,
+        ) -> Result<(), EngineError> {
+            Ok(())
+        }
     }
 
     fn make_manager(llm: Arc<dyn LlmBackend>) -> ThreadManager {
@@ -484,7 +581,14 @@ mod tests {
         let project = ProjectId::new();
 
         let tid = mgr
-            .spawn_thread("test", ThreadType::Foreground, project, ThreadConfig::default(), None, "user")
+            .spawn_thread(
+                "test",
+                ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
             .await
             .unwrap();
 
@@ -515,7 +619,14 @@ mod tests {
         let project = ProjectId::new();
 
         let tid = mgr
-            .spawn_thread("test", ThreadType::Foreground, project, ThreadConfig::default(), None, "user")
+            .spawn_thread(
+                "test",
+                ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
             .await
             .unwrap();
 
@@ -536,12 +647,26 @@ mod tests {
         let project = ProjectId::new();
 
         let parent = mgr
-            .spawn_thread("parent", ThreadType::Foreground, project, ThreadConfig::default(), None, "user")
+            .spawn_thread(
+                "parent",
+                ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
             .await
             .unwrap();
 
         let child = mgr
-            .spawn_thread("child", ThreadType::Research, project, ThreadConfig::default(), Some(parent), "user")
+            .spawn_thread(
+                "child",
+                ThreadType::Research,
+                project,
+                ThreadConfig::default(),
+                Some(parent),
+                "user",
+            )
             .await
             .unwrap();
 

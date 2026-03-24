@@ -48,7 +48,10 @@ pub async fn execute_action_calls(
 
     for call in calls {
         // 1. Find the lease for this action
-        let lease = match leases.find_lease_for_action(thread.id, &call.action_name).await {
+        let lease = match leases
+            .find_lease_for_action(thread.id, &call.action_name)
+            .await
+        {
             Some(l) => l,
             None => {
                 let error_result = ActionResult {

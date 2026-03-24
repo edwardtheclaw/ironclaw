@@ -75,10 +75,7 @@ impl ThreadMessage {
     }
 
     /// Create an assistant message with action calls.
-    pub fn assistant_with_actions(
-        content: Option<String>,
-        calls: Vec<ActionCall>,
-    ) -> Self {
+    pub fn assistant_with_actions(content: Option<String>, calls: Vec<ActionCall>) -> Self {
         Self {
             role: MessageRole::Assistant,
             content: content.unwrap_or_default(),

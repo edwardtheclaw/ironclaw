@@ -26,4 +26,3 @@ pub enum Provenance {
     /// Retrieved from project memory.
     MemoryRetrieval { doc_id: DocId },
 }
-

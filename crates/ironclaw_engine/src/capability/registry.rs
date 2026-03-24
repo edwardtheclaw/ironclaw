@@ -20,7 +20,8 @@ impl CapabilityRegistry {
 
     /// Register a capability. Overwrites any existing capability with the same name.
     pub fn register(&mut self, capability: Capability) {
-        self.capabilities.insert(capability.name.clone(), capability);
+        self.capabilities
+            .insert(capability.name.clone(), capability);
     }
 
     /// Look up a capability by name.

@@ -33,6 +33,8 @@ pub struct ExecutionLoop {
     policy: Arc<PolicyEngine>,
     signal_rx: SignalReceiver,
     user_id: String,
+    /// Optional capability registry for resolving capability-level policies.
+    capabilities: Option<Arc<crate::capability::registry::CapabilityRegistry>>,
     /// Optional broadcast sender for live event streaming.
     event_tx: Option<tokio::sync::broadcast::Sender<crate::types::event::ThreadEvent>>,
     /// Optional retrieval engine for injecting prior knowledge into context.
@@ -57,6 +59,7 @@ impl ExecutionLoop {
             policy,
             signal_rx,
             user_id,
+            capabilities: None,
             event_tx: None,
             retrieval: None,
         }
@@ -68,6 +71,15 @@ impl ExecutionLoop {
         tx: tokio::sync::broadcast::Sender<crate::types::event::ThreadEvent>,
     ) -> Self {
         self.event_tx = Some(tx);
+        self
+    }
+
+    /// Set the capability registry for resolving capability-level policies.
+    pub fn with_capabilities(
+        mut self,
+        capabilities: Arc<crate::capability::registry::CapabilityRegistry>,
+    ) -> Self {
+        self.capabilities = Some(capabilities);
         self
     }
 
@@ -93,13 +105,25 @@ impl ExecutionLoop {
         self.thread.transition_to(ThreadState::Running, None)?;
 
         // Inject CodeAct/RLM system prompt if none exists
-        if !self.thread.messages.iter().any(|m| m.role == crate::types::message::MessageRole::System) {
+        if !self
+            .thread
+            .messages
+            .iter()
+            .any(|m| m.role == crate::types::message::MessageRole::System)
+        {
             // Get available actions for the prompt
             let active_leases = self.leases.active_for_thread(self.thread.id).await;
-            let actions = self.effects.available_actions(&active_leases).await
-                .unwrap_or_default();
+            let actions = match self.effects.available_actions(&active_leases).await {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(thread_id = %self.thread.id, "failed to load actions for system prompt: {e}");
+                    Vec::new()
+                }
+            };
             let system_prompt = crate::executor::prompt::build_codeact_system_prompt(&actions);
-            self.thread.messages.insert(0, ThreadMessage::system(system_prompt));
+            self.thread
+                .messages
+                .insert(0, ThreadMessage::system(system_prompt));
         }
 
         let max_iterations = self.thread.config.max_iterations;
@@ -138,10 +162,8 @@ impl ExecutionLoop {
                     limit = max_tokens,
                     "token limit exceeded"
                 );
-                self.thread.transition_to(
-                    ThreadState::Completed,
-                    Some("token limit exceeded".into()),
-                )?;
+                self.thread
+                    .transition_to(ThreadState::Completed, Some("token limit exceeded".into()))?;
                 return Ok(ThreadOutcome::Failed {
                     error: format!(
                         "Token limit exceeded: {} of {} tokens",
@@ -176,10 +198,8 @@ impl ExecutionLoop {
                     limit = max_usd,
                     "USD budget exceeded"
                 );
-                self.thread.transition_to(
-                    ThreadState::Completed,
-                    Some("USD budget exceeded".into()),
-                )?;
+                self.thread
+                    .transition_to(ThreadState::Completed, Some("USD budget exceeded".into()))?;
                 return Ok(ThreadOutcome::Failed {
                     error: format!(
                         "USD budget exceeded: ${:.4} of ${:.4}",
@@ -236,9 +256,7 @@ impl ExecutionLoop {
             // 6. Create step
             let mut step = Step::new(self.thread.id, iteration + 1);
             step.status = StepStatus::LlmCalling;
-            self.emit_event(EventKind::StepStarted {
-                step_id: step.id,
-            });
+            self.emit_event(EventKind::StepStarted { step_id: step.id });
 
             // 7. Call LLM
             // CodeAct/RLM: send NO structured tool definitions — tools are described
@@ -308,8 +326,7 @@ impl ExecutionLoop {
                     // sometimes write FINAL() outside code blocks)
                     if let Some(answer) = extract_final_from_text(&text) {
                         debug!(thread_id = %self.thread.id, "FINAL() detected in text response");
-                        self.thread
-                            .add_message(ThreadMessage::assistant(text));
+                        self.thread.add_message(ThreadMessage::assistant(text));
                         step.status = StepStatus::Completed;
                         step.completed_at = Some(chrono::Utc::now());
                         self.emit_event(EventKind::StepCompleted {
@@ -337,8 +354,7 @@ impl ExecutionLoop {
                             nudge_count,
                             "tool intent detected, injecting nudge"
                         );
-                        self.thread
-                            .add_message(ThreadMessage::assistant(text));
+                        self.thread.add_message(ThreadMessage::assistant(text));
                         self.thread
                             .add_message(ThreadMessage::user(intent::TOOL_INTENT_NUDGE));
 
@@ -364,10 +380,8 @@ impl ExecutionLoop {
                     });
                     self.thread.step_count += 1;
 
-                    self.thread.transition_to(
-                        ThreadState::Completed,
-                        Some("text response".into()),
-                    )?;
+                    self.thread
+                        .transition_to(ThreadState::Completed, Some("text response".into()))?;
                     return Ok(ThreadOutcome::Completed {
                         response: Some(text),
                     });
@@ -378,7 +392,10 @@ impl ExecutionLoop {
 
                     // Record assistant message with action calls
                     self.thread
-                        .add_message(ThreadMessage::assistant_with_actions(content, calls.clone()));
+                        .add_message(ThreadMessage::assistant_with_actions(
+                            content,
+                            calls.clone(),
+                        ));
 
                     step.status = StepStatus::Executing;
 
@@ -391,6 +408,21 @@ impl ExecutionLoop {
                         step_id: step.id,
                     };
 
+                    // Collect capability-level policies from the registry.
+                    // Gathers policies from all registered capabilities — they're
+                    // cheap and deterministic. Per-action scoping happens inside
+                    // the policy engine via condition matching.
+                    let cap_policies: Vec<crate::types::capability::PolicyRule> = self
+                        .capabilities
+                        .as_ref()
+                        .map(|caps| {
+                            caps.list()
+                                .iter()
+                                .flat_map(|c| c.policies.iter().cloned())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
                     // Execute actions
                     let batch = execute_action_calls(
                         &calls,
@@ -399,7 +431,7 @@ impl ExecutionLoop {
                         &self.leases,
                         &self.policy,
                         &exec_ctx,
-                        &[], // capability-level policies (TODO: resolve from registry)
+                        &cap_policies,
                     )
                     .await?;
 
@@ -428,8 +460,10 @@ impl ExecutionLoop {
 
                     // Check if approval is needed
                     if let Some(outcome) = batch.need_approval {
-                        self.thread
-                            .transition_to(ThreadState::Waiting, Some("awaiting approval".into()))?;
+                        self.thread.transition_to(
+                            ThreadState::Waiting,
+                            Some("awaiting approval".into()),
+                        )?;
                         return Ok(outcome);
                     }
                 }
@@ -559,15 +593,18 @@ impl ExecutionLoop {
                             output_str
                         };
                         if result.is_error {
-                            output_parts.push(format!("[{} error] {}", result.action_name, truncated));
+                            output_parts
+                                .push(format!("[{} error] {}", result.action_name, truncated));
                         } else {
-                            output_parts.push(format!("[{} result] {}", result.action_name, truncated));
+                            output_parts
+                                .push(format!("[{} result] {}", result.action_name, truncated));
                         }
                     }
                     if code_result.return_value != serde_json::Value::Null {
                         output_parts.push(format!(
                             "[return] {}",
-                            serde_json::to_string_pretty(&code_result.return_value).unwrap_or_default()
+                            serde_json::to_string_pretty(&code_result.return_value)
+                                .unwrap_or_default()
                         ));
                     }
                     let output_text = if output_parts.is_empty() {
@@ -577,14 +614,22 @@ impl ExecutionLoop {
                     };
                     // Truncate total output to prevent context bloat
                     let mut metadata = if output_text.chars().count() > 8000 {
-                        let tail: String = output_text.chars().skip(output_text.chars().count() - 8000).collect();
-                        format!("[TRUNCATED: last 8000 of {} chars]\n{tail}", output_text.chars().count())
+                        let tail: String = output_text
+                            .chars()
+                            .skip(output_text.chars().count() - 8000)
+                            .collect();
+                        format!(
+                            "[TRUNCATED: last 8000 of {} chars]\n{tail}",
+                            output_text.chars().count()
+                        )
                     } else {
                         output_text
                     };
 
                     // If code had errors, remind the model about `state`
-                    if code_result.had_error && !persisted_state.as_object().is_some_and(|m| m.is_empty()) {
+                    if code_result.had_error
+                        && !persisted_state.as_object().is_some_and(|m| m.is_empty())
+                    {
                         let keys: Vec<&str> = persisted_state
                             .as_object()
                             .map(|m| m.keys().map(String::as_str).collect())
@@ -607,10 +652,8 @@ impl ExecutionLoop {
 
                     // Check FINAL() termination
                     if let Some(answer) = code_result.final_answer {
-                        self.thread.transition_to(
-                            ThreadState::Completed,
-                            Some("FINAL() called".into()),
-                        )?;
+                        self.thread
+                            .transition_to(ThreadState::Completed, Some("FINAL() called".into()))?;
                         return Ok(ThreadOutcome::Completed {
                             response: Some(answer),
                         });
@@ -618,8 +661,10 @@ impl ExecutionLoop {
 
                     // Check if approval is needed
                     if let Some(outcome) = code_result.need_approval {
-                        self.thread
-                            .transition_to(ThreadState::Waiting, Some("awaiting approval".into()))?;
+                        self.thread.transition_to(
+                            ThreadState::Waiting,
+                            Some("awaiting approval".into()),
+                        )?;
                         return Ok(outcome);
                     }
 
@@ -763,11 +808,11 @@ fn extract_final_from_text(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::llm::{LlmCallConfig, LlmOutput};
     use crate::types::capability::{ActionDef, CapabilityLease, EffectType};
     use crate::types::project::ProjectId;
     use crate::types::step::{ActionResult, TokenUsage};
     use crate::types::thread::{ThreadConfig, ThreadType};
-    use crate::traits::llm::{LlmCallConfig, LlmOutput};
 
     use std::sync::Mutex;
     use std::time::Duration;
@@ -913,21 +958,11 @@ mod tests {
         let policy = Arc::new(PolicyEngine::new());
 
         // Grant a default lease
-        leases
-            .grant(tid, "test_cap", vec![], None, None)
-            .await;
+        leases.grant(tid, "test_cap", vec![], None, None).await;
 
         let (tx, rx) = crate::runtime::messaging::signal_channel(16);
 
-        let exec = ExecutionLoop::new(
-            thread,
-            llm,
-            effects,
-            leases,
-            policy,
-            rx,
-            "test-user".into(),
-        );
+        let exec = ExecutionLoop::new(thread, llm, effects, leases, policy, rx, "test-user".into());
         (exec, tx)
     }
 
@@ -1059,11 +1094,12 @@ mod tests {
 
         let outcome = exec.run().await.unwrap();
         assert!(matches!(outcome, ThreadOutcome::Completed { .. }));
-        assert!(exec
-            .thread
-            .messages
-            .iter()
-            .any(|m| m.content == "injected!"));
+        assert!(
+            exec.thread
+                .messages
+                .iter()
+                .any(|m| m.content == "injected!")
+        );
     }
 
     #[tokio::test]
@@ -1088,11 +1124,12 @@ mod tests {
         );
         assert_eq!(exec.thread.step_count, 2);
         // Should have nudge system message
-        assert!(exec
-            .thread
-            .messages
-            .iter()
-            .any(|m| m.content.contains("didn't make an action call")));
+        assert!(
+            exec.thread
+                .messages
+                .iter()
+                .any(|m| m.content.contains("didn't make an action call"))
+        );
     }
 
     #[tokio::test]
@@ -1165,9 +1202,9 @@ mod tests {
     async fn codeact_tool_call_then_final() {
         // LLM outputs code that calls a tool, then uses the result
         let (mut exec, _tx) = make_loop(
-            vec![
-                code_response("result = test_tool()\nprint(result)\nFINAL('got result')"),
-            ],
+            vec![code_response(
+                "result = test_tool()\nprint(result)\nFINAL('got result')",
+            )],
             vec![Ok(ActionResult {
                 call_id: "code_call_1".into(),
                 action_name: "test_tool".into(),
@@ -1225,7 +1262,12 @@ mod tests {
         );
         assert_eq!(exec.thread.step_count, 2);
         // The output metadata from first step should be in messages
-        assert!(exec.thread.messages.iter().any(|m| m.content.contains("x = 30")));
+        assert!(
+            exec.thread
+                .messages
+                .iter()
+                .any(|m| m.content.contains("x = 30"))
+        );
     }
 
     #[tokio::test]
@@ -1243,12 +1285,17 @@ mod tests {
         .await;
 
         let outcome = exec.run().await.unwrap();
-        assert!(matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "recovered"));
+        assert!(
+            matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "recovered")
+        );
         assert_eq!(exec.thread.step_count, 2);
         // First step should have error in output metadata
-        assert!(exec.thread.messages.iter().any(|m| {
-            m.content.contains("NameError") || m.content.contains("Error")
-        }));
+        assert!(
+            exec.thread
+                .messages
+                .iter()
+                .any(|m| { m.content.contains("NameError") || m.content.contains("Error") })
+        );
     }
 
     #[tokio::test]
@@ -1321,7 +1368,9 @@ mod tests {
         let (mut exec, _tx) = make_loop(
             vec![
                 // First response: code that calls llm_query
-                code_response("answer = llm_query('What is 2+2?')\nFINAL(f'Sub-agent said: {answer}')"),
+                code_response(
+                    "answer = llm_query('What is 2+2?')\nFINAL(f'Sub-agent said: {answer}')",
+                ),
                 // This text response will be consumed by the llm_query sub-call
                 // (MockLlm pops from the same queue)
             ],

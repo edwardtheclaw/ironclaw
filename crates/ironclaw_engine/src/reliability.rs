@@ -165,9 +165,7 @@ mod tests {
         tracker
             .record_success("tool_b", Duration::from_millis(50))
             .await;
-        tracker
-            .record_failure("tool_b", "not found")
-            .await;
+        tracker.record_failure("tool_b", "not found").await;
 
         let m = tracker.get_metrics("tool_b").await.unwrap();
         assert_eq!(m.call_count, 2);
@@ -181,9 +179,7 @@ mod tests {
         tracker
             .record_success("good_tool", Duration::from_millis(10))
             .await;
-        tracker
-            .record_failure("bad_tool", "always fails")
-            .await;
+        tracker.record_failure("bad_tool", "always fails").await;
 
         let unreliable = tracker.unreliable_actions(0.5).await;
         assert_eq!(unreliable.len(), 1);

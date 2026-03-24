@@ -53,9 +53,11 @@ impl LeaseManager {
     /// Check whether a lease is still valid. Returns the lease if valid.
     pub async fn check(&self, lease_id: LeaseId) -> Result<CapabilityLease, EngineError> {
         let leases = self.active.read().await;
-        let lease = leases.get(&lease_id).ok_or_else(|| EngineError::LeaseExpired {
-            capability_name: format!("lease {lease_id:?} not found"),
-        })?;
+        let lease = leases
+            .get(&lease_id)
+            .ok_or_else(|| EngineError::LeaseExpired {
+                capability_name: format!("lease {lease_id:?} not found"),
+            })?;
         if !lease.is_valid() {
             return Err(EngineError::LeaseExpired {
                 capability_name: lease.capability_name.clone(),
@@ -67,9 +69,11 @@ impl LeaseManager {
     /// Consume one use of a lease. Returns error if the lease is invalid or exhausted.
     pub async fn consume_use(&self, lease_id: LeaseId) -> Result<(), EngineError> {
         let mut leases = self.active.write().await;
-        let lease = leases.get_mut(&lease_id).ok_or_else(|| EngineError::LeaseExpired {
-            capability_name: format!("lease {lease_id:?} not found"),
-        })?;
+        let lease = leases
+            .get_mut(&lease_id)
+            .ok_or_else(|| EngineError::LeaseExpired {
+                capability_name: format!("lease {lease_id:?} not found"),
+            })?;
         if !lease.is_valid() {
             return Err(EngineError::LeaseExpired {
                 capability_name: lease.capability_name.clone(),
@@ -202,8 +206,16 @@ mod tests {
             None,
         )
         .await;
-        assert!(mgr.find_lease_for_action(tid, "create_issue").await.is_some());
-        assert!(mgr.find_lease_for_action(tid, "delete_repo").await.is_none());
+        assert!(
+            mgr.find_lease_for_action(tid, "create_issue")
+                .await
+                .is_some()
+        );
+        assert!(
+            mgr.find_lease_for_action(tid, "delete_repo")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

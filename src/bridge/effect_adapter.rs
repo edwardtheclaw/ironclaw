@@ -53,7 +53,10 @@ impl EffectBridgeAdapter {
     /// Mark a tool as auto-approved (user said "always").
     #[allow(dead_code)]
     pub async fn auto_approve_tool(&self, tool_name: &str) {
-        self.auto_approved.write().await.insert(tool_name.to_string());
+        self.auto_approved
+            .write()
+            .await
+            .insert(tool_name.to_string());
     }
 }
 

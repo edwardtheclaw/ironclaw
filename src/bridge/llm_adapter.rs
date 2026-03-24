@@ -7,9 +7,7 @@ use ironclaw_engine::{
     TokenUsage,
 };
 
-use crate::llm::{
-    ChatMessage, LlmProvider, Role, ToolCall, ToolCompletionRequest, ToolDefinition,
-};
+use crate::llm::{ChatMessage, LlmProvider, Role, ToolCall, ToolCompletionRequest, ToolDefinition};
 
 /// Wraps an existing `LlmProvider` to implement the engine's `LlmBackend` trait.
 pub struct LlmBridgeAdapter {
@@ -105,12 +103,13 @@ impl LlmBackend for LlmBridgeAdapter {
         request.metadata = config.metadata.clone();
 
         // Call provider
-        let response = provider
-            .complete_with_tools(request)
-            .await
-            .map_err(|e| EngineError::Llm {
-                reason: e.to_string(),
-            })?;
+        let response =
+            provider
+                .complete_with_tools(request)
+                .await
+                .map_err(|e| EngineError::Llm {
+                    reason: e.to_string(),
+                })?;
 
         // Convert response — check for code blocks (CodeAct/RLM pattern)
         let llm_response = if !response.tool_calls.is_empty() {

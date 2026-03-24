@@ -15,4 +15,4 @@
 pub mod executor;
 pub mod pipeline;
 
-pub use pipeline::{reflect, reflect_simple, ReflectionResult};
+pub use pipeline::{ReflectionResult, reflect, reflect_simple};

@@ -314,12 +314,8 @@ mod tests {
         let engine = PolicyEngine::new();
         let action = make_action("transfer_funds", vec![EffectType::Financial], false);
         let lease = make_lease();
-        let decision = engine.evaluate_with_provenance(
-            &action,
-            &lease,
-            &[],
-            &Provenance::LlmGenerated,
-        );
+        let decision =
+            engine.evaluate_with_provenance(&action, &lease, &[], &Provenance::LlmGenerated);
         assert!(matches!(decision, PolicyDecision::RequireApproval { .. }));
     }
 
@@ -328,12 +324,8 @@ mod tests {
         let engine = PolicyEngine::new();
         let action = make_action("post_message", vec![EffectType::WriteExternal], false);
         let lease = make_lease();
-        let decision = engine.evaluate_with_provenance(
-            &action,
-            &lease,
-            &[],
-            &Provenance::LlmGenerated,
-        );
+        let decision =
+            engine.evaluate_with_provenance(&action, &lease, &[], &Provenance::LlmGenerated);
         assert!(matches!(decision, PolicyDecision::RequireApproval { .. }));
     }
 
@@ -342,12 +334,7 @@ mod tests {
         let engine = PolicyEngine::new();
         let action = make_action("transfer_funds", vec![EffectType::Financial], false);
         let lease = make_lease();
-        let decision = engine.evaluate_with_provenance(
-            &action,
-            &lease,
-            &[],
-            &Provenance::User,
-        );
+        let decision = engine.evaluate_with_provenance(&action, &lease, &[], &Provenance::User);
         assert_eq!(decision, PolicyDecision::Allow);
     }
 
@@ -360,7 +347,9 @@ mod tests {
             &action,
             &lease,
             &[],
-            &Provenance::ToolOutput { action_name: "scrape_invoices".into() },
+            &Provenance::ToolOutput {
+                action_name: "scrape_invoices".into(),
+            },
         );
         assert!(matches!(decision, PolicyDecision::RequireApproval { .. }));
     }

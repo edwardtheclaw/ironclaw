@@ -35,32 +35,42 @@ src/
 │   ├── capability.rs     # Capability, ActionDef, EffectType, CapabilityLease, PolicyRule
 │   ├── memory.rs         # MemoryDoc, DocId, DocType (Summary/Lesson/Playbook/Issue/Spec/Note)
 │   ├── project.rs        # Project, ProjectId
-│   ├── event.rs          # ThreadEvent, EventKind (16 variants for event sourcing)
+│   ├── event.rs          # ThreadEvent, EventKind (18 variants for event sourcing)
 │   ├── message.rs        # ThreadMessage, MessageRole
 │   ├── provenance.rs     # Provenance enum (User/System/ToolOutput/LlmGenerated/etc.)
+│   ├── conversation.rs   # ConversationSurface, ConversationEntry, EntrySender
+│   ├── mission.rs        # Mission, MissionId, MissionCadence, MissionStatus
 │   └── error.rs          # EngineError, ThreadError, StepError, CapabilityError
 ├── traits/               # External dependency abstractions (host implements these)
 │   ├── llm.rs            # LlmBackend trait
-│   ├── store.rs          # Store trait (18 CRUD methods)
+│   ├── store.rs          # Store trait (20 CRUD methods)
 │   └── effect.rs         # EffectExecutor trait
 ├── capability/           # Capability management
 │   ├── registry.rs       # CapabilityRegistry — register/get/list capabilities
 │   ├── lease.rs          # LeaseManager — grant/check/consume/revoke/expire leases
-│   └── policy.rs         # PolicyEngine — deterministic effect-level allow/deny/approve
+│   └── policy.rs         # PolicyEngine — deterministic effect-level allow/deny/approve + provenance taint
 ├── runtime/              # Thread lifecycle management
 │   ├── manager.rs        # ThreadManager — spawn, stop, inject messages, join threads
+│   ├── conversation.rs   # ConversationManager — routes UI messages to threads
+│   ├── mission.rs        # MissionManager — long-running goals that spawn threads on cadence
 │   ├── tree.rs           # ThreadTree — parent-child relationships
 │   └── messaging.rs      # ThreadSignal, ThreadOutcome, signal channels
 ├── executor/             # Step execution
 │   ├── loop_engine.rs    # ExecutionLoop — core loop replacing run_agentic_loop()
 │   ├── structured.rs     # Tier 0: structured tool call execution
-│   ├── context.rs        # Context builder (messages + actions from leases)
-│   └── intent.rs         # Tool intent nudge detection
+│   ├── scripting.rs      # Tier 1: embedded Python via Monty (CodeAct/RLM)
+│   ├── context.rs        # Context builder (messages + actions from leases + memory docs)
+│   ├── compaction.rs     # Context compaction when approaching model context limit
+│   ├── prompt.rs         # System prompt construction (CodeAct preamble/postamble)
+│   ├── intent.rs         # Tool intent nudge detection
+│   └── trace.rs          # Execution trace recording and retrospective analysis
 ├── memory/               # Memory document system
 │   ├── store.rs          # MemoryStore — project-scoped doc CRUD
-│   └── retrieval.rs      # RetrievalEngine — context building (stub, Phase 4)
-└── reflection/           # Post-thread reflection (stub, Phase 4)
-    └── mod.rs
+│   └── retrieval.rs      # RetrievalEngine — keyword-based context retrieval from project docs
+├── reflection/           # Post-thread reflection pipeline
+│   ├── pipeline.rs       # reflect() (CodeAct) + reflect_simple() (direct LLM) + output parsing
+│   └── executor.rs       # ReflectionExecutor — read-only tools for reflection threads
+└── reliability.rs        # ReliabilityTracker — per-action success rate and latency via EMA
 ```
 
 ## Thread State Machine
