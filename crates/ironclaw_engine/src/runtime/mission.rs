@@ -770,4 +770,270 @@ mod tests {
             "spawned thread should be recorded in mission history"
         );
     }
+
+    // ── E2E Mission Flow Tests ──────────────────────────────
+
+    /// Build a MissionManager with a MockLlm that returns specific text.
+    fn make_mission_manager_with_response(store: Arc<dyn Store>, response: &str) -> MissionManager {
+        let caps = CapabilityRegistry::new();
+        let thread_manager = Arc::new(ThreadManager::new(
+            MockLlm::text(response),
+            Arc::new(MockEffects),
+            Arc::clone(&store),
+            Arc::new(caps),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        ));
+        MissionManager::new(store, thread_manager)
+    }
+
+    #[tokio::test]
+    async fn fire_mission_builds_meta_prompt_with_goal() {
+        // The MockLlm returns a simple response. We verify the mission
+        // creates a thread and records it.
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager_with_response(
+            Arc::clone(&store) as Arc<dyn Store>,
+            "I searched for news. Found 5 articles.\n\nNext focus: Summarize the articles\nGoal achieved: no",
+        );
+        let project_id = ProjectId::new();
+
+        let id = mgr
+            .create_mission(
+                project_id,
+                "Tech News",
+                "Deliver daily tech news briefing",
+                MissionCadence::Manual,
+            )
+            .await
+            .unwrap();
+
+        let thread_id = mgr.fire_mission(id, "test-user", None).await.unwrap();
+        assert!(thread_id.is_some());
+
+        // Wait for background outcome processing
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        assert_eq!(mission.thread_history.len(), 1);
+        assert_eq!(mission.status, MissionStatus::Active); // not completed
+    }
+
+    #[tokio::test]
+    async fn outcome_processing_extracts_next_focus() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager_with_response(
+            Arc::clone(&store) as Arc<dyn Store>,
+            "Accomplished: Analyzed the codebase\n\nNext focus: Write tests for the auth module\nGoal achieved: no",
+        );
+        let project_id = ProjectId::new();
+
+        let id = mgr
+            .create_mission(
+                project_id,
+                "Test Coverage",
+                "Increase test coverage to 80%",
+                MissionCadence::Manual,
+            )
+            .await
+            .unwrap();
+
+        mgr.fire_mission(id, "test-user", None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        // next_focus should be extracted from the response
+        assert_eq!(
+            mission.current_focus.as_deref(),
+            Some("Write tests for the auth module"),
+            "next_focus should be extracted from FINAL response"
+        );
+        // approach_history should have one entry
+        assert_eq!(mission.approach_history.len(), 1);
+        assert!(mission.approach_history[0].contains("Accomplished"));
+    }
+
+    #[tokio::test]
+    async fn outcome_processing_detects_goal_achieved() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager_with_response(
+            Arc::clone(&store) as Arc<dyn Store>,
+            "Coverage is now 82%!\n\nNext focus: none\nGoal achieved: yes",
+        );
+        let project_id = ProjectId::new();
+
+        let id = mgr
+            .create_mission(
+                project_id,
+                "Coverage Mission",
+                "Get to 80% coverage",
+                MissionCadence::Manual,
+            )
+            .await
+            .unwrap();
+
+        // Set success criteria
+        {
+            let mut missions = store.missions.write().await;
+            if let Some(m) = missions.get_mut(&id) {
+                m.success_criteria = Some("coverage >= 80%".into());
+            }
+        }
+
+        mgr.fire_mission(id, "test-user", None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        assert_eq!(
+            mission.status,
+            MissionStatus::Completed,
+            "mission should be completed when goal is achieved"
+        );
+    }
+
+    #[tokio::test]
+    async fn mission_evolves_via_direct_outcome_processing() {
+        // Test the outcome processing directly without relying on
+        // background task timing.
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        let project_id = ProjectId::new();
+
+        // Create a mission
+        let mission = Mission::new(
+            project_id,
+            "Coverage",
+            "Increase coverage to 80%",
+            MissionCadence::Manual,
+        );
+        let id = mission.id;
+        store.save_mission(&mission).await.unwrap();
+
+        // Simulate fire 1 outcome
+        let outcome1 = ThreadOutcome::Completed {
+            response: Some(
+                "Found 3 uncovered modules.\n\nNext focus: Write tests for db module\nGoal achieved: no".into(),
+            ),
+        };
+        process_mission_outcome(&store, id, ThreadId::new(), &outcome1)
+            .await
+            .unwrap();
+
+        let mission = store.load_mission(id).await.unwrap().unwrap();
+        assert_eq!(
+            mission.current_focus.as_deref(),
+            Some("Write tests for db module")
+        );
+        assert_eq!(mission.approach_history.len(), 1);
+        assert_eq!(mission.status, MissionStatus::Active);
+
+        // Simulate fire 2 outcome
+        let outcome2 = ThreadOutcome::Completed {
+            response: Some(
+                "Added 15 tests for db module.\n\nNext focus: Write tests for tools module\nGoal achieved: no".into(),
+            ),
+        };
+        process_mission_outcome(&store, id, ThreadId::new(), &outcome2)
+            .await
+            .unwrap();
+
+        let mission = store.load_mission(id).await.unwrap().unwrap();
+        assert_eq!(
+            mission.current_focus.as_deref(),
+            Some("Write tests for tools module"),
+            "focus should evolve between outcomes"
+        );
+        assert_eq!(mission.approach_history.len(), 2);
+
+        // Simulate fire 3 — goal achieved
+        let outcome3 = ThreadOutcome::Completed {
+            response: Some("Coverage is 82%!\n\nGoal achieved: yes".into()),
+        };
+        process_mission_outcome(&store, id, ThreadId::new(), &outcome3)
+            .await
+            .unwrap();
+
+        let mission = store.load_mission(id).await.unwrap().unwrap();
+        assert_eq!(
+            mission.status,
+            MissionStatus::Completed,
+            "mission should complete when goal achieved"
+        );
+        assert_eq!(mission.approach_history.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn fire_with_trigger_payload() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager_with_response(
+            Arc::clone(&store) as Arc<dyn Store>,
+            "Processed the webhook event.\n\nNext focus: none\nGoal achieved: no",
+        );
+        let project_id = ProjectId::new();
+
+        let id = mgr
+            .create_mission(
+                project_id,
+                "GitHub Triage",
+                "Triage incoming issues",
+                MissionCadence::Webhook {
+                    path: "github".into(),
+                    secret: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let payload = serde_json::json!({
+            "action": "opened",
+            "issue": {
+                "title": "Bug: login fails",
+                "number": 42
+            }
+        });
+
+        let thread_id = mgr
+            .fire_mission(id, "test-user", Some(payload.clone()))
+            .await
+            .unwrap();
+        assert!(thread_id.is_some());
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        assert_eq!(mission.last_trigger_payload, Some(payload));
+        assert_eq!(mission.threads_today, 1);
+    }
+
+    #[tokio::test]
+    async fn daily_budget_enforced() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager_with_response(Arc::clone(&store) as Arc<dyn Store>, "done");
+        let project_id = ProjectId::new();
+
+        let id = mgr
+            .create_mission(project_id, "budget test", "goal", MissionCadence::Manual)
+            .await
+            .unwrap();
+
+        // Set max_threads_per_day to 1
+        {
+            let mut missions = store.missions.write().await;
+            if let Some(m) = missions.get_mut(&id) {
+                m.max_threads_per_day = 1;
+            }
+        }
+
+        // First fire — should work
+        let t1 = mgr.fire_mission(id, "test-user", None).await.unwrap();
+        assert!(t1.is_some());
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Second fire — should be blocked by budget
+        let t2 = mgr.fire_mission(id, "test-user", None).await.unwrap();
+        assert!(
+            t2.is_none(),
+            "second fire should be blocked by daily budget"
+        );
+    }
 }
