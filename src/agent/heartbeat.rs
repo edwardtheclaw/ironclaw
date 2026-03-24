@@ -620,7 +620,6 @@ pub fn spawn_multi_user_heartbeat(
                             "multi-user heartbeat: memory hygiene deleted stale documents"
                         );
                     }
-
                     let mut runner = HeartbeatRunner::new(cfg, hyg, workspace, llm_clone);
                     if let Some(tx) = tx {
                         runner = runner.with_response_channel(tx);

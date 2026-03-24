@@ -416,11 +416,6 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
         } else {
             Some(self.agent.llm().cost_per_token())
         };
-        // Use the override model name if set so cost attribution is accurate.
-        let model_name = reason_ctx
-            .model_override
-            .clone()
-            .unwrap_or_else(|| self.agent.llm().active_model_name());
         let read_discount = self.agent.llm().cache_read_discount();
         let write_multiplier = self.agent.llm().cache_write_multiplier();
         let call_cost = self
