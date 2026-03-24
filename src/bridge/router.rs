@@ -6,8 +6,8 @@ use tokio::sync::RwLock;
 use tracing::debug;
 
 use ironclaw_engine::{
-    Capability, CapabilityRegistry, ConversationManager, LeaseManager, PolicyEngine, Project,
-    Store, ThreadConfig, ThreadManager, ThreadOutcome,
+    Capability, CapabilityRegistry, ConversationManager, LeaseManager, MissionManager,
+    PolicyEngine, Project, Store, ThreadConfig, ThreadManager, ThreadOutcome,
 };
 
 use ironclaw_common::AppEvent;
@@ -49,6 +49,8 @@ struct EngineState {
     sse: Option<Arc<SseManager>>,
     /// V1 database for writing conversation messages (gateway reads from here).
     db: Option<Arc<dyn Database>>,
+    /// Mission manager for long-running goals.
+    mission_manager: Arc<MissionManager>,
 }
 
 /// Global engine state, initialized on first use.
@@ -133,6 +135,18 @@ async fn get_or_init_engine(agent: &Agent) -> Result<(), Error> {
 
     let conversation_manager = ConversationManager::new(Arc::clone(&thread_manager));
 
+    // Create mission manager and start cron ticker
+    let mission_manager = Arc::new(MissionManager::new(
+        store.clone() as Arc<dyn Store>,
+        Arc::clone(&thread_manager),
+    ));
+    mission_manager.start_cron_ticker(agent.deps.owner_id.clone());
+
+    // Wire mission manager into effect adapter for mission_* function calls
+    effect_adapter
+        .set_mission_manager(Arc::clone(&mission_manager))
+        .await;
+
     *guard = Some(EngineState {
         thread_manager,
         conversation_manager,
@@ -142,6 +156,7 @@ async fn get_or_init_engine(agent: &Agent) -> Result<(), Error> {
         pending_approval: RwLock::new(None),
         sse: agent.deps.sse_tx.clone(),
         db: agent.deps.store.clone(),
+        mission_manager,
     });
 
     Ok(())

@@ -39,6 +39,8 @@ pub struct EffectBridgeAdapter {
     call_count: std::sync::atomic::AtomicU32,
     /// Per-user per-tool sliding window rate limiter.
     rate_limiter: RateLimiter,
+    /// Mission manager for handling mission_* function calls.
+    mission_manager: RwLock<Option<Arc<ironclaw_engine::MissionManager>>>,
 }
 
 impl EffectBridgeAdapter {
@@ -54,6 +56,7 @@ impl EffectBridgeAdapter {
             auto_approved: RwLock::new(HashSet::new()),
             call_count: std::sync::atomic::AtomicU32::new(0),
             rate_limiter: RateLimiter::new(),
+            mission_manager: RwLock::new(None),
         }
     }
 
@@ -63,6 +66,138 @@ impl EffectBridgeAdapter {
             .write()
             .await
             .insert(tool_name.to_string());
+    }
+
+    /// Set the mission manager (called after engine init).
+    pub async fn set_mission_manager(&self, mgr: Arc<ironclaw_engine::MissionManager>) {
+        *self.mission_manager.write().await = Some(mgr);
+    }
+
+    /// Handle mission_* function calls. Returns None if not a mission call.
+    async fn handle_mission_call(
+        &self,
+        action_name: &str,
+        params: &serde_json::Value,
+        context: &ThreadExecutionContext,
+    ) -> Option<Result<ActionResult, EngineError>> {
+        let mgr = self.mission_manager.read().await;
+        let mgr = mgr.as_ref()?;
+
+        let result = match action_name {
+            "mission_create" => {
+                let name = params
+                    .get("name")
+                    .or_else(|| params.get("_args").and_then(|a| a.get(0)))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unnamed mission");
+                let goal = params
+                    .get("goal")
+                    .or_else(|| params.get("_args").and_then(|a| a.get(1)))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let cadence_str = params
+                    .get("cadence")
+                    .or_else(|| params.get("_args").and_then(|a| a.get(2)))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("manual");
+                match mgr
+                    .create_mission(context.project_id, name, goal, parse_cadence(cadence_str))
+                    .await
+                {
+                    Ok(id) => {
+                        Ok(serde_json::json!({"mission_id": id.to_string(), "status": "created"}))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            "mission_list" => match mgr.list_missions(context.project_id).await {
+                Ok(missions) => {
+                    let list: Vec<serde_json::Value> = missions
+                        .iter()
+                        .map(|m| {
+                            serde_json::json!({
+                                "id": m.id.to_string(),
+                                "name": m.name,
+                                "goal": m.goal,
+                                "status": format!("{:?}", m.status),
+                                "threads": m.thread_history.len(),
+                                "current_focus": m.current_focus,
+                            })
+                        })
+                        .collect();
+                    Ok(serde_json::json!(list))
+                }
+                Err(e) => Err(e),
+            },
+            "mission_fire" => {
+                let id_str = params
+                    .get("id")
+                    .or_else(|| params.get("_args").and_then(|a| a.get(0)))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let id = uuid::Uuid::parse_str(id_str)
+                    .map(ironclaw_engine::MissionId)
+                    .map_err(|e| EngineError::Effect {
+                        reason: format!("invalid mission id: {e}"),
+                    });
+                match id {
+                    Ok(id) => match mgr.fire_mission(id, &context.user_id, None).await {
+                        Ok(Some(tid)) => {
+                            Ok(serde_json::json!({"thread_id": tid.to_string(), "status": "fired"}))
+                        }
+                        Ok(None) => Ok(
+                            serde_json::json!({"status": "not_fired", "reason": "mission is terminal or budget exhausted"}),
+                        ),
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                }
+            }
+            "mission_pause" | "mission_resume" => {
+                let id_str = params
+                    .get("id")
+                    .or_else(|| params.get("_args").and_then(|a| a.get(0)))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let id = uuid::Uuid::parse_str(id_str)
+                    .map(ironclaw_engine::MissionId)
+                    .map_err(|e| EngineError::Effect {
+                        reason: format!("invalid mission id: {e}"),
+                    });
+                match id {
+                    Ok(id) => {
+                        let res = if action_name == "mission_pause" {
+                            mgr.pause_mission(id).await
+                        } else {
+                            mgr.resume_mission(id).await
+                        };
+                        match res {
+                            Ok(()) => Ok(serde_json::json!({"status": "ok"})),
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            _ => return None, // Not a mission call
+        };
+
+        Some(match result {
+            Ok(output) => Ok(ActionResult {
+                call_id: String::new(),
+                action_name: action_name.to_string(),
+                output,
+                is_error: false,
+                duration: std::time::Duration::ZERO,
+            }),
+            Err(e) => Ok(ActionResult {
+                call_id: String::new(),
+                action_name: action_name.to_string(),
+                output: serde_json::json!({"error": e.to_string()}),
+                is_error: true,
+                duration: std::time::Duration::ZERO,
+            }),
+        })
     }
 
     /// Reset the per-step call counter (called between code steps).
@@ -106,7 +241,18 @@ impl EffectExecutor for EffectBridgeAdapter {
             });
         }
 
-        // ── 0. Block tools that need v1 runtime deps (RoutineEngine, Scheduler) ──
+        // ── 0a. Handle mission_* functions via MissionManager ──
+        if let Some(result) = self
+            .handle_mission_call(action_name, &parameters, context)
+            .await
+        {
+            return result.map(|mut r| {
+                r.duration = start.elapsed();
+                r
+            });
+        }
+
+        // ── 0b. Block tools that need v1 runtime deps (RoutineEngine, Scheduler) ──
         if is_v1_only_tool(lookup_name) {
             return Err(EngineError::Effect {
                 reason: format!(
@@ -293,6 +439,41 @@ impl EffectExecutor for EffectBridgeAdapter {
         }
 
         Ok(actions)
+    }
+}
+
+/// Parse a cadence string into a MissionCadence.
+fn parse_cadence(s: &str) -> ironclaw_engine::types::mission::MissionCadence {
+    use ironclaw_engine::types::mission::MissionCadence;
+    let trimmed = s.trim().to_lowercase();
+    if trimmed == "manual" {
+        MissionCadence::Manual
+    } else if trimmed.contains(' ') && trimmed.split_whitespace().count() >= 5 {
+        // Looks like a cron expression
+        MissionCadence::Cron {
+            expression: s.trim().to_string(),
+            timezone: None,
+        }
+    } else if trimmed.starts_with("event:") {
+        MissionCadence::OnEvent {
+            event_pattern: trimmed
+                .strip_prefix("event:")
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+        }
+    } else if trimmed.starts_with("webhook:") {
+        MissionCadence::Webhook {
+            path: trimmed
+                .strip_prefix("webhook:")
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+            secret: None,
+        }
+    } else {
+        // Default to manual if unrecognized
+        MissionCadence::Manual
     }
 }
 

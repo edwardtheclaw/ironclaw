@@ -326,34 +326,35 @@ async fn process_mission_outcome(
     };
 
     match outcome {
-        ThreadOutcome::Completed { response } => {
-            if let Some(text) = response {
-                // Try to extract next focus and goal status from the response
-                let lower = text.to_lowercase();
+        ThreadOutcome::Completed {
+            response: Some(text),
+        } => {
+            // Try to extract next focus and goal status from the response
+            let lower = text.to_lowercase();
 
-                // Check if goal achieved
-                if lower.contains("goal has been achieved: yes")
-                    || lower.contains("goal achieved: yes")
-                    || lower.contains("mission complete")
-                {
-                    debug!(mission_id = %mission_id, "goal achieved — completing mission");
-                    mission.status = MissionStatus::Completed;
-                }
-
-                // Extract next focus (look for "next focus:" pattern)
-                if let Some(focus_start) = lower.find("next focus:") {
-                    let after = &text[focus_start + "next focus:".len()..];
-                    let next_focus: String = after.lines().next().unwrap_or("").trim().to_string();
-                    if !next_focus.is_empty() {
-                        mission.current_focus = Some(next_focus);
-                    }
-                }
-
-                // Record approach
-                let accomplishment: String = text.chars().take(200).collect();
-                mission.approach_history.push(accomplishment);
+            // Check if goal achieved
+            if lower.contains("goal has been achieved: yes")
+                || lower.contains("goal achieved: yes")
+                || lower.contains("mission complete")
+            {
+                debug!(mission_id = %mission_id, "goal achieved — completing mission");
+                mission.status = MissionStatus::Completed;
             }
+
+            // Extract next focus (look for "next focus:" pattern)
+            if let Some(focus_start) = lower.find("next focus:") {
+                let after = &text[focus_start + "next focus:".len()..];
+                let next_focus: String = after.lines().next().unwrap_or("").trim().to_string();
+                if !next_focus.is_empty() {
+                    mission.current_focus = Some(next_focus);
+                }
+            }
+
+            // Record approach
+            let accomplishment: String = text.chars().take(200).collect();
+            mission.approach_history.push(accomplishment);
         }
+        ThreadOutcome::Completed { response: None } => {}
         ThreadOutcome::Failed { error } => {
             mission.approach_history.push(format!("FAILED: {error}"));
         }
