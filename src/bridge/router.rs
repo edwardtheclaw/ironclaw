@@ -3,7 +3,7 @@
 use std::sync::{Arc, OnceLock};
 
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::debug;
 
 use ironclaw_engine::{
     Capability, CapabilityRegistry, ConversationManager, LeaseManager, PolicyEngine, Project,
@@ -61,7 +61,7 @@ async fn get_or_init_engine(agent: &Agent) -> Result<(), Error> {
         return Ok(()); // double-check after acquiring write lock
     }
 
-    info!("engine v2: initializing engine state");
+    debug!("engine v2: initializing engine state");
 
     let llm_adapter = Arc::new(LlmBridgeAdapter::new(
         agent.llm().clone(),
@@ -175,7 +175,7 @@ pub async fn handle_approval(
     }
 
     // Approved — add to auto-approved set
-    info!(
+    debug!(
         tool = %pending.action_name,
         always,
         "engine v2: tool approved"
@@ -190,7 +190,7 @@ pub async fn handle_approval(
     state.effect_adapter.auto_approve_tool(&registry_name).await;
 
     if always {
-        info!(tool = %pending.action_name, "engine v2: tool auto-approved for session");
+        debug!(tool = %pending.action_name, "engine v2: tool auto-approved for session");
     }
 
     // Re-process the original message — the tool will now pass approval
@@ -219,7 +219,7 @@ pub async fn handle_with_engine(
     let guard = lock.read().await;
     let state = guard.as_ref().expect("engine initialized");
 
-    info!(
+    debug!(
         user_id = %message.user_id,
         channel = %message.channel,
         "engine v2: handling message"
