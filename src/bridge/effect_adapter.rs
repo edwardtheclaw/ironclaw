@@ -22,18 +22,23 @@ use ironclaw_engine::{
 use crate::context::JobContext;
 use crate::hooks::{HookEvent, HookOutcome, HookRegistry};
 use crate::safety::SafetyLayer;
+use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::{ApprovalRequirement, ToolRegistry};
 
 /// Wraps the existing tool pipeline to implement the engine's `EffectExecutor`.
 ///
 /// Enforces all v1 security controls at the adapter boundary:
-/// tool approval, output sanitization, hooks, and rate limiting.
+/// tool approval, output sanitization, hooks, rate limiting, and call limits.
 pub struct EffectBridgeAdapter {
     tools: Arc<ToolRegistry>,
     safety: Arc<SafetyLayer>,
     hooks: Arc<HookRegistry>,
     /// Tools the user has approved with "always" (persists within session).
     auto_approved: RwLock<HashSet<String>>,
+    /// Per-step tool call counter (reset externally between steps).
+    call_count: std::sync::atomic::AtomicU32,
+    /// Per-user per-tool sliding window rate limiter.
+    rate_limiter: RateLimiter,
 }
 
 impl EffectBridgeAdapter {
@@ -47,16 +52,24 @@ impl EffectBridgeAdapter {
             safety,
             hooks,
             auto_approved: RwLock::new(HashSet::new()),
+            call_count: std::sync::atomic::AtomicU32::new(0),
+            rate_limiter: RateLimiter::new(),
         }
     }
 
     /// Mark a tool as auto-approved (user said "always").
-    #[allow(dead_code)]
     pub async fn auto_approve_tool(&self, tool_name: &str) {
         self.auto_approved
             .write()
             .await
             .insert(tool_name.to_string());
+    }
+
+    /// Reset the per-step call counter (called between code steps).
+    #[allow(dead_code)]
+    pub fn reset_call_count(&self) {
+        self.call_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -78,6 +91,31 @@ impl EffectExecutor for EffectBridgeAdapter {
         } else {
             &hyphenated
         };
+
+        // ── Per-step call limit (prevent amplification loops) ──
+        const MAX_CALLS_PER_STEP: u32 = 50;
+        let count = self
+            .call_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count >= MAX_CALLS_PER_STEP {
+            return Err(EngineError::Effect {
+                reason: format!(
+                    "Tool call limit reached ({MAX_CALLS_PER_STEP} per code step). \
+                     Break your task into multiple steps."
+                ),
+            });
+        }
+
+        // ── 0. Block tools that need v1 runtime deps (RoutineEngine, Scheduler) ──
+        if is_v1_only_tool(lookup_name) {
+            return Err(EngineError::Effect {
+                reason: format!(
+                    "Tool '{}' is not available in engine v2. \
+                     Tell the user to use the slash command instead (e.g. /routine, /job).",
+                    action_name
+                ),
+            });
+        }
 
         // ── 1. Check tool approval (v1: Tool::requires_approval) ──
 
@@ -106,6 +144,29 @@ impl EffectExecutor for EffectBridgeAdapter {
                     }
                 }
                 ApprovalRequirement::Never => {}
+            }
+        }
+
+        // ── 1.5. Check rate limit (v1: RateLimiter) ──
+
+        if let Some(tool) = self.tools.get(lookup_name).await
+            && let Some(rl_config) = tool.rate_limit_config()
+        {
+            let result = self
+                .rate_limiter
+                .check_and_record(&context.user_id, lookup_name, &rl_config)
+                .await;
+            if let crate::tools::rate_limiter::RateLimitResult::Limited {
+                retry_after, ..
+            } = result
+            {
+                return Err(EngineError::Effect {
+                    reason: format!(
+                        "Tool '{}' is rate limited. Try again in {:.0}s.",
+                        action_name,
+                        retry_after.as_secs_f64()
+                    ),
+                });
             }
         }
 
@@ -204,9 +265,14 @@ impl EffectExecutor for EffectBridgeAdapter {
     ) -> Result<Vec<ActionDef>, EngineError> {
         let tool_defs = self.tools.tool_definitions().await;
 
-        // Build action defs with approval info from each tool
+        // Build action defs, excluding v1-only tools
         let mut actions = Vec::with_capacity(tool_defs.len());
         for td in tool_defs {
+            // Skip tools that can't work in engine v2
+            if is_v1_only_tool(&td.name) {
+                continue;
+            }
+
             let python_name = td.name.replace('-', "_");
 
             // Check default approval requirement (with empty params)
@@ -230,4 +296,26 @@ impl EffectExecutor for EffectBridgeAdapter {
 
         Ok(actions)
     }
+}
+
+/// Tools that depend on v1 runtime components (RoutineEngine, Scheduler,
+/// ContainerJobManager) and cannot work in engine v2's minimal JobContext.
+fn is_v1_only_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "routine_create"
+            | "routine-create"
+            | "routine_update"
+            | "routine-update"
+            | "routine_delete"
+            | "routine-delete"
+            | "routine_fire"
+            | "routine-fire"
+            | "create_job"
+            | "create-job"
+            | "cancel_job"
+            | "cancel-job"
+            | "build_software"
+            | "build-software"
+    )
 }

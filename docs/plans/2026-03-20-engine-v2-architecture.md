@@ -383,46 +383,25 @@ Engine broadcasts `ThreadEvent`s via `tokio::broadcast`. Router subscribes and f
 - Loaded on startup via `load_docs_from_workspace()`
 - Full DB persistence (engine_* tables) deferred — workspace persistence is sufficient for learning across sessions
 
-#### Web gateway integration (NOT YET IMPLEMENTED)
+#### Web gateway integration — DONE
+- SSE streaming via AppEvent: `ThreadEvent` → `AppEvent` conversion + `SseManager.broadcast()`
+- V1 conversation DB persistence: user messages + agent responses written via `add_conversation_message()`
+- Depends on `ironclaw_common` crate with `AppEvent` type (PR #1615, merged into branch)
 
-The web gateway is completely disconnected from engine v2. Three gaps:
+#### Routines / Jobs — BLOCKED (gracefully)
+- V1-only tools (`routine_create`, `create_job`, `build_software`, etc.) are blocked in engine v2 with a helpful error: "use the slash command instead"
+- Filtered out of `available_actions()` so the system prompt doesn't list them
+- Routines still work via `/routine` slash commands (fall through to v1)
+- Long term: replace with engine v2 Mission system
 
-**1. No SSE event streaming**
-- Gateway expects `SseEvent` variants via `SseManager.broadcast()`
-- Engine v2 emits `ThreadEvent` via `tokio::broadcast` (forwarded to channel as `StatusUpdate` — works for REPL but not web)
-- **Fix**: Bridge `ThreadEvent` → `SseEvent` (or common `AppEvent` type) and broadcast to `SseManager`
-- **Prerequisite**: SseEvent extraction to common AppEvent type (separate PR in progress)
-- Events to bridge: `StepStarted` → `Thinking`, `ActionExecuted` → `ToolCompleted`, `ActionFailed` → `ToolCompleted(error)`, thread completion → `Response`
+#### Rate limiting — DONE
+- Per-user per-tool sliding window via `RateLimiter` in `EffectBridgeAdapter`
+- Checks `tool.rate_limit_config()` before every execution
+- Returns "rate limited, try again in Ns" error
 
-**2. No conversation persistence for gateway**
-- Gateway reads chat history from v1 `ConversationStore` DB tables
-- Engine v2 writes to `HybridStore` (in-memory + workspace) which gateway doesn't query
-- **Fix**: After engine thread completes, write user message + response to v1 conversation tables via `ConversationStore::add_conversation_message()`
-- This gives the gateway history without changing any gateway code
-
-**3. No cross-channel message visibility**
-- REPL messages processed by engine v2 don't appear in web gateway
-- Web gateway messages processed by engine v2 don't appear in REPL history
-- **Fix**: Same as #2 — writing to v1 conversation tables makes messages visible everywhere
-
-**Implementation approach** (minimal, after AppEvent PR):
-1. Router accepts `sse_tx: Option<Arc<SseManager>>` from `Agent.deps`
-2. Forward `ThreadEvent` → `SseEvent` during the event polling loop (alongside channel `StatusUpdate`)
-3. After thread completion, write user message + response to v1 DB via `store.add_conversation_message()`
-4. Gateway reads from DB as usual — no gateway code changes needed
-
-#### Routines / Jobs (NOT HOOKED UP)
-
-Routines are entirely v1 — `RoutineEngine` fires via cron/event triggers and runs through `run_agentic_loop()` with its own delegate. Engine v2 routing only intercepts `UserInput` and `ApprovalResponse` in `handle_message`. Routine execution doesn't go through `handle_message`.
-
-**Known issue:** When a user asks "create a routine for..." as natural language, engine v2 processes it via CodeAct. The model calls `routine_create(...)` which needs `Arc<RoutineEngine>` + `Arc<dyn Database>` — these exist on the tool but the `JobContext` built by the bridge has minimal fields. This can cause crashes (observed: SIGKILL during routine creation attempt).
-
-**Options:**
-- Short term: block routine/job tools in engine v2 (return "use /routine command instead")
-- Medium term: pass `RoutineEngine` + DB refs through `JobContext.metadata` or a dedicated context field
-- Long term: replace routines with engine v2 `Mission` system
-
-Engine v2 has `Mission` types (`MissionManager`, `MissionCadence`, `MissionStatus`) defined but not wired to trigger infrastructure.
+#### Per-step tool call limit — DONE
+- Max 50 tool calls per code step (prevents amplification loops in CodeAct)
+- Atomic counter in `EffectBridgeAdapter`, error on exceed
 
 #### Acceptance testing (NOT YET IMPLEMENTED)
 - Drive engine via TestRig + TraceLlm fixtures
@@ -533,11 +512,11 @@ Once boundaries stabilize, split if beneficial:
 | **3** | CodeAct (Monty + RLM pattern) | **DONE** | 74 | `b59a0b9`, `9538332` |
 | **4** | Budget controls + compaction + reflection | **DONE** | 78 | `4bc7ffd` |
 | **5** | Conversation surface | **DONE** | 85 | `0827235` |
-| **6** | Main crate bridge (Strategy C) | **DONE** (partial) | 134 | `ac4ced0`→`7afeaa9c` |
+| **6** | Main crate bridge (Strategy C) | **DONE** | 151 | `ac4ced0`→`ccec1917` |
 | **7** | Cleanup + migration | Planned | — | — |
 | **8** | WASM tools + Docker isolation | Planned | — | — |
 
-**Phase 6 remaining:** approval flow, DB persistence, acceptance tests, two-phase commit.
+**Phase 6 remaining:** acceptance tests (TestRig fixtures), two-phase commit.
 Phase 7 depends on Phase 6 approval + DB being complete. Phase 8 is infrastructure integration.
 
 ---
