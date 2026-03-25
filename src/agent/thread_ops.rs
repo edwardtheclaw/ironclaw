@@ -1143,7 +1143,10 @@ impl Agent {
                     Some(thread) => {
                         if let Some(turn) = thread.last_turn_mut() {
                             if is_tool_error {
-                                turn.record_tool_error_for(&pending.tool_call_id, result_content.clone());
+                                turn.record_tool_error_for(
+                                    &pending.tool_call_id,
+                                    result_content.clone(),
+                                );
                             } else {
                                 turn.record_tool_result_for(
                                     &pending.tool_call_id,
