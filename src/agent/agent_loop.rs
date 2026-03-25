@@ -1150,9 +1150,14 @@ impl Agent {
             && let Submission::UserInput { ref content } = submission
             && let Some(engine) = self.routine_engine().await
         {
+            let single_message_repl = is_single_message_repl(message);
             // Use post-hook content so that BeforeInbound hooks that rewrite
             // input are respected by event trigger matching.
-            let fired = engine.check_event_triggers(message, content).await;
+            let fired = if single_message_repl {
+                engine.check_event_triggers_and_wait(message, content).await
+            } else {
+                engine.check_event_triggers(message, content).await
+            };
             if fired > 0 {
                 tracing::debug!(
                     channel = %message.channel,
@@ -1160,7 +1165,7 @@ impl Agent {
                     fired,
                     "Consumed inbound user message with matching event-triggered routine(s)"
                 );
-                return if is_single_message_repl(message) {
+                return if single_message_repl {
                     Ok(None)
                 } else {
                     Ok(Some(String::new()))
