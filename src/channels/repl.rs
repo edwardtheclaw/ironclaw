@@ -431,6 +431,18 @@ impl ReplChannel {
             let _ = execute!(stderr, terminal::Clear(terminal::ClearType::FromCursorDown));
         }
     }
+
+    async fn finish_single_message_turn(&self) {
+        if self.single_message.is_none() {
+            return;
+        }
+
+        let tx = self.msg_tx.lock().ok().and_then(|mut guard| guard.take());
+        if let Some(tx) = tx {
+            let msg = IncomingMessage::new("repl", &self.user_id, "/quit");
+            let _ = tx.send(msg).await;
+        }
+    }
 }
 
 impl Default for ReplChannel {
@@ -480,10 +492,10 @@ impl Channel for ReplChannel {
 
     async fn start(&self) -> Result<MessageStream, ChannelError> {
         let (tx, rx) = mpsc::channel(32);
-        // Interactive mode needs a sender handle so approval prompts can inject
-        // responses back into the channel. Single-message mode should not keep
-        // an extra sender alive or the receiver stream never closes.
-        if self.single_message.is_none() && let Ok(mut guard) = self.msg_tx.lock() {
+        // Approval prompts inject responses back through this sender.
+        // In single-message mode we keep it until the turn finishes, then
+        // drop it after enqueuing /quit so the receiver stream can close.
+        if let Ok(mut guard) = self.msg_tx.lock() {
             *guard = Some(tx.clone());
         }
         let single_message = self.single_message.clone();
@@ -500,9 +512,6 @@ impl Channel for ReplChannel {
             if let Some(msg) = single_message {
                 let incoming = IncomingMessage::new("repl", &user_id, &msg).with_timezone(&sys_tz);
                 let _ = tx.blocking_send(incoming);
-                // Ensure the agent exits after handling exactly one turn in -m mode,
-                // even when other channels (gateway/http) are enabled.
-                let _ = tx.blocking_send(IncomingMessage::new("repl", &user_id, "/quit"));
                 return;
             }
 
@@ -665,6 +674,7 @@ impl Channel for ReplChannel {
             println!();
             println!();
             self.stdin_locked.store(false, Ordering::Relaxed);
+            self.finish_single_message_turn().await;
             return Ok(());
         }
 
@@ -683,6 +693,7 @@ impl Channel for ReplChannel {
         println!();
         // Unlock stdin so readline can resume
         self.stdin_locked.store(false, Ordering::Relaxed);
+        self.finish_single_message_turn().await;
         Ok(())
     }
 
@@ -906,6 +917,17 @@ mod tests {
             .expect("first message missing");
         assert_eq!(first.channel, "repl");
         assert_eq!(first.content, "hi");
+
+        assert!(
+            timeout(Duration::from_millis(100), stream.next())
+                .await
+                .is_err(),
+            "single-message mode should wait for the turn to finish before quitting"
+        );
+
+        repl.respond(&first, OutgoingResponse::text("done"))
+            .await
+            .expect("respond should succeed");
 
         let second = timeout(Duration::from_secs(1), stream.next())
             .await
