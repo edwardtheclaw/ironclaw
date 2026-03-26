@@ -400,7 +400,7 @@ impl HeartbeatRunner {
     }
 
     /// Send a notification about heartbeat findings.
-    pub(crate) async fn send_notification(&self, message: &str) {
+    async fn send_notification(&self, message: &str) {
         let Some(ref tx) = self.response_tx else {
             tracing::debug!("No response channel configured for heartbeat notifications");
             return;
