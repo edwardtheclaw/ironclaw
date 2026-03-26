@@ -3528,6 +3528,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "zbus",
+ "zeroize",
  "zip",
 ]
 

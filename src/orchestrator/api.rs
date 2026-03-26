@@ -781,7 +781,7 @@ mod tests {
                 assert_eq!(role, "assistant");
                 assert_eq!(content, "Hello from worker");
             }
-            other => panic!("Expected JobMessage, got {:?}", other),
+            other => unreachable!("Expected JobMessage, got {:?}", other),
         }
     }
 
@@ -829,7 +829,7 @@ mod tests {
             SseEvent::JobToolUse { tool_name, .. } => {
                 assert_eq!(tool_name, "shell");
             }
-            other => panic!("Expected JobToolUse, got {:?}", other),
+            other => unreachable!("Expected JobToolUse, got {:?}", other),
         }
     }
 

@@ -17,6 +17,15 @@ use crate::channels::web::types::SseEvent;
 /// Prevents resource exhaustion from connection flooding.
 const MAX_CONNECTIONS: u64 = 100;
 
+/// Capacity of the SSE broadcast ring-buffer.
+/// When the buffer is full, the oldest messages are overwritten and lagging
+/// receivers will see a `RecvError::Lagged` error on their next receive.
+const BROADCAST_CAPACITY: usize = 256;
+
+/// Warn threshold: emit a warning when queued messages exceed this fraction
+/// of `BROADCAST_CAPACITY` (90 %).
+const BROADCAST_WARN_THRESHOLD: usize = (BROADCAST_CAPACITY as f64 * 0.9) as usize;
+
 /// Manages SSE broadcast to all connected browser tabs.
 pub struct SseManager {
     tx: broadcast::Sender<SseEvent>,
@@ -28,7 +37,7 @@ impl SseManager {
     /// Create a new SSE manager.
     pub fn new() -> Self {
         // Buffer 256 events; slow clients will miss events (acceptable for SSE with reconnect)
-        let (tx, _) = broadcast::channel(256);
+        let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             tx,
             connection_count: Arc::new(AtomicU64::new(0)),
@@ -54,8 +63,21 @@ impl SseManager {
     }
 
     /// Broadcast an event to all connected clients.
+    ///
+    /// Emits a `warn!` when the broadcast buffer is approaching capacity so
+    /// that slow consumers can be detected before messages are silently dropped
+    /// (QW-07 / O-04).
     pub fn broadcast(&self, event: SseEvent) {
-        // Ignore send errors (no receivers is fine)
+        let queued = self.tx.len();
+        if queued >= BROADCAST_WARN_THRESHOLD {
+            tracing::warn!(
+                queued,
+                capacity = BROADCAST_CAPACITY,
+                "SSE broadcast buffer near capacity; slow consumers may miss events"
+            );
+        }
+        // Ignore send errors (no receivers is fine; lagged receivers are
+        // handled by BroadcastStream which emits RecvError::Lagged).
         let _ = self.tx.send(event);
     }
 

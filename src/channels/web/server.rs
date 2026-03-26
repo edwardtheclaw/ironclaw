@@ -228,6 +228,9 @@ pub async fn start_server(
     // Public routes (no auth)
     let public = Router::new()
         .route("/api/health", get(health_handler))
+        // /healthz is a process-supervisor–friendly alias used by systemd, Kubernetes,
+        // and Docker Compose readiness/liveness probes (QW-06 / Ops-01).
+        .route("/healthz", get(health_handler))
         .route("/oauth/callback", get(oauth_callback_handler))
         .route(
             "/oauth/slack/callback",

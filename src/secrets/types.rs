@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 /// A stored secret with encrypted value.
 ///
@@ -124,8 +125,11 @@ impl fmt::Debug for DecryptedSecret {
 
 impl Clone for DecryptedSecret {
     fn clone(&self) -> Self {
+        // Wrap the intermediate String in Zeroizing so that heap memory
+        // containing the plaintext is explicitly zeroed on drop (B-07 / S-05).
+        let plaintext = Zeroizing::new(self.value.expose_secret().to_string());
         Self {
-            value: SecretString::from(self.value.expose_secret().to_string()),
+            value: SecretString::from((*plaintext).clone()),
         }
     }
 }

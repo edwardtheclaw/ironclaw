@@ -118,6 +118,9 @@ semver = "1"
 # Secrecy for sensitive values
 secrecy = { version = "0.10", features = ["serde"] }
 
+# Explicit zeroize dependency for Zeroizing<T> wrapper (secrecy uses this internally)
+zeroize = "1"
+
 # URL parsing and encoding
 url = "2"
 urlencoding = "2"

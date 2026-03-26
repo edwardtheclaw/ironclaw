@@ -13,8 +13,9 @@ use crate::agent::session::Session;
 use crate::agent::undo::UndoManager;
 use crate::hooks::HookRegistry;
 
-/// Warn when session count exceeds this threshold.
-const SESSION_COUNT_WARNING_THRESHOLD: usize = 1000;
+/// Hard limit: evict the least-recently-active idle session when the session
+/// count reaches this threshold (QW-08 / B-05).
+const SESSION_COUNT_HARD_LIMIT: usize = 1000;
 
 /// Key for mapping external thread IDs to internal ones.
 #[derive(Clone, Hash, Eq, PartialEq)]
@@ -66,17 +67,74 @@ impl SessionManager {
             return Arc::clone(session);
         }
 
+        // Hard eviction: if we are at the session limit, evict the
+        // least-recently-active idle session before inserting the new one.
+        // This prevents unbounded memory growth under adversarial or runaway
+        // conditions (QW-08 / B-05).
+        //
+        // To avoid nested lock ordering issues, we identify the victim and
+        // collect its data while holding the sessions write lock, then release
+        // it before cleaning up thread_map and undo_managers.
+        let eviction: Option<(String, Vec<uuid::Uuid>)> =
+            if sessions.len() >= SESSION_COUNT_HARD_LIMIT {
+                let victim = sessions
+                    .iter()
+                    .filter_map(|(uid, sess)| {
+                        // try_lock fails when a session is actively being used
+                        let guard = sess.try_lock().ok()?;
+                        Some((uid.clone(), guard.last_active_at))
+                    })
+                    .min_by_key(|(_, ts)| *ts)
+                    .map(|(uid, _)| uid);
+
+                if let Some(ref evict_uid) = victim {
+                    let thread_ids: Vec<uuid::Uuid> = sessions
+                        .get(evict_uid)
+                        .and_then(|s| s.try_lock().ok())
+                        .map(|s| s.threads.keys().copied().collect())
+                        .unwrap_or_default();
+                    sessions.remove(evict_uid);
+                    tracing::warn!(
+                        evicted_user = %evict_uid,
+                        count = sessions.len(),
+                        limit = SESSION_COUNT_HARD_LIMIT,
+                        "Session limit reached; evicted least-recently-active session"
+                    );
+                    Some((evict_uid.clone(), thread_ids))
+                } else {
+                    tracing::warn!(
+                        count = sessions.len(),
+                        limit = SESSION_COUNT_HARD_LIMIT,
+                        "Session limit reached but no idle session available to evict"
+                    );
+                    None
+                }
+            } else {
+                None
+            };
+
         let new_session = Session::new(user_id);
         let session_id = new_session.id.to_string();
         let session = Arc::new(Mutex::new(new_session));
         sessions.insert(user_id.to_string(), Arc::clone(&session));
 
-        if sessions.len() >= SESSION_COUNT_WARNING_THRESHOLD && sessions.len() % 100 == 0 {
-            tracing::warn!(
-                "High session count: {} active sessions. \
-                 Pruning runs every 10 minutes; consider reducing session_idle_timeout.",
-                sessions.len()
-            );
+        // Release the sessions write lock before acquiring thread_map /
+        // undo_managers write locks to maintain consistent lock ordering
+        // and avoid potential deadlocks with concurrent callers.
+        drop(sessions);
+
+        // Clean up thread_map and undo_managers for the evicted session.
+        if let Some((evict_uid, evicted_thread_ids)) = eviction {
+            {
+                let mut thread_map = self.thread_map.write().await;
+                thread_map.retain(|key, _| key.user_id != evict_uid);
+            }
+            {
+                let mut undo_managers = self.undo_managers.write().await;
+                for tid in &evicted_thread_ids {
+                    undo_managers.remove(tid);
+                }
+            }
         }
 
         // Fire OnSessionStart hook (fire-and-forget)
@@ -919,5 +977,44 @@ mod tests {
             1,
             "should have exactly 1 thread, not a duplicate"
         );
+    }
+
+    /// QW-08: When the session count reaches SESSION_COUNT_HARD_LIMIT, the
+    /// least-recently-active idle session must be evicted to make room.
+    #[tokio::test]
+    async fn test_hard_eviction_at_session_limit() {
+        let manager = SessionManager::new();
+
+        // Create (HARD_LIMIT) sessions; the first one will be the stalest.
+        for i in 0..SESSION_COUNT_HARD_LIMIT {
+            let uid = format!("evict-user-{i}");
+            let s = manager.get_or_create_session(&uid).await;
+            if i == 0 {
+                // Back-date the first session so it is the eviction victim.
+                let mut sess = s.lock().await;
+                sess.last_active_at = chrono::Utc::now() - chrono::TimeDelta::seconds(86400 * 365);
+            }
+        }
+
+        // Verify we are exactly at the limit.
+        {
+            let sessions = manager.sessions.read().await;
+            assert_eq!(sessions.len(), SESSION_COUNT_HARD_LIMIT);
+        }
+
+        // Adding one more session should evict "evict-user-0" (oldest).
+        manager.get_or_create_session("evict-new-user").await;
+
+        let sessions = manager.sessions.read().await;
+        assert!(
+            !sessions.contains_key("evict-user-0"),
+            "the oldest session should have been evicted"
+        );
+        assert!(
+            sessions.contains_key("evict-new-user"),
+            "the new session should be present"
+        );
+        // Total count should remain at the limit (evict one, add one).
+        assert_eq!(sessions.len(), SESSION_COUNT_HARD_LIMIT);
     }
 }

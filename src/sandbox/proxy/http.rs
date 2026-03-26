@@ -227,7 +227,12 @@ async fn handle_request(
 
     match decision {
         NetworkDecision::Deny { reason } => {
-            tracing::info!("Proxy: blocked {} {} - {}", method, uri, reason);
+            tracing::warn!(
+                method = %method,
+                uri = %uri,
+                reason = %reason,
+                "Proxy: blocked outbound request"
+            );
             Ok(error_response(StatusCode::FORBIDDEN, reason))
         }
         NetworkDecision::Allow | NetworkDecision::AllowWithCredentials { .. } => {
@@ -272,7 +277,11 @@ async fn handle_connect(
     let decision = state.decider.decide(&network_req).await;
 
     if let NetworkDecision::Deny { reason } = decision {
-        tracing::info!("Proxy: blocked CONNECT {} - {}", host, reason);
+        tracing::warn!(
+            host = %host,
+            reason = %reason,
+            "Proxy: blocked CONNECT tunnel"
+        );
         return error_response(StatusCode::FORBIDDEN, reason);
     }
 
@@ -332,11 +341,24 @@ async fn forward_request(
     let method = req.method().clone();
     let uri = req.uri().clone();
 
-    // Build the forwarded request
-    let mut builder = state.http_client.request(
-        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
-        uri.to_string(),
-    );
+    // Build the forwarded request.
+    // Reject methods that cannot be represented in reqwest (malformed or
+    // unsupported extension methods) rather than silently converting to GET.
+    let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
+        Ok(m) => m,
+        Err(_) => {
+            tracing::warn!(
+                method = %method,
+                uri = %uri,
+                "Proxy: rejecting request with unsupported HTTP method"
+            );
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Unsupported HTTP method: {}", method),
+            ));
+        }
+    };
+    let mut builder = state.http_client.request(reqwest_method, uri.to_string());
 
     // Copy headers (except hop-by-hop headers)
     for (name, value) in req.headers() {
@@ -552,5 +574,33 @@ mod tests {
 
         let resp = error_response(StatusCode::FORBIDDEN, "denied".to_string());
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// QW-10: Verify that the proxy method-conversion guard behaves correctly.
+    ///
+    /// - Valid HTTP token strings (including unknown extension methods) are
+    ///   parsed successfully — they will be forwarded, not silently converted.
+    /// - Malformed method strings (containing whitespace, control chars, etc.)
+    ///   would be rejected with 400 by `forward_request`.
+    ///
+    /// This documents the post-fix invariant: the `unwrap_or(GET)` fallback
+    /// that previously swallowed conversion errors has been replaced with an
+    /// explicit 400 response (B-01 / S-02).
+    #[test]
+    fn test_proxy_method_conversion_guard() {
+        // Well-formed unknown extension method: reqwest accepts any valid token.
+        let result = reqwest::Method::from_bytes(b"FROBNICATE");
+        assert!(result.is_ok(), "valid HTTP token should parse as a method");
+
+        // Standard methods round-trip correctly.
+        for method in &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"] {
+            let result = reqwest::Method::from_bytes(method.as_bytes());
+            assert!(result.is_ok(), "{method} should parse");
+        }
+
+        // Malformed method (embedded space) must fail — this is what the guard
+        // now rejects with 400 instead of silently converting to GET.
+        let result = reqwest::Method::from_bytes(b"BAD METHOD");
+        assert!(result.is_err(), "method with space must fail to parse");
     }
 }

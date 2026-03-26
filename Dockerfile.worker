@@ -9,7 +9,8 @@
 # The image includes common development tools so workers can build software,
 # run tests, and execute shell commands.
 
-FROM rust:1.92-bookworm AS builder
+# Pin by digest to prevent silent regressions from upstream tag mutations (QW-09 / Ops-03).
+FROM rust:1.92-bookworm@sha256:e90e846de4124376164ddfbaab4b0774c7bdeef5e738866295e5a90a34a307a2 AS builder
 
 WORKDIR /build
 COPY . .
@@ -19,7 +20,7 @@ RUN cargo build --release --bin ironclaw
 
 # ---
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a
 
 # Install curl first (needed to fetch the GitHub CLI GPG key), then add the
 # gh CLI apt repository, then install all remaining dev tools in one layer.
