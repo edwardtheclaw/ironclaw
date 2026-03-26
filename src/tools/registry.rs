@@ -382,9 +382,7 @@ impl ToolRegistry {
         scheduler_slot: Option<crate::tools::builtin::SchedulerSlot>,
         job_manager: Option<Arc<ContainerJobManager>>,
         store: Option<Arc<dyn Database>>,
-        job_event_tx: Option<
-            tokio::sync::broadcast::Sender<(uuid::Uuid, String, crate::common::AppEvent)>,
-        >,
+        job_event_tx: Option<tokio::sync::broadcast::Sender<(uuid::Uuid, String, crate::AppEvent)>>,
         inject_tx: Option<tokio::sync::mpsc::Sender<crate::channels::IncomingMessage>>,
         prompt_queue: Option<PromptQueue>,
         secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
