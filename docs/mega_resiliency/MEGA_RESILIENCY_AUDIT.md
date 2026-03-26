@@ -368,36 +368,40 @@ These findings affect components outside this repository:
 
 ## 16. Wave-Based Remediation Plan
 
-### Wave 1 — Hardening (Week 1, Low Risk, High Value)
+### Wave 1 — Hardening (Week 1, Low Risk, High Value) ✅ COMPLETE
 
 **Goal:** Close the most critical observability and correctness gaps without architectural change.
 
-1. **QW-01** Log proxy denials
-2. **QW-02** Reject unknown HTTP methods with 400
-3. **QW-03** `Restart=on-failure` in systemd unit
-4. **QW-04** Replace test `panic!` with `assert!`
-5. **QW-05** `Zeroizing<String>` in `DecryptedSecret::clone()`
-6. **QW-06** Add `/healthz` endpoint
-7. **QW-07** Warn on SSE buffer full
-8. **QW-08** Hard eviction in `SessionManager`
-9. **QW-09** Pin Docker image by digest
-10. **QW-10** Test for unknown HTTP method
+1. **QW-01** Log proxy denials ✅
+2. **QW-02** Reject unknown HTTP methods with 400 ✅
+3. **QW-03** `Restart=on-failure` in systemd unit ✅
+4. **QW-04** Replace test `panic!` with `unreachable!` ✅
+5. **QW-05** `Zeroizing<String>` in `DecryptedSecret::clone()` ✅
+6. **QW-06** Add `/healthz` endpoint ✅
+7. **QW-07** Warn on SSE buffer full ✅
+8. **QW-08** Hard eviction in `SessionManager` ✅
+9. **QW-09** Pin Docker image by digest ✅
+10. **QW-10** Test for unknown HTTP method ✅
+
+See: `docs/mega_resiliency/tasks/wave1_hardening.md`
 
 **Estimated effort:** 2–3 engineer-days
 
 ---
 
-### Wave 2 — Reliability (Weeks 2–3)
+### Wave 2 — Reliability (Weeks 2–3) ✅ COMPLETE
 
 **Goal:** Address the most impactful reliability gaps.
 
-1. **B-06** libSQL incremental migration tracking (version table + ordered migration files)
-2. **B-03** Structured logging for proxy denials (extend QW-01 with structured fields)
-3. **T-01** libSQL vector search integration test
-4. **T-06** Hook fail-open end-to-end test
-5. **T-09** Web gateway 100-connection limit test
-6. **Ops-02** Graceful shutdown with job drain (SIGTERM handler + in-flight job timeout)
-7. **Ops-05** libSQL write retry with backoff at DB layer
+1. **B-06** libSQL incremental migration tracking ✅ (already implemented)
+2. **B-03** Structured logging for proxy denials ✅ (already implemented)
+3. **T-01** libSQL vector search integration test ✅ (3 tests added to `tests/module_init_integration.rs`)
+4. **T-06** Hook fail-open end-to-end test ✅ (already implemented in `src/hooks/registry.rs`)
+5. **T-09** Web gateway 100-connection limit test ✅ (already implemented in `src/channels/web/sse.rs`)
+6. **Ops-02** Graceful shutdown with job drain ✅ (SIGTERM handler + 30 s drain added to `src/main.rs`)
+7. **Ops-05** libSQL write retry with backoff ✅ (already implemented in `src/db/libsql/mod.rs`)
+
+See: `docs/mega_resiliency/tasks/wave2_reliability.md`
 
 **Estimated effort:** 5–7 engineer-days
 

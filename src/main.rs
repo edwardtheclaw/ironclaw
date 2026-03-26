@@ -785,6 +785,10 @@ async fn async_main() -> anyhow::Result<()> {
     // Give the agent the routine engine slot so it can expose the engine to the gateway.
     agent.set_routine_engine_slot(shared_routine_engine_slot);
 
+    // Capture the scheduler reference before `agent.run()` so that the
+    // shutdown sequence can drain in-flight jobs (Ops-02).
+    let scheduler_for_drain = agent.scheduler();
+
     // Prepare SIGHUP handler for hot-reloading HTTP webhook config
     // Broadcast channel for clean shutdown of background tasks
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -957,12 +961,44 @@ async fn async_main() -> anyhow::Result<()> {
         });
     }
 
+    // Run the agent.  On Unix, also listen for SIGTERM so that process
+    // supervisors (systemd, launchd, Docker) can trigger the graceful drain
+    // sequence below instead of hard-killing the process (Ops-02).
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    result = agent.run() => { result?; }
+                    _ = sigterm.recv() => {
+                        tracing::info!("SIGTERM received — initiating graceful shutdown");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to register SIGTERM handler: {}", e);
+                agent.run().await?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
     agent.run().await?;
 
     // ── Shutdown ────────────────────────────────────────────────────────
 
     // Signal background tasks (SIGHUP handler, etc.) to gracefully shut down
     let _ = shutdown_tx.send(());
+
+    // Drain in-flight scheduler jobs with a 30-second timeout (Ops-02).
+    // Sends Stop signals to all running jobs and aborts background subtasks,
+    // giving them a chance to persist state before the process exits.
+    tracing::debug!("Draining in-flight jobs (30 s timeout)...");
+    tokio::time::timeout(Duration::from_secs(30), scheduler_for_drain.stop_all())
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!("Job drain timed out after 30 s; abandoning remaining jobs");
+        });
 
     // Shut down all stdio MCP server child processes.
     components.mcp_process_manager.shutdown_all().await;

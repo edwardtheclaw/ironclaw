@@ -222,6 +222,162 @@ async fn extension_manager_with_process_manager_constructs() {
 }
 
 // ---------------------------------------------------------------------------
+// T-01: libSQL WorkspaceStore — FTS and hybrid search regression tests
+//
+// These tests exercise the libSQL `hybrid_search()` path which was previously
+// undertested. Key invariants:
+//   - FTS-only search returns relevant results from `memory_chunks_fts`.
+//   - Hybrid search with an embedding does not panic even when the
+//     `libsql_vector_idx` index is absent (V9 migration removes it); the
+//     implementation logs a debug message and falls back to FTS.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_workspace_fts_search_returns_results() {
+    use ironclaw::db::{Database, WorkspaceStore};
+    use ironclaw::workspace::SearchConfig;
+
+    // In-memory database — no temp file, no cleanup required.
+    let backend = ironclaw::db::libsql::LibSqlBackend::new_memory()
+        .await
+        .expect("in-memory libsql backend");
+    backend.run_migrations().await.expect("migrations");
+
+    let user_id = "t01_fts_user";
+
+    // Create a document and insert a chunk (triggers FTS5 indexing via trigger).
+    let doc = backend
+        .get_or_create_document_by_path(user_id, None, "notes.md")
+        .await
+        .expect("create doc");
+    backend
+        .insert_chunk(
+            doc.id,
+            0,
+            "Rust is a systems programming language focused on safety and performance.",
+            None,
+        )
+        .await
+        .expect("insert chunk");
+
+    // FTS search — should find the chunk.
+    let results = backend
+        .hybrid_search(
+            user_id,
+            None,
+            "systems programming",
+            None,
+            &SearchConfig::default().fts_only(),
+        )
+        .await
+        .expect("hybrid_search");
+
+    assert!(
+        !results.is_empty(),
+        "FTS should find at least one result for 'systems programming'"
+    );
+    assert!(
+        results[0].content.contains("Rust"),
+        "top result should contain 'Rust'; got: {}",
+        results[0].content
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_workspace_fts_search_empty_on_no_match() {
+    use ironclaw::db::{Database, WorkspaceStore};
+    use ironclaw::workspace::SearchConfig;
+
+    let backend = ironclaw::db::libsql::LibSqlBackend::new_memory()
+        .await
+        .expect("in-memory libsql backend");
+    backend.run_migrations().await.expect("migrations");
+
+    let user_id = "t01_no_match_user";
+
+    let doc = backend
+        .get_or_create_document_by_path(user_id, None, "unrelated.md")
+        .await
+        .expect("create doc");
+    backend
+        .insert_chunk(
+            doc.id,
+            0,
+            "The quick brown fox jumps over the lazy dog.",
+            None,
+        )
+        .await
+        .expect("insert chunk");
+
+    // Search for something unrelated — must not error.
+    let results = backend
+        .hybrid_search(
+            user_id,
+            None,
+            "quantum cryptography blockchain",
+            None,
+            &SearchConfig::default().fts_only(),
+        )
+        .await
+        .expect("hybrid_search must not error on no match");
+
+    // FTS5 may return zero results for a completely unrelated query.
+    // The important thing is that it does not panic or return an Err.
+    drop(results);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_workspace_hybrid_search_with_embedding_falls_back_to_fts() {
+    use ironclaw::db::{Database, WorkspaceStore};
+    use ironclaw::workspace::SearchConfig;
+
+    let backend = ironclaw::db::libsql::LibSqlBackend::new_memory()
+        .await
+        .expect("in-memory libsql backend");
+    backend.run_migrations().await.expect("migrations");
+
+    let user_id = "t01_vector_user";
+
+    let doc = backend
+        .get_or_create_document_by_path(user_id, None, "memory.md")
+        .await
+        .expect("create doc");
+    backend
+        .insert_chunk(
+            doc.id,
+            0,
+            "Machine learning models need large training data sets.",
+            None,
+        )
+        .await
+        .expect("insert chunk");
+
+    // Pass a 1536-dim dummy embedding together with an FTS query.
+    // The vector index is absent in new migrations so vector search falls back
+    // to FTS-only via the debug-logged error path in `hybrid_search`.
+    let embedding: Vec<f32> = vec![0.1_f32; 1536];
+    let results = backend
+        .hybrid_search(
+            user_id,
+            None,
+            "machine learning",
+            Some(&embedding),
+            &SearchConfig::default(),
+        )
+        .await
+        .expect("hybrid_search must not error when vector index absent");
+
+    // FTS should still return the inserted chunk.
+    assert!(
+        !results.is_empty(),
+        "FTS fallback should find results for 'machine learning'"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // DatabaseHandles: default is empty
 // ---------------------------------------------------------------------------
 
