@@ -253,6 +253,18 @@ pub async fn execute_code(
     // Build context variables including persisted state from prior steps
     let (input_names, input_values) = build_context_inputs(thread, persisted_state);
 
+    // Collect known tool names so NameLookup can return callable stubs.
+    // Without this, `mission_list()` in code raises NameError because Monty
+    // resolves the name before calling it, and Undefined → NameError.
+    let active_leases = leases.active_for_thread(thread.id).await;
+    let known_actions: std::collections::HashSet<String> = effects
+        .available_actions(&active_leases)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.name)
+        .collect();
+
     // Parse and compile (wrap in catch_unwind — Monty 0.0.x can panic)
     let runner = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         MontyRun::new(code.to_string(), "step.py", input_names)
@@ -458,12 +470,23 @@ pub async fn execute_code(
 
             RunProgress::NameLookup(lookup) => {
                 let name = lookup.name.clone();
-                debug!(name = %name, "Monty: unresolved name");
+
+                // If the name matches a known tool, return a callable Function
+                // stub so Monty yields FunctionCall (dispatched to the effect
+                // executor) instead of raising NameError.
+                let result = if known_actions.contains(&name) {
+                    debug!(name = %name, "Monty: resolved as tool function");
+                    NameLookupResult::Value(MontyObject::Function {
+                        name: name.clone(),
+                        docstring: None,
+                    })
+                } else {
+                    debug!(name = %name, "Monty: unresolved name");
+                    NameLookupResult::Undefined
+                };
+
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    lookup.resume(
-                        NameLookupResult::Undefined,
-                        PrintWriter::Collect(&mut stdout),
-                    )
+                    lookup.resume(result, PrintWriter::Collect(&mut stdout))
                 })) {
                     Ok(Ok(p)) => progress = p,
                     Ok(Err(e)) => {
@@ -566,6 +589,12 @@ async fn handle_llm_query(
         messages.push(ThreadMessage::system(format!(
             "You are a sub-agent. Answer concisely based on the context.\n\n{ctx}"
         )));
+    } else {
+        // Some providers (e.g. OpenAI Codex Responses API) require a system
+        // message / instructions field. Always include one.
+        messages.push(ThreadMessage::system(
+            "You are a helpful sub-agent. Answer concisely.",
+        ));
     }
     messages.push(ThreadMessage::user(prompt));
 
@@ -654,6 +683,10 @@ async fn handle_llm_query_batched(
                 messages.push(ThreadMessage::system(format!(
                     "You are a sub-agent. Answer concisely.\n\n{ctx}"
                 )));
+            } else {
+                messages.push(ThreadMessage::system(
+                    "You are a helpful sub-agent. Answer concisely.",
+                ));
             }
             messages.push(ThreadMessage::user(prompt));
             llm.complete(&messages, &[], &config).await
