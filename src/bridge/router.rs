@@ -84,7 +84,10 @@ enum PendingApprovalResolution {
 }
 
 /// Get or initialize the engine state using the agent's dependencies.
-async fn get_or_init_engine(agent: &Agent) -> Result<(), Error> {
+///
+/// Called eagerly at startup (from `Agent::run()`) when `ENGINE_V2=true`,
+/// and defensively from each handler as a lazy fallback.
+pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
     let guard = lock.read().await;
     if guard.is_some() {
@@ -456,7 +459,7 @@ pub async fn handle_approval(
     approved: bool,
     always: bool,
 ) -> Result<Option<String>, Error> {
-    get_or_init_engine(agent).await?;
+    init_engine(agent).await?;
 
     let lock = ENGINE_STATE
         .get()
@@ -497,7 +500,7 @@ pub async fn handle_exec_approval(
     approved: bool,
     always: bool,
 ) -> Result<Option<String>, Error> {
-    get_or_init_engine(agent).await?;
+    init_engine(agent).await?;
 
     let lock = ENGINE_STATE
         .get()
@@ -642,7 +645,7 @@ pub async fn handle_interrupt(
     agent: &Agent,
     message: &IncomingMessage,
 ) -> Result<Option<String>, Error> {
-    get_or_init_engine(agent).await?;
+    init_engine(agent).await?;
 
     let lock = ENGINE_STATE
         .get()
@@ -703,7 +706,7 @@ pub async fn handle_clear(
 
 /// Stop all active threads and clear conversation entries.
 async fn clear_engine_conversation(agent: &Agent, message: &IncomingMessage) -> Result<(), Error> {
-    get_or_init_engine(agent).await?;
+    init_engine(agent).await?;
 
     let lock = ENGINE_STATE
         .get()
@@ -758,7 +761,7 @@ pub async fn handle_with_engine(
     content: &str,
 ) -> Result<Option<String>, Error> {
     // Ensure engine is initialized
-    get_or_init_engine(agent).await?;
+    init_engine(agent).await?;
 
     let lock = ENGINE_STATE
         .get()

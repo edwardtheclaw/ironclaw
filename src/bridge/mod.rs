@@ -22,6 +22,8 @@ pub use router::{
     get_engine_mission,
     get_engine_project,
     get_engine_thread,
+    // Initialization
+    init_engine,
     // Action handlers
     handle_approval,
     handle_clear,
