@@ -269,46 +269,75 @@ fn analyze_trace(thread: &Thread) -> Vec<TraceIssue> {
         }
     }
 
-    // 4. Check for code execution errors (NameError, etc. in messages)
+    // 4. Check for code execution errors in output messages.
+    // Code output appears as User-role messages (Monty stdout/stderr) with
+    // prefixes like "[stdout]" or "[stderr]". Skip the System prompt (index 0)
+    // and Assistant messages to avoid false positives from example text.
+    let error_patterns = [
+        "NameError",
+        "SyntaxError",
+        "TypeError",
+        "NotImplementedError",
+    ];
     for (i, msg) in thread.messages.iter().enumerate() {
-        if msg.role == crate::types::message::MessageRole::System
-            && (msg.content.contains("NameError")
-                || msg.content.contains("SyntaxError")
-                || msg.content.contains("TypeError")
-                || msg.content.contains("Error:"))
-        {
+        let is_code_output = msg.role == crate::types::message::MessageRole::User
+            && (msg.content.starts_with("[stdout]")
+                || msg.content.starts_with("[stderr]")
+                || msg.content.starts_with("[code ")
+                || msg.content.starts_with("Traceback"));
+        if is_code_output && error_patterns.iter().any(|p| msg.content.contains(p)) {
             let preview: String = msg.content.chars().take(200).collect();
             issues.push(TraceIssue {
                 severity: IssueSeverity::Warning,
                 category: "code_error".into(),
-                description: format!("Code error in message {i}: {preview}"),
+                description: format!("Code execution error in message {i}: {preview}"),
                 step: None,
             });
         }
     }
 
-    // 5. Check for model ignoring tool results (hallucination risk)
+    // 5. Check for empty call_id on ActionResult messages (causes LLM API rejection).
+    for (i, msg) in thread.messages.iter().enumerate() {
+        if msg.role == crate::types::message::MessageRole::ActionResult {
+            let call_id_empty = msg.action_call_id.as_ref().is_none_or(|id| id.is_empty());
+            if call_id_empty {
+                let name = msg.action_name.as_deref().unwrap_or("unknown");
+                issues.push(TraceIssue {
+                    severity: IssueSeverity::Error,
+                    category: "empty_call_id".into(),
+                    description: format!(
+                        "ActionResult message {i} (tool '{name}') has empty call_id — will cause LLM API rejection"
+                    ),
+                    step: None,
+                });
+            }
+        }
+    }
+
+    // 6. Check for model ignoring tool results (hallucination risk).
+    // In Tier 0 (structured), results appear as ActionResult messages.
+    // In Tier 1 (CodeAct), results appear as User messages with "[tool result]" prefixes.
     let has_tool_results = thread
         .messages
         .iter()
         .any(|m| m.role == crate::types::message::MessageRole::ActionResult);
-    // Check if tool outputs are visible in the message history (any role).
-    // The engine adds tool results as system messages with "[tool_name result]"
-    // or "[tool_name error]" prefixes.
-    let has_tool_output_in_messages = thread
-        .messages
-        .iter()
-        .any(|m| m.content.contains(" result]") || m.content.contains(" error]"));
+    let has_tool_output_in_messages = thread.messages.iter().any(|m| {
+        m.role == crate::types::message::MessageRole::ActionResult
+            || m.content.contains(" result]")
+            || m.content.contains(" error]")
+    });
     if has_tool_results && !has_tool_output_in_messages {
         issues.push(TraceIssue {
             severity: IssueSeverity::Warning,
             category: "missing_tool_output".into(),
-            description: "Tool results exist but no tool output in system messages — model may not see tool results".into(),
+            description:
+                "Tool results exist but no tool output in messages — model may not see tool results"
+                    .into(),
             step: None,
         });
     }
 
-    // 6. Check for excessive iterations
+    // 7. Check for excessive iterations
     if thread.step_count > 10 {
         issues.push(TraceIssue {
             severity: IssueSeverity::Warning,
@@ -321,7 +350,7 @@ fn analyze_trace(thread: &Thread) -> Vec<TraceIssue> {
         });
     }
 
-    // 7. Check for text response without FINAL (model answered from memory)
+    // 8. Check for text response without FINAL (model answered from memory)
     let text_without_code = thread.events.iter().all(|e| {
         !matches!(
             e.kind,
@@ -337,7 +366,7 @@ fn analyze_trace(thread: &Thread) -> Vec<TraceIssue> {
         });
     }
 
-    // 8. Check for LLM not producing code blocks
+    // 9. Check for LLM not producing code blocks
     let code_steps = thread
         .events
         .iter()
@@ -363,5 +392,40 @@ fn analyze_trace(thread: &Thread) -> Vec<TraceIssue> {
         });
     }
 
+    // 10. Extract failure reason from StateChanged → Failed events
+    for event in &thread.events {
+        if let crate::types::event::EventKind::StateChanged {
+            to: ThreadState::Failed,
+            reason: Some(reason),
+            ..
+        } = &event.kind
+        {
+            if reason.contains("LLM") || reason.contains("Provider") {
+                issues.push(TraceIssue {
+                    severity: IssueSeverity::Error,
+                    category: "llm_error".into(),
+                    description: format!("LLM provider error: {}", truncate(reason, 300)),
+                    step: None,
+                });
+            } else if reason.contains("orchestrator") {
+                issues.push(TraceIssue {
+                    severity: IssueSeverity::Error,
+                    category: "orchestrator_error".into(),
+                    description: format!("Orchestrator error: {}", truncate(reason, 300)),
+                    step: None,
+                });
+            }
+        }
+    }
+
     issues
+}
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    let chars: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        format!("{chars}...")
+    } else {
+        chars
+    }
 }

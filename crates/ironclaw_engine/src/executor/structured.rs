@@ -129,7 +129,10 @@ pub async fn execute_action_calls(
             .await;
 
         match result {
-            Ok(action_result) => {
+            Ok(mut action_result) => {
+                // EffectExecutor doesn't receive call_id; stamp it from the
+                // original ActionCall so downstream messages carry the correct ID.
+                action_result.call_id = call.id.clone();
                 events.push(EventKind::ActionExecuted {
                     step_id: context.step_id,
                     action_name: call.action_name.clone(),
