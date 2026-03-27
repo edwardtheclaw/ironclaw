@@ -8,8 +8,9 @@ use serde_json::json;
 use crate::exports::near::agent::channel::Attachment;
 use crate::near::agent::channel_host::{self, InboundAttachment};
 use crate::types::{
-    CdnMedia, ImageItem, MessageItem, SendMessageRequest, WechatConfig, MESSAGE_ITEM_IMAGE,
-    MESSAGE_STATE_FINISH, MESSAGE_TYPE_BOT, UPLOAD_MEDIA_TYPE_IMAGE,
+    CdnMedia, FileItem, ImageItem, MessageItem, SendMessageRequest, WechatConfig,
+    MESSAGE_ITEM_FILE, MESSAGE_ITEM_IMAGE, MESSAGE_ITEM_VOICE, MESSAGE_STATE_FINISH,
+    MESSAGE_TYPE_BOT, UPLOAD_MEDIA_TYPE_IMAGE,
 };
 
 const AES_BLOCK_SIZE: usize = 16;
@@ -21,7 +22,7 @@ pub struct UploadImage {
     pub file_size_ciphertext: u64,
 }
 
-pub fn extract_image_attachments(
+pub fn extract_inbound_attachments(
     config: &WechatConfig,
     message: &crate::types::WechatMessage,
 ) -> Result<Vec<InboundAttachment>, String> {
@@ -29,7 +30,9 @@ pub fn extract_image_attachments(
         .item_list
         .iter()
         .enumerate()
-        .filter_map(|(index, item)| map_image_attachment(config, message, item, index).transpose())
+        .filter_map(|(index, item)| {
+            map_inbound_attachment(config, message, item, index).transpose()
+        })
         .collect()
 }
 
@@ -70,6 +73,8 @@ pub fn send_image_attachment(
                     aeskey: None,
                     mid_size: Some(upload.file_size_ciphertext),
                 }),
+                voice_item: None,
+                file_item: None,
             }],
             context_token: context_token.map(str::to_string),
         },
@@ -77,6 +82,24 @@ pub fn send_image_attachment(
     };
 
     crate::api::send_message_request(config, &request)
+}
+
+fn map_inbound_attachment(
+    config: &WechatConfig,
+    message: &crate::types::WechatMessage,
+    item: &MessageItem,
+    index: usize,
+) -> Result<Option<InboundAttachment>, String> {
+    if item.r#type == Some(MESSAGE_ITEM_IMAGE) {
+        return map_image_attachment(config, message, item, index);
+    }
+    if item.r#type == Some(MESSAGE_ITEM_VOICE) {
+        return map_voice_attachment(config, message, item, index);
+    }
+    if item.r#type == Some(MESSAGE_ITEM_FILE) {
+        return map_file_attachment(config, message, item, index);
+    }
+    Ok(None)
 }
 
 fn map_image_attachment(
@@ -127,6 +150,132 @@ fn map_image_attachment(
     }))
 }
 
+fn map_file_attachment(
+    config: &WechatConfig,
+    message: &crate::types::WechatMessage,
+    item: &MessageItem,
+    index: usize,
+) -> Result<Option<InboundAttachment>, String> {
+    if item.r#type != Some(MESSAGE_ITEM_FILE) {
+        return Ok(None);
+    }
+
+    let file = item.file_item.as_ref().ok_or_else(|| {
+        format!(
+            "WeChat file message {:?} is missing file_item payload",
+            message.message_id
+        )
+    })?;
+    let media = file.media.as_ref().ok_or_else(|| {
+        format!(
+            "WeChat file message {:?} is missing media payload",
+            message.message_id
+        )
+    })?;
+    let encrypt_query_param = media.encrypt_query_param.as_deref().ok_or_else(|| {
+        format!(
+            "WeChat file message {:?} is missing encrypt_query_param",
+            message.message_id
+        )
+    })?;
+    let aes_key = media
+        .aes_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "WeChat file message {:?} is missing aes_key",
+                message.message_id
+            )
+        })?;
+    let message_id = message
+        .message_id
+        .ok_or_else(|| "WeChat file message is missing message_id".to_string())?;
+    let filename = inbound_file_name(file, message_id, index);
+    let size_bytes = file.len.as_deref().and_then(parse_file_size);
+
+    Ok(Some(InboundAttachment {
+        id: format!("wechat-file-{}-{}", message_id, index),
+        mime_type: infer_file_mime_type(&filename),
+        filename: Some(filename),
+        size_bytes,
+        source_url: Some(build_cdn_download_url(
+            &config.cdn_base_url,
+            encrypt_query_param,
+        )),
+        storage_key: None,
+        extracted_text: None,
+        extras_json: json!({ "wechat_aes_key": aes_key }).to_string(),
+    }))
+}
+
+fn map_voice_attachment(
+    config: &WechatConfig,
+    message: &crate::types::WechatMessage,
+    item: &MessageItem,
+    index: usize,
+) -> Result<Option<InboundAttachment>, String> {
+    if item.r#type != Some(MESSAGE_ITEM_VOICE) {
+        return Ok(None);
+    }
+
+    let voice = item.voice_item.as_ref().ok_or_else(|| {
+        format!(
+            "WeChat voice message {:?} is missing voice_item payload",
+            message.message_id
+        )
+    })?;
+    let media = voice.media.as_ref().ok_or_else(|| {
+        format!(
+            "WeChat voice message {:?} is missing media payload",
+            message.message_id
+        )
+    })?;
+    let encrypt_query_param = media.encrypt_query_param.as_deref().ok_or_else(|| {
+        format!(
+            "WeChat voice message {:?} is missing encrypt_query_param",
+            message.message_id
+        )
+    })?;
+    let aes_key = media
+        .aes_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "WeChat voice message {:?} is missing aes_key",
+                message.message_id
+            )
+        })?;
+    let message_id = message
+        .message_id
+        .ok_or_else(|| "WeChat voice message is missing message_id".to_string())?;
+    let (mime_type, extension) = infer_voice_media_type(voice.encode_type);
+    let duration_secs = voice.playtime.map(|millis| (millis / 1000) as u32);
+
+    Ok(Some(InboundAttachment {
+        id: format!("wechat-voice-{}-{}", message_id, index),
+        mime_type: mime_type.to_string(),
+        filename: Some(format!(
+            "wechat-voice-{}-{}.{}",
+            message_id, index, extension
+        )),
+        size_bytes: None,
+        source_url: Some(build_cdn_download_url(
+            &config.cdn_base_url,
+            encrypt_query_param,
+        )),
+        storage_key: None,
+        extracted_text: voice
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        extras_json: build_voice_extras_json(aes_key, duration_secs),
+    }))
+}
+
 fn preferred_image_aes_key<'a>(image: &'a ImageItem, media: &'a CdnMedia) -> Option<&'a str> {
     image
         .aeskey
@@ -138,6 +287,77 @@ fn preferred_image_aes_key<'a>(image: &'a ImageItem, media: &'a CdnMedia) -> Opt
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
         })
+}
+
+fn inbound_file_name(file: &FileItem, message_id: i64, index: usize) -> String {
+    file.file_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("wechat-file-{}-{}.bin", message_id, index))
+}
+
+fn parse_file_size(raw: &str) -> Option<u64> {
+    raw.trim().parse::<u64>().ok()
+}
+
+fn infer_voice_media_type(encode_type: Option<i32>) -> (&'static str, &'static str) {
+    match encode_type {
+        Some(7) => ("audio/mpeg", "mp3"),
+        Some(8) => ("audio/ogg", "ogg"),
+        Some(5) => ("audio/amr", "amr"),
+        Some(6) => ("audio/silk", "silk"),
+        _ => ("audio/silk", "silk"),
+    }
+}
+
+fn build_voice_extras_json(aes_key: &str, duration_secs: Option<u32>) -> String {
+    let mut extras = serde_json::Map::new();
+    extras.insert("wechat_aes_key".to_string(), json!(aes_key));
+    if let Some(duration_secs) = duration_secs {
+        extras.insert("duration_secs".to_string(), json!(duration_secs));
+    }
+    serde_json::Value::Object(extras).to_string()
+}
+
+fn infer_file_mime_type(filename: &str) -> String {
+    let extension = filename
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.trim().to_ascii_lowercase());
+
+    match extension.as_deref() {
+        Some("pdf") => "application/pdf",
+        Some("doc") => "application/msword",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("ppt") => "application/vnd.ms-powerpoint",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        Some("txt") => "text/plain",
+        Some("csv") => "text/csv",
+        Some("json") => "application/json",
+        Some("xml") => "application/xml",
+        Some("md") => "text/markdown",
+        Some("zip") => "application/zip",
+        Some("tar") => "application/x-tar",
+        Some("gz") => "application/gzip",
+        Some("mp3") => "audio/mpeg",
+        Some("ogg") => "audio/ogg",
+        Some("wav") => "audio/wav",
+        Some("mp4") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
+        Some("mkv") => "video/x-matroska",
+        Some("avi") => "video/x-msvideo",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 fn upload_image(
@@ -305,9 +525,14 @@ fn padded_size(raw_size: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_hex, encrypt_aes_ecb_pkcs7, map_image_attachment, AES_BLOCK_SIZE};
+    use super::{
+        build_voice_extras_json, encode_hex, encrypt_aes_ecb_pkcs7, infer_file_mime_type,
+        infer_voice_media_type, map_file_attachment, map_image_attachment, map_voice_attachment,
+        AES_BLOCK_SIZE,
+    };
     use crate::types::{
-        CdnMedia, ImageItem, MessageItem, WechatConfig, WechatMessage, MESSAGE_ITEM_IMAGE,
+        CdnMedia, FileItem, ImageItem, MessageItem, VoiceItem, WechatConfig, WechatMessage,
+        MESSAGE_ITEM_FILE, MESSAGE_ITEM_IMAGE, MESSAGE_ITEM_VOICE,
     };
 
     #[test]
@@ -345,11 +570,149 @@ mod tests {
                     aeskey: None,
                     mid_size: Some(128),
                 }),
+                voice_item: None,
+                file_item: None,
             }],
         };
 
         let error = map_image_attachment(&config, &message, &message.item_list[0], 0)
             .expect_err("missing message_id should error");
         assert!(error.contains("missing message_id"));
+    }
+
+    #[test]
+    fn test_map_file_attachment_uses_filename_and_size_metadata() {
+        let config = WechatConfig::default();
+        let message = WechatMessage {
+            message_id: Some(42),
+            from_user_id: Some("user-1".to_string()),
+            to_user_id: Some("bot-1".to_string()),
+            session_id: None,
+            message_type: None,
+            context_token: None,
+            item_list: vec![MessageItem {
+                r#type: Some(MESSAGE_ITEM_FILE),
+                text_item: None,
+                image_item: None,
+                voice_item: None,
+                file_item: Some(FileItem {
+                    media: Some(CdnMedia {
+                        encrypt_query_param: Some("enc".to_string()),
+                        aes_key: Some("YWJjZGVmZ2hpamtsbW5vcA==".to_string()),
+                        encrypt_type: Some(1),
+                    }),
+                    file_name: Some("report.PDF".to_string()),
+                    len: Some("256".to_string()),
+                }),
+            }],
+        };
+
+        let attachment = map_file_attachment(&config, &message, &message.item_list[0], 0)
+            .expect("file attachment should map")
+            .expect("file attachment should be present");
+        assert_eq!(attachment.id, "wechat-file-42-0");
+        assert_eq!(attachment.mime_type, "application/pdf");
+        assert_eq!(attachment.filename.as_deref(), Some("report.PDF"));
+        assert_eq!(attachment.size_bytes, Some(256));
+        assert!(attachment.extras_json.contains("wechat_aes_key"));
+    }
+
+    #[test]
+    fn test_map_file_attachment_errors_when_message_id_missing() {
+        let config = WechatConfig::default();
+        let message = WechatMessage {
+            message_id: None,
+            from_user_id: Some("user-1".to_string()),
+            to_user_id: Some("bot-1".to_string()),
+            session_id: None,
+            message_type: None,
+            context_token: None,
+            item_list: vec![MessageItem {
+                r#type: Some(MESSAGE_ITEM_FILE),
+                text_item: None,
+                image_item: None,
+                voice_item: None,
+                file_item: Some(FileItem {
+                    media: Some(CdnMedia {
+                        encrypt_query_param: Some("enc".to_string()),
+                        aes_key: Some("aes".to_string()),
+                        encrypt_type: Some(1),
+                    }),
+                    file_name: Some("report.pdf".to_string()),
+                    len: Some("256".to_string()),
+                }),
+            }],
+        };
+
+        let error = map_file_attachment(&config, &message, &message.item_list[0], 0)
+            .expect_err("missing message_id should error");
+        assert!(error.contains("missing message_id"));
+    }
+
+    #[test]
+    fn test_infer_file_mime_type_defaults_to_octet_stream() {
+        assert_eq!(
+            infer_file_mime_type("archive.unknown"),
+            "application/octet-stream"
+        );
+        assert_eq!(infer_file_mime_type("README"), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_infer_voice_media_type_defaults_to_silk() {
+        assert_eq!(infer_voice_media_type(Some(6)), ("audio/silk", "silk"));
+        assert_eq!(infer_voice_media_type(Some(8)), ("audio/ogg", "ogg"));
+        assert_eq!(infer_voice_media_type(None), ("audio/silk", "silk"));
+    }
+
+    #[test]
+    fn test_build_voice_extras_json_includes_duration() {
+        let extras = build_voice_extras_json("aes-key", Some(9));
+        assert!(extras.contains("wechat_aes_key"));
+        assert!(extras.contains("duration_secs"));
+    }
+
+    #[test]
+    fn test_map_voice_attachment_sets_audio_metadata() {
+        let config = WechatConfig::default();
+        let message = WechatMessage {
+            message_id: Some(77),
+            from_user_id: Some("user-1".to_string()),
+            to_user_id: Some("bot-1".to_string()),
+            session_id: None,
+            message_type: None,
+            context_token: None,
+            item_list: vec![MessageItem {
+                r#type: Some(MESSAGE_ITEM_VOICE),
+                text_item: None,
+                image_item: None,
+                voice_item: Some(VoiceItem {
+                    media: Some(CdnMedia {
+                        encrypt_query_param: Some("enc".to_string()),
+                        aes_key: Some("YWJjZGVmZ2hpamtsbW5vcA==".to_string()),
+                        encrypt_type: Some(1),
+                    }),
+                    encode_type: Some(8),
+                    playtime: Some(4200),
+                    text: Some("hello from voice".to_string()),
+                }),
+                file_item: None,
+            }],
+        };
+
+        let attachment = map_voice_attachment(&config, &message, &message.item_list[0], 0)
+            .expect("voice attachment should map")
+            .expect("voice attachment should be present");
+        assert_eq!(attachment.id, "wechat-voice-77-0");
+        assert_eq!(attachment.mime_type, "audio/ogg");
+        assert_eq!(
+            attachment.filename.as_deref(),
+            Some("wechat-voice-77-0.ogg")
+        );
+        assert_eq!(
+            attachment.extracted_text.as_deref(),
+            Some("hello from voice")
+        );
+        assert!(attachment.extras_json.contains("duration_secs"));
     }
 }

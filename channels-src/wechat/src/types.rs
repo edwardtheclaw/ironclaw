@@ -170,6 +170,10 @@ pub struct MessageItem {
     pub text_item: Option<TextItem>,
     #[serde(default)]
     pub image_item: Option<ImageItem>,
+    #[serde(default)]
+    pub voice_item: Option<VoiceItem>,
+    #[serde(default)]
+    pub file_item: Option<FileItem>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -198,6 +202,28 @@ pub struct ImageItem {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VoiceItem {
+    #[serde(default)]
+    pub media: Option<CdnMedia>,
+    #[serde(default)]
+    pub encode_type: Option<i32>,
+    #[serde(default)]
+    pub playtime: Option<u64>,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FileItem {
+    #[serde(default)]
+    pub media: Option<CdnMedia>,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub len: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OutboundMetadata {
     pub from_user_id: String,
     #[serde(default)]
@@ -215,6 +241,8 @@ pub const MESSAGE_TYPE_BOT: i32 = 2;
 pub const MESSAGE_STATE_FINISH: i32 = 2;
 pub const MESSAGE_ITEM_TEXT: i32 = 1;
 pub const MESSAGE_ITEM_IMAGE: i32 = 2;
+pub const MESSAGE_ITEM_VOICE: i32 = 3;
+pub const MESSAGE_ITEM_FILE: i32 = 4;
 pub const TYPING_STATUS_TYPING: i32 = 1;
 pub const TYPING_STATUS_CANCEL: i32 = 2;
 pub const UPLOAD_MEDIA_TYPE_IMAGE: i32 = 1;

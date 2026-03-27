@@ -174,10 +174,10 @@ impl Guest for WechatChannel {
                         log_channel(
                             channel_host::LogLevel::Info,
                             &format!(
-                                "Flushing buffered WeChat image-only message for {} after waiting one poll cycle",
-                                bundle.from_user_id
-                            ),
-                        );
+                "Flushing buffered WeChat attachment-only message for {} after waiting one poll cycle",
+                bundle.from_user_id
+            ),
+        );
                         emit_buffered_bundle(bundle);
                     }
                 }
@@ -292,7 +292,7 @@ fn incoming_bundle_from_message(
     };
 
     let text = extract_text(&message);
-    let attachments = media::extract_image_attachments(config, &message)?
+    let attachments = media::extract_inbound_attachments(config, &message)?
         .into_iter()
         .map(StoredInboundAttachment::from)
         .collect::<Vec<_>>();
@@ -357,7 +357,7 @@ fn process_incoming_bundle(
         log_channel(
             channel_host::LogLevel::Info,
             &format!(
-                "Buffered WeChat image-only message for {} and will wait one poll cycle for follow-up text",
+                "Buffered WeChat attachment-only message for {} and will wait one poll cycle for follow-up text",
                 bundle.from_user_id
             ),
         );
@@ -465,6 +465,11 @@ fn extract_text(message: &WechatMessage) -> String {
         .find_map(|item| {
             if item.r#type == Some(MESSAGE_ITEM_TEXT) {
                 item.text_item.as_ref().map(|item| item.text.clone())
+            } else if item.r#type == Some(crate::types::MESSAGE_ITEM_VOICE) {
+                item.voice_item
+                    .as_ref()
+                    .and_then(|item| item.text.as_ref())
+                    .cloned()
             } else {
                 None
             }
@@ -617,10 +622,11 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        classify_status_update, merge_text, process_incoming_bundle, PendingInboundBundle,
-        StoredInboundAttachment, WechatStatusAction,
+        classify_status_update, extract_text, merge_text, process_incoming_bundle,
+        PendingInboundBundle, StoredInboundAttachment, WechatStatusAction,
     };
     use crate::exports::near::agent::channel::{StatusType, StatusUpdate};
+    use crate::types::{MessageItem, VoiceItem, WechatMessage, MESSAGE_ITEM_VOICE};
 
     fn make_bundle(user_id: &str, text: &str, image_count: usize) -> PendingInboundBundle {
         PendingInboundBundle {
@@ -728,6 +734,32 @@ mod tests {
         assert_eq!(merge_text("", "hello"), "hello");
         assert_eq!(merge_text("look", "what is this"), "look\nwhat is this");
         assert_eq!(merge_text("look", ""), "look");
+    }
+
+    #[test]
+    fn test_extract_text_uses_voice_transcript_when_present() {
+        let message = WechatMessage {
+            message_id: Some(1),
+            from_user_id: Some("user-1".to_string()),
+            to_user_id: Some("bot-1".to_string()),
+            session_id: None,
+            message_type: None,
+            context_token: None,
+            item_list: vec![MessageItem {
+                r#type: Some(MESSAGE_ITEM_VOICE),
+                text_item: None,
+                image_item: None,
+                voice_item: Some(VoiceItem {
+                    media: None,
+                    encode_type: Some(6),
+                    playtime: Some(1500),
+                    text: Some("voice transcript".to_string()),
+                }),
+                file_item: None,
+            }],
+        };
+
+        assert_eq!(extract_text(&message), "voice transcript");
     }
 
     #[test]

@@ -34,16 +34,18 @@ pub(crate) async fn hydrate_attachment_for_channel(
         tracing::warn!(
             channel = %channel_name,
             attachment_id = %attachment.id,
-            "Skipping WeChat image hydration: missing AES key metadata"
+            "Skipping WeChat attachment hydration: missing AES key metadata"
         );
         return;
     };
 
     match download_wechat_attachment_bytes(channel_name, capabilities, source_url).await {
-        Ok(ciphertext) => match decrypt_wechat_image_bytes(&ciphertext, &encoded_aes_key) {
+        Ok(ciphertext) => match decrypt_wechat_attachment_bytes(&ciphertext, &encoded_aes_key) {
             Ok(plaintext) => {
                 attachment.size_bytes = Some(plaintext.len() as u64);
-                attachment.mime_type = detect_image_mime(&plaintext).to_string();
+                if attachment.mime_type.starts_with("image/") {
+                    attachment.mime_type = detect_image_mime(&plaintext).to_string();
+                }
                 attachment.data = plaintext;
             }
             Err(error) => {
@@ -51,7 +53,7 @@ pub(crate) async fn hydrate_attachment_for_channel(
                     channel = %channel_name,
                     attachment_id = %attachment.id,
                     error = %error,
-                    "Failed to decrypt WeChat image attachment"
+                    "Failed to decrypt WeChat attachment"
                 );
             }
         },
@@ -60,7 +62,7 @@ pub(crate) async fn hydrate_attachment_for_channel(
                 channel = %channel_name,
                 attachment_id = %attachment.id,
                 error = %error,
-                "Failed to download WeChat image attachment"
+                "Failed to download WeChat attachment"
             );
         }
     }
@@ -69,7 +71,7 @@ pub(crate) async fn hydrate_attachment_for_channel(
 fn should_hydrate_wechat_attachment(channel_name: &str, attachment: &Attachment) -> bool {
     channel_name == WECHAT_CHANNEL_NAME
         && attachment.data.is_empty()
-        && attachment.mime_type.starts_with("image/")
+        && attachment.source_url.is_some()
 }
 
 fn wechat_aes_key(extras_json: &str) -> Option<String> {
@@ -122,14 +124,17 @@ async fn download_wechat_attachment_bytes(
     }
     if bytes.len() > MAX_ATTACHMENT_BYTES {
         return Err(format!(
-            "WeChat image attachment exceeds {MAX_ATTACHMENT_BYTES} bytes"
+            "WeChat attachment exceeds {MAX_ATTACHMENT_BYTES} bytes"
         ));
     }
 
     Ok(bytes)
 }
 
-fn decrypt_wechat_image_bytes(ciphertext: &[u8], encoded_aes_key: &str) -> Result<Vec<u8>, String> {
+fn decrypt_wechat_attachment_bytes(
+    ciphertext: &[u8],
+    encoded_aes_key: &str,
+) -> Result<Vec<u8>, String> {
     let key = parse_aes_key(encoded_aes_key)?;
     decrypt_aes_ecb_pkcs7(ciphertext, &key)
 }
@@ -244,7 +249,7 @@ fn encrypt_aes_ecb_pkcs7(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, String
 #[cfg(test)]
 mod tests {
     use super::{
-        Attachment, decrypt_wechat_image_bytes, detect_image_mime, encrypt_aes_ecb_pkcs7,
+        Attachment, decrypt_wechat_attachment_bytes, detect_image_mime, encrypt_aes_ecb_pkcs7,
         hydrate_attachment_for_channel, should_hydrate_wechat_attachment,
     };
     use crate::channels::wasm::ChannelCapabilities;
@@ -278,7 +283,7 @@ mod tests {
         let plaintext = vec![0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x11];
         let ciphertext = encrypt_aes_ecb_pkcs7(&plaintext, &key).unwrap();
         let encoded_key = base64::engine::general_purpose::STANDARD.encode(key);
-        let decrypted = decrypt_wechat_image_bytes(&ciphertext, &encoded_key).unwrap();
+        let decrypted = decrypt_wechat_attachment_bytes(&ciphertext, &encoded_key).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -292,14 +297,14 @@ mod tests {
     }
 
     #[test]
-    fn wechat_attachment_hydration_only_applies_to_wechat_images() {
+    fn wechat_attachment_hydration_applies_to_wechat_encrypted_media() {
         let mut attachment = make_attachment();
         attachment.extras_json = encode_test_extras_json("ZmFrZS1rZXk=");
         assert!(should_hydrate_wechat_attachment("wechat", &attachment));
         assert!(!should_hydrate_wechat_attachment("telegram", &attachment));
 
         attachment.mime_type = "application/pdf".to_string();
-        assert!(!should_hydrate_wechat_attachment("wechat", &attachment));
+        assert!(should_hydrate_wechat_attachment("wechat", &attachment));
     }
 
     #[tokio::test]

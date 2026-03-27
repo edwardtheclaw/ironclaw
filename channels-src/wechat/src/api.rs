@@ -136,6 +136,8 @@ pub fn send_text_message(
                     text: text.to_string(),
                 }),
                 image_item: None,
+                voice_item: None,
+                file_item: None,
             }],
             context_token: context_token.map(str::to_string),
         },
