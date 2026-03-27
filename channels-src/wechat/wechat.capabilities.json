@@ -45,6 +45,6 @@
     "cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",
     "bot_type": "3",
     "poll_interval_ms": 30000,
-    "long_poll_timeout_ms": 35000
+    "long_poll_timeout_ms": 15000
   }
 }

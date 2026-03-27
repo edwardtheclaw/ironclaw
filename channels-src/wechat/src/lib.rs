@@ -138,6 +138,16 @@ impl Guest for WechatChannel {
 
                 let mut context_tokens_changed = false;
                 for message in response.msgs {
+                    log_channel(
+                        channel_host::LogLevel::Info,
+                        &format!(
+                            "Received WeChat message: id={:?} from_user_id={:?} message_type={:?} item_types=[{}]",
+                            message.message_id,
+                            message.from_user_id,
+                            message.message_type,
+                            summarize_item_types(&message),
+                        ),
+                    );
                     if let Some(from_user_id) = message.from_user_id.as_deref() {
                         if let Some(context_token) = message.context_token.as_deref() {
                             let changed = context_tokens
@@ -149,6 +159,15 @@ impl Guest for WechatChannel {
                     }
                     match incoming_bundle_from_message(&config, message) {
                         Ok(Some(bundle)) => {
+                            log_channel(
+                                channel_host::LogLevel::Info,
+                                &format!(
+                                    "Mapped WeChat message into bundle: from_user_id={} text_len={} attachment_count={}",
+                                    bundle.from_user_id,
+                                    bundle.text.trim().chars().count(),
+                                    bundle.attachments.len(),
+                                ),
+                            );
                             let emitted = process_incoming_bundle(
                                 &mut pending_inbound,
                                 bundle,
@@ -369,6 +388,15 @@ fn process_incoming_bundle(
 }
 
 fn emit_buffered_bundle(bundle: PendingInboundBundle) {
+    log_channel(
+        channel_host::LogLevel::Info,
+        &format!(
+            "Emitting WeChat bundle to agent: from_user_id={} text_len={} attachment_count={}",
+            bundle.from_user_id,
+            bundle.text.trim().chars().count(),
+            bundle.attachments.len(),
+        ),
+    );
     let metadata = json!({
         "from_user_id": bundle.from_user_id,
         "to_user_id": bundle.to_user_id,
@@ -410,6 +438,27 @@ fn merge_text(existing: &str, incoming: &str) -> String {
         (true, false) => incoming.to_string(),
         (false, true) => existing.to_string(),
         (false, false) => format!("{existing}\n{incoming}"),
+    }
+}
+
+fn summarize_item_types(message: &WechatMessage) -> String {
+    let item_types = message
+        .item_list
+        .iter()
+        .map(|item| match item.r#type {
+            Some(MESSAGE_ITEM_TEXT) => "text".to_string(),
+            Some(crate::types::MESSAGE_ITEM_IMAGE) => "image".to_string(),
+            Some(crate::types::MESSAGE_ITEM_VOICE) => "voice".to_string(),
+            Some(crate::types::MESSAGE_ITEM_FILE) => "file".to_string(),
+            Some(other) => format!("unknown:{other}"),
+            None => "missing".to_string(),
+        })
+        .collect::<Vec<_>>();
+
+    if item_types.is_empty() {
+        "none".to_string()
+    } else {
+        item_types.join(",")
     }
 }
 

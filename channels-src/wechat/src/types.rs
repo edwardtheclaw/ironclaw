@@ -31,7 +31,7 @@ fn default_poll_interval_ms() -> u32 {
 }
 
 fn default_long_poll_timeout_ms() -> u32 {
-    35_000
+    15_000
 }
 
 impl Default for WechatConfig {

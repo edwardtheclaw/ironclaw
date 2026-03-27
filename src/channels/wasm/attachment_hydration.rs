@@ -4,6 +4,7 @@ use aes::Aes128;
 use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
 use base64::Engine as _;
 use serde::Deserialize;
+use silk_rs::decode_silk;
 
 use crate::channels::wasm::capabilities::ChannelCapabilities;
 use crate::channels::wasm::host::{Attachment, ChannelHostState};
@@ -11,6 +12,7 @@ use crate::channels::wasm::host::{Attachment, ChannelHostState};
 const AES_BLOCK_SIZE: usize = 16;
 const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 const WECHAT_CHANNEL_NAME: &str = "wechat";
+const WECHAT_SILK_SAMPLE_RATE_HZ: i32 = 24_000;
 
 #[derive(Debug, Deserialize)]
 struct WechatAttachmentExtras {
@@ -43,10 +45,19 @@ pub(crate) async fn hydrate_attachment_for_channel(
         Ok(ciphertext) => match decrypt_wechat_attachment_bytes(&ciphertext, &encoded_aes_key) {
             Ok(plaintext) => {
                 attachment.size_bytes = Some(plaintext.len() as u64);
-                if attachment.mime_type.starts_with("image/") {
-                    attachment.mime_type = detect_image_mime(&plaintext).to_string();
-                }
                 attachment.data = plaintext;
+                if attachment.mime_type.starts_with("image/") {
+                    attachment.mime_type = detect_image_mime(&attachment.data).to_string();
+                } else if is_wechat_silk_attachment(attachment)
+                    && let Err(error) = maybe_transcode_wechat_silk_attachment(attachment)
+                {
+                    tracing::warn!(
+                        channel = %channel_name,
+                        attachment_id = %attachment.id,
+                        error = %error,
+                        "Failed to transcode WeChat SILK attachment; preserving raw SILK"
+                    );
+                }
             }
             Err(error) => {
                 tracing::warn!(
@@ -66,6 +77,15 @@ pub(crate) async fn hydrate_attachment_for_channel(
             );
         }
     }
+}
+
+fn is_wechat_silk_attachment(attachment: &Attachment) -> bool {
+    attachment.mime_type.eq_ignore_ascii_case("audio/silk")
+        || attachment
+            .filename
+            .as_deref()
+            .and_then(|filename| filename.rsplit_once('.').map(|(_, ext)| ext))
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("silk"))
 }
 
 fn should_hydrate_wechat_attachment(channel_name: &str, attachment: &Attachment) -> bool {
@@ -230,6 +250,68 @@ fn detect_image_mime(bytes: &[u8]) -> &'static str {
     }
 }
 
+fn maybe_transcode_wechat_silk_attachment(attachment: &mut Attachment) -> Result<(), String> {
+    if attachment.data.is_empty() {
+        return Err("SILK attachment has no data".to_string());
+    }
+
+    let pcm = decode_silk(&attachment.data, WECHAT_SILK_SAMPLE_RATE_HZ)
+        .map_err(|error| format!("SILK decode failed: {error}"))?;
+    if pcm.is_empty() {
+        return Err("SILK decoder returned empty PCM".to_string());
+    }
+
+    let wav = pcm_s16le_to_wav(&pcm, WECHAT_SILK_SAMPLE_RATE_HZ as u32)?;
+    attachment.data = wav;
+    attachment.size_bytes = Some(attachment.data.len() as u64);
+    attachment.mime_type = "audio/wav".to_string();
+    if let Some(filename) = attachment.filename.as_mut() {
+        replace_attachment_extension(filename, "wav");
+    }
+    Ok(())
+}
+
+fn pcm_s16le_to_wav(pcm: &[u8], sample_rate_hz: u32) -> Result<Vec<u8>, String> {
+    if !pcm.len().is_multiple_of(2) {
+        return Err("PCM buffer length must be even for 16-bit mono audio".to_string());
+    }
+
+    let data_len = u32::try_from(pcm.len())
+        .map_err(|_| "PCM buffer exceeds WAV container size limits".to_string())?;
+    let total_len = 44u32
+        .checked_add(data_len)
+        .ok_or_else(|| "WAV container size overflowed".to_string())?;
+    let byte_rate = sample_rate_hz
+        .checked_mul(2)
+        .ok_or_else(|| "WAV byte rate overflowed".to_string())?;
+
+    let mut wav = Vec::with_capacity(total_len as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(total_len - 8).to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&sample_rate_hz.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(pcm);
+    Ok(wav)
+}
+
+fn replace_attachment_extension(filename: &mut String, replacement: &str) {
+    if let Some((stem, _)) = filename.rsplit_once('.') {
+        *filename = format!("{stem}.{replacement}");
+    } else {
+        filename.push('.');
+        filename.push_str(replacement);
+    }
+}
+
 #[cfg(test)]
 fn encrypt_aes_ecb_pkcs7(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
     use aes::cipher::BlockEncrypt;
@@ -250,7 +332,8 @@ fn encrypt_aes_ecb_pkcs7(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, String
 mod tests {
     use super::{
         Attachment, decrypt_wechat_attachment_bytes, detect_image_mime, encrypt_aes_ecb_pkcs7,
-        hydrate_attachment_for_channel, should_hydrate_wechat_attachment,
+        hydrate_attachment_for_channel, maybe_transcode_wechat_silk_attachment, pcm_s16le_to_wav,
+        should_hydrate_wechat_attachment,
     };
     use crate::channels::wasm::ChannelCapabilities;
     use base64::Engine as _;
@@ -314,5 +397,40 @@ mod tests {
         hydrate_attachment_for_channel("wechat", &caps, &mut attachment).await;
         assert!(attachment.data.is_empty());
         assert_eq!(attachment.size_bytes, None);
+    }
+
+    #[test]
+    fn pcm_s16le_to_wav_wraps_pcm_with_expected_header() {
+        let wav = pcm_s16le_to_wav(&[0x00, 0x00, 0x01, 0x00], 24_000).expect("wav wrapping");
+        assert!(wav.starts_with(b"RIFF"));
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(&wav[40..44], &(4u32).to_le_bytes());
+        assert_eq!(&wav[44..], &[0x00, 0x00, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn silk_transcode_failure_preserves_raw_silk_path_for_callers() {
+        let mut attachment = Attachment {
+            id: "wechat-voice-1".to_string(),
+            mime_type: "audio/silk".to_string(),
+            filename: Some("wechat-voice-1.silk".to_string()),
+            size_bytes: Some(3),
+            source_url: None,
+            storage_key: None,
+            extracted_text: None,
+            extras_json: encode_test_extras_json("ZmFrZS1rZXk="),
+            data: vec![1, 2, 3],
+            duration_secs: Some(1),
+        };
+
+        let original = attachment.data.clone();
+        let error =
+            maybe_transcode_wechat_silk_attachment(&mut attachment).expect_err("invalid SILK");
+        assert!(error.contains("SILK decode failed"));
+        assert_eq!(attachment.mime_type, "audio/silk");
+        assert_eq!(attachment.filename.as_deref(), Some("wechat-voice-1.silk"));
+        assert_eq!(attachment.data, original);
     }
 }
