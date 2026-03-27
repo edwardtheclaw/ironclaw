@@ -23,18 +23,11 @@ impl LeasePlanner {
     }
 
     /// Build the capability grants for a new thread.
-    ///
-    /// Reflection threads are handled by the reflection pipeline's dedicated
-    /// executor, so the default planner grants no host capabilities to them.
     pub fn plan_for_thread(
         &self,
-        thread_type: ThreadType,
+        _thread_type: ThreadType,
         capabilities: &CapabilityRegistry,
     ) -> Vec<CapabilityGrantPlan> {
-        if thread_type == ThreadType::Reflection {
-            return Vec::new();
-        }
-
         capabilities
             .list()
             .into_iter()
@@ -89,10 +82,4 @@ mod tests {
         assert_eq!(plans[0].granted_actions, vec!["read_file"]);
     }
 
-    #[test]
-    fn reflection_threads_do_not_get_default_capabilities() {
-        let planner = LeasePlanner::new();
-        let plans = planner.plan_for_thread(ThreadType::Reflection, &registry());
-        assert!(plans.is_empty());
-    }
 }

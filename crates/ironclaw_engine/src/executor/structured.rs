@@ -166,3 +166,322 @@ pub async fn execute_action_calls(
         need_approval: None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::effect::ThreadExecutionContext;
+    use crate::types::capability::{ActionDef, CapabilityLease, EffectType};
+    use crate::types::project::ProjectId;
+    use crate::types::step::StepId;
+    use crate::types::thread::{Thread, ThreadConfig, ThreadType};
+
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    struct MockEffects {
+        results: Mutex<Vec<Result<ActionResult, EngineError>>>,
+        actions: Vec<ActionDef>,
+    }
+
+    impl MockEffects {
+        fn new(actions: Vec<ActionDef>, results: Vec<Result<ActionResult, EngineError>>) -> Self {
+            Self {
+                results: Mutex::new(results),
+                actions,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for MockEffects {
+        async fn execute_action(
+            &self,
+            _name: &str,
+            _params: serde_json::Value,
+            _lease: &CapabilityLease,
+            _ctx: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            let mut results = self.results.lock().unwrap();
+            if results.is_empty() {
+                Ok(ActionResult {
+                    call_id: String::new(), // EffectExecutor doesn't set call_id
+                    action_name: String::new(),
+                    output: serde_json::json!({"result": "ok"}),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                })
+            } else {
+                results.remove(0)
+            }
+        }
+
+        async fn available_actions(
+            &self,
+            _leases: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(self.actions.clone())
+        }
+    }
+
+    fn test_action(name: &str) -> ActionDef {
+        ActionDef {
+            name: name.into(),
+            description: "Test tool".into(),
+            parameters_schema: serde_json::json!({"type": "object"}),
+            effects: vec![EffectType::ReadLocal],
+            requires_approval: false,
+        }
+    }
+
+    fn make_exec_context(thread: &Thread) -> ThreadExecutionContext {
+        ThreadExecutionContext {
+            thread_id: thread.id,
+            thread_type: thread.thread_type,
+            project_id: thread.project_id,
+            user_id: "test".into(),
+            step_id: StepId::new(),
+        }
+    }
+
+    // ── call_id propagation tests ────────────────────────────
+
+    #[tokio::test]
+    async fn call_id_preserved_on_successful_execution() {
+        let thread = Thread::new("test", ThreadType::Foreground, ProjectId::new(), ThreadConfig::default());
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("web_search")],
+            vec![Ok(ActionResult {
+                call_id: String::new(), // EffectExecutor returns empty
+                action_name: "web_search".into(),
+                output: serde_json::json!({"results": []}),
+                is_error: false,
+                duration: Duration::from_millis(42),
+            })],
+        ));
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        let ctx = make_exec_context(&thread);
+
+        leases.grant(thread.id, "search", vec![], None, None).await;
+
+        let calls = vec![ActionCall {
+            id: "call_r2o5mqBgdNUlH8KzskncUGaX".into(),
+            action_name: "web_search".into(),
+            parameters: serde_json::json!({"query": "test"}),
+        }];
+
+        let result = execute_action_calls(&calls, &thread, &effects, &leases, &policy, &ctx, &[])
+            .await
+            .unwrap();
+
+        // call_id must be stamped from ActionCall, not the empty EffectExecutor return
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].call_id, "call_r2o5mqBgdNUlH8KzskncUGaX");
+        assert_eq!(result.results[0].action_name, "web_search");
+        assert!(!result.results[0].is_error);
+
+        // Event should carry the same call_id
+        let exec_event = result.events.iter().find(|e| matches!(e, EventKind::ActionExecuted { .. }));
+        assert!(exec_event.is_some());
+        if let Some(EventKind::ActionExecuted { call_id, action_name, .. }) = exec_event {
+            assert_eq!(call_id, "call_r2o5mqBgdNUlH8KzskncUGaX");
+            assert_eq!(action_name, "web_search");
+        }
+    }
+
+    #[tokio::test]
+    async fn call_id_preserved_on_execution_error() {
+        let thread = Thread::new("test", ThreadType::Foreground, ProjectId::new(), ThreadConfig::default());
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("shell")],
+            vec![Err(EngineError::Effect {
+                reason: "permission denied".into(),
+            })],
+        ));
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        let ctx = make_exec_context(&thread);
+
+        leases.grant(thread.id, "exec", vec![], None, None).await;
+
+        let calls = vec![ActionCall {
+            id: "call_abc123def".into(),
+            action_name: "shell".into(),
+            parameters: serde_json::json!({"cmd": "ls"}),
+        }];
+
+        let result = execute_action_calls(&calls, &thread, &effects, &leases, &policy, &ctx, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].call_id, "call_abc123def");
+        assert!(result.results[0].is_error);
+
+        let fail_event = result.events.iter().find(|e| matches!(e, EventKind::ActionFailed { .. }));
+        assert!(fail_event.is_some());
+        if let Some(EventKind::ActionFailed { call_id, .. }) = fail_event {
+            assert_eq!(call_id, "call_abc123def");
+        }
+    }
+
+    #[tokio::test]
+    async fn call_id_preserved_when_no_lease() {
+        let thread = Thread::new("test", ThreadType::Foreground, ProjectId::new(), ThreadConfig::default());
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        let ctx = make_exec_context(&thread);
+
+        // No lease granted — action should fail with correct call_id
+        let calls = vec![ActionCall {
+            id: "call_no_lease_123".into(),
+            action_name: "web_search".into(),
+            parameters: serde_json::json!({}),
+        }];
+
+        let result = execute_action_calls(&calls, &thread, &effects, &leases, &policy, &ctx, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].call_id, "call_no_lease_123");
+        assert!(result.results[0].is_error);
+
+        if let Some(EventKind::ActionFailed { call_id, error, .. }) = result.events.first() {
+            assert_eq!(call_id, "call_no_lease_123");
+            assert!(error.contains("no lease"));
+        } else {
+            panic!("expected ActionFailed event");
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_calls_each_get_correct_call_id() {
+        let thread = Thread::new("test", ThreadType::Foreground, ProjectId::new(), ThreadConfig::default());
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("tool_a"), test_action("tool_b")],
+            vec![
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "tool_a".into(),
+                    output: serde_json::json!("a_result"),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "tool_b".into(),
+                    output: serde_json::json!("b_result"),
+                    is_error: false,
+                    duration: Duration::from_millis(2),
+                }),
+            ],
+        ));
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        let ctx = make_exec_context(&thread);
+
+        leases.grant(thread.id, "cap", vec![], None, None).await;
+
+        let calls = vec![
+            ActionCall {
+                id: "id_aaaa".into(),
+                action_name: "tool_a".into(),
+                parameters: serde_json::json!({}),
+            },
+            ActionCall {
+                id: "id_bbbb".into(),
+                action_name: "tool_b".into(),
+                parameters: serde_json::json!({}),
+            },
+        ];
+
+        let result = execute_action_calls(&calls, &thread, &effects, &leases, &policy, &ctx, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(result.results.len(), 2);
+        assert_eq!(result.results[0].call_id, "id_aaaa");
+        assert_eq!(result.results[1].call_id, "id_bbbb");
+    }
+
+    /// Provider-specific: OpenAI rejects empty string call_id. Verify no result
+    /// ever has an empty call_id when the ActionCall provided one.
+    #[tokio::test]
+    async fn openai_empty_call_id_never_produced() {
+        let thread = Thread::new("test", ThreadType::Foreground, ProjectId::new(), ThreadConfig::default());
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("echo")],
+            vec![Ok(ActionResult {
+                call_id: String::new(), // EffectExecutor always returns empty
+                action_name: String::new(),
+                output: serde_json::json!("hello"),
+                is_error: false,
+                duration: Duration::from_millis(1),
+            })],
+        ));
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        let ctx = make_exec_context(&thread);
+
+        leases.grant(thread.id, "cap", vec![], None, None).await;
+
+        let calls = vec![ActionCall {
+            id: "aB3xK9mZq".into(), // Mistral-compatible 9-char ID
+            action_name: "echo".into(),
+            parameters: serde_json::json!({}),
+        }];
+
+        let result = execute_action_calls(&calls, &thread, &effects, &leases, &policy, &ctx, &[])
+            .await
+            .unwrap();
+
+        // Must NOT be empty — must be stamped from the ActionCall
+        assert!(!result.results[0].call_id.is_empty());
+        assert_eq!(result.results[0].call_id, "aB3xK9mZq");
+    }
+
+    /// Mistral requires call_id matching [a-zA-Z0-9]{9}.
+    /// Verify the ID passes through unmodified (normalization is LLM-layer concern,
+    /// but engine must never lose it).
+    #[tokio::test]
+    async fn mistral_format_call_id_preserved() {
+        let thread = Thread::new("test", ThreadType::Foreground, ProjectId::new(), ThreadConfig::default());
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("web_search")],
+            vec![Ok(ActionResult {
+                call_id: String::new(),
+                action_name: "web_search".into(),
+                output: serde_json::json!({}),
+                is_error: false,
+                duration: Duration::from_millis(1),
+            })],
+        ));
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        let ctx = make_exec_context(&thread);
+
+        leases.grant(thread.id, "cap", vec![], None, None).await;
+
+        // Mistral format: exactly 9 alphanumeric chars
+        let mistral_id = "xK3mR9bZq";
+        let calls = vec![ActionCall {
+            id: mistral_id.into(),
+            action_name: "web_search".into(),
+            parameters: serde_json::json!({}),
+        }];
+
+        let result = execute_action_calls(&calls, &thread, &effects, &leases, &policy, &ctx, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(result.results[0].call_id, mistral_id);
+
+        // Event also preserves the exact format
+        if let Some(EventKind::ActionExecuted { call_id, .. }) = result.events.first() {
+            assert_eq!(call_id, mistral_id);
+        }
+    }
+}

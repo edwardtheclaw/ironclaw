@@ -151,8 +151,8 @@ impl PolicyEngine {
             }
             // User and System provenance are trusted
             Provenance::User | Provenance::System => {}
-            // Reflection and MemoryRetrieval are internal, treat as trusted
-            Provenance::Reflection { .. } | Provenance::MemoryRetrieval { .. } => {}
+            // MemoryRetrieval is internal, treat as trusted
+            Provenance::MemoryRetrieval { .. } => {}
         }
 
         decision

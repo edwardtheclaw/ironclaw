@@ -67,9 +67,6 @@ src/
 ├── memory/               # Memory document system
 │   ├── store.rs          # MemoryStore — project-scoped doc CRUD
 │   └── retrieval.rs      # RetrievalEngine — keyword-based context retrieval from project docs
-├── reflection/           # Post-thread reflection pipeline
-│   ├── pipeline.rs       # reflect() (CodeAct) + reflect_simple() (direct LLM) + output parsing
-│   └── executor.rs       # ReflectionExecutor — read-only tools for reflection threads
 └── reliability.rs        # ReliabilityTracker — per-action success rate and latency via EMA
 ```
 
@@ -78,11 +75,21 @@ src/
 ```
 Created → Running → Waiting → Running (resume)
                   → Suspended → Running (resume)
-                  → Completed → Reflecting → Done
+                  → Completed → Done
                   → Failed
 ```
 
 Validated by `ThreadState::can_transition_to()`. Terminal states: `Done`, `Failed`.
+
+## Learning Missions
+
+Three event-driven missions fire automatically after thread completion:
+
+1. **Error diagnosis** (`self-improvement`) — fires when a thread completes with trace issues. Diagnoses root cause and applies prompt overlays or orchestrator patches.
+2. **Playbook extraction** (`playbook-extraction`) — fires when a thread succeeds with 5+ steps and 3+ tool actions. Extracts reusable step-by-step procedures.
+3. **Conversation insights** (`conversation-insights`) — fires every 5 completed threads in a project. Extracts user preferences, domain knowledge, and workflow patterns.
+
+Created by `MissionManager::ensure_learning_missions()` at project bootstrap.
 
 ## External Trait Boundaries
 

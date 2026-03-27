@@ -245,9 +245,6 @@ impl ThreadManager {
 
         // Spawn background task
         let store_for_task = Arc::clone(&self.store);
-        let llm_for_reflection = Arc::clone(&self.llm);
-        let caps_for_reflection = Arc::clone(&self.capabilities);
-        let event_tx = self.event_tx.clone();
         let running = Arc::clone(&self.running);
         let completed = Arc::clone(&self.completed);
         let handle = tokio::spawn(async move {
@@ -255,98 +252,24 @@ impl ThreadManager {
             let result = exec.run().await;
             debug!(thread_id = %thread_id, "thread execution finished");
 
-            // Helper to emit events on both the thread and broadcast channel
-            let emit = |thread: &mut crate::types::thread::Thread,
-                        kind: crate::types::event::EventKind| {
-                let event = crate::types::event::ThreadEvent::new(thread.id, kind);
-                let _ = event_tx.send(event.clone());
-                thread.events.push(event);
-                thread.updated_at = chrono::Utc::now();
-            };
-
-            // Run retrospective trace analysis (non-LLM, always runs)
-            let mut trace = crate::executor::trace::build_trace(&exec.thread);
+            // Run retrospective trace analysis (non-LLM, always runs).
+            // Issues are picked up by the self-improvement mission via event listener.
+            let trace = crate::executor::trace::build_trace(&exec.thread);
             if !trace.issues.is_empty() {
                 crate::executor::trace::log_trace_summary(&trace);
             }
 
-            // Run LLM reflection if enabled and thread completed
-            if exec.thread.config.enable_reflection
-                && exec.thread.state == crate::types::thread::ThreadState::Completed
+            // Transition Completed → Done
+            if exec.thread.state == crate::types::thread::ThreadState::Completed
+                && let Err(e) = exec.thread.transition_to(
+                    crate::types::thread::ThreadState::Done,
+                    None,
+                )
             {
-                // Transition: Completed → Reflecting
-                if let Err(e) = exec.thread.transition_to(
-                    crate::types::thread::ThreadState::Reflecting,
-                    Some("starting reflection".into()),
-                ) {
-                    tracing::warn!(thread_id = %thread_id, "failed to transition to Reflecting: {e}");
-                } else {
-                    emit(
-                        &mut exec.thread,
-                        crate::types::event::EventKind::ReflectionStarted,
-                    );
-
-                    match crate::reflection::reflect(
-                        &exec.thread,
-                        &llm_for_reflection,
-                        &store_for_task,
-                        &caps_for_reflection,
-                    )
-                    .await
-                    {
-                        Ok(reflection) => {
-                            let doc_types: Vec<String> = reflection
-                                .docs
-                                .iter()
-                                .map(|d| format!("{:?}", d.doc_type))
-                                .collect();
-
-                            emit(
-                                &mut exec.thread,
-                                crate::types::event::EventKind::ReflectionComplete {
-                                    docs_produced: reflection.docs.len(),
-                                    doc_types,
-                                    tokens_used: reflection.tokens_used.total(),
-                                },
-                            );
-
-                            // Attach reflection results to the trace
-                            crate::executor::trace::attach_reflection(&mut trace, &reflection);
-
-                            for doc in &reflection.docs {
-                                if let Err(e) = store_for_task.save_memory_doc(doc).await {
-                                    tracing::warn!(
-                                        thread_id = %thread_id,
-                                        doc_title = %doc.title,
-                                        "failed to save reflection doc: {e}"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            emit(
-                                &mut exec.thread,
-                                crate::types::event::EventKind::ReflectionFailed {
-                                    error: e.to_string(),
-                                },
-                            );
-                        }
-                    }
-
-                    // Transition: Reflecting → Done
-                    if let Err(e) = exec.thread.transition_to(
-                        crate::types::thread::ThreadState::Done,
-                        Some("reflection finished".into()),
-                    ) {
-                        tracing::warn!(
-                            thread_id = %thread_id,
-                            "failed to transition to Done after reflection: {e}"
-                        );
-                    }
-                }
+                tracing::warn!(thread_id = %thread_id, "failed to transition to Done: {e}");
             }
 
-            // Write trace file if enabled (after reflection, so it's included)
+            // Write trace file if enabled
             if crate::executor::trace::is_trace_enabled() {
                 crate::executor::trace::log_trace_summary(&trace);
                 crate::executor::trace::write_trace(&trace);

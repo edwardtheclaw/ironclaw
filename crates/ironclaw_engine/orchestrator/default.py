@@ -5,7 +5,7 @@
 # by the self-improvement Mission.
 #
 # Host functions (provided by Rust via Monty suspension):
-#   __llm_complete__(messages, actions, config)  -> response dict
+#   __llm_complete__(messages, actions, config)  -> response dict  (args ignored; Rust builds context from thread)
 #   __execute_code_step__(code, state)           -> result dict
 #   __execute_action__(name, params)             -> result dict
 #   __check_signals__()                          -> None | "stop" | {"inject": msg}
@@ -243,21 +243,20 @@ def run_loop(context, goal, actions, state, config):
             })
 
         elif resp_type == "actions":
-            # Tier 0: structured tool calls
+            # Tier 0: structured tool calls.
+            # The assistant message with structured action_calls is added by
+            # __llm_complete__ in Rust — do NOT add it here.
             nudge_count = 0
             calls = response.get("calls", [])
-            __add_message__("assistant_actions", str(calls))
 
             for call in calls:
                 name = call.get("name", "")
                 params = call.get("params", {})
                 call_id = call.get("call_id", "")
 
-                r = __execute_action__(name, params)
-
-                __emit_event__("action_executed" if not r.get("is_error") else "action_failed",
-                               action_name=name, call_id=call_id)
-                __add_message__("action_result", str(r.get("output", {})))
+                # __execute_action__ handles event emission, message addition,
+                # and lease consumption in Rust — no duplicate logic needed here.
+                r = __execute_action__(name, params, call_id=call_id)
 
                 if r.get("need_approval"):
                     __save_checkpoint__(state, {

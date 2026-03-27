@@ -338,9 +338,12 @@ pub async fn execute_orchestrator(
                             .await
                     }
 
-                    // __execute_action__(name, params)
+                    // __execute_action__(name, params, call_id=...)
                     "__execute_action__" => {
-                        handle_execute_action(args, kwargs, thread, effects, leases, policy).await
+                        handle_execute_action(
+                            args, kwargs, thread, effects, leases, policy, event_tx,
+                        )
+                        .await
                     }
 
                     // __check_signals__()
@@ -441,10 +444,14 @@ pub async fn execute_orchestrator(
 ///
 /// Calls the LLM and returns the response as a dict:
 /// `{type: "text"|"code"|"actions", content/code/calls: ..., usage: {...}}`
+///
+/// For `ActionCalls` responses, the assistant message with structured action_calls
+/// is added directly to the thread (not by Python) so the LLM backend can convert
+/// them to the provider-specific tool_calls format on the next call.
 async fn handle_llm_complete(
     _args: &[MontyObject],
     _kwargs: &[(MontyObject, MontyObject)],
-    thread: &Thread,
+    thread: &mut Thread,
     llm: &Arc<dyn LlmBackend>,
     effects: &Arc<dyn EffectExecutor>,
     leases: &Arc<LeaseManager>,
@@ -485,7 +492,16 @@ async fn handle_llm_complete(
                 LlmResponse::Code { code, .. } => {
                     serde_json::json!({"type": "code", "code": code, "usage": usage})
                 }
-                LlmResponse::ActionCalls { calls, .. } => {
+                LlmResponse::ActionCalls { calls, content } => {
+                    // Add the assistant message with structured action_calls so the
+                    // LLM backend sees proper tool_calls on the next round-trip.
+                    // Python must NOT call __add_message__("assistant_actions", ...) —
+                    // the message is already on the thread.
+                    thread.add_message(ThreadMessage::assistant_with_actions(
+                        content,
+                        calls.clone(),
+                    ));
+
                     let calls_json: Vec<serde_json::Value> = calls
                         .iter()
                         .map(|c| {
@@ -602,14 +618,25 @@ async fn handle_execute_code_step(
     }
 }
 
-/// Handle `__execute_action__(name, params)`.
+/// Handle `__execute_action__(name, params, call_id=...)`.
+///
+/// Single source of truth for action execution. Performs:
+/// 1. Lease lookup
+/// 2. Policy check
+/// 3. Lease consumption
+/// 4. Action execution via EffectExecutor
+/// 5. Event emission (ActionExecuted/ActionFailed)
+/// 6. Message addition (ActionResult with correct call_id)
+///
+/// Python only needs to check the returned `need_approval` flag.
 async fn handle_execute_action(
     args: &[MontyObject],
     kwargs: &[(MontyObject, MontyObject)],
-    thread: &Thread,
+    thread: &mut Thread,
     effects: &Arc<dyn EffectExecutor>,
     leases: &Arc<LeaseManager>,
     policy: &Arc<PolicyEngine>,
+    event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
 ) -> ExtFunctionResult {
     let name = match extract_string_arg(args, kwargs, "name", 0) {
         Some(n) => n,
@@ -626,6 +653,8 @@ async fn handle_execute_action(
         .map(monty_to_json)
         .unwrap_or(serde_json::json!({}));
 
+    let call_id = extract_string_kwarg(kwargs, "call_id").unwrap_or_default();
+
     let exec_ctx = ThreadExecutionContext {
         thread_id: thread.id,
         thread_type: thread.thread_type,
@@ -634,19 +663,50 @@ async fn handle_execute_action(
         step_id: StepId::new(),
     };
 
-    // Find lease for this action
+    // Helper: emit event and add ActionResult message to thread
+    let emit_and_record = |thread: &mut Thread,
+                           event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
+                           event_kind: EventKind,
+                           call_id: &str,
+                           action_name: &str,
+                           output: &serde_json::Value| {
+        let event = ThreadEvent::new(thread.id, event_kind);
+        if let Some(tx) = event_tx {
+            let _ = tx.send(event.clone());
+        }
+        thread.events.push(event);
+        thread.updated_at = chrono::Utc::now();
+        thread.add_message(ThreadMessage::action_result(call_id, action_name, output.to_string()));
+    };
+
+    // 1. Find lease for this action
     let lease = match leases.find_lease_for_action(thread.id, &name).await {
         Some(l) => l,
         None => {
+            let error = format!("No lease for action '{name}'");
+            let output = serde_json::json!({"error": &error});
+            emit_and_record(
+                thread,
+                event_tx,
+                EventKind::ActionFailed {
+                    step_id: exec_ctx.step_id,
+                    action_name: name.clone(),
+                    call_id: call_id.clone(),
+                    error,
+                },
+                &call_id,
+                &name,
+                &output,
+            );
             let result = serde_json::json!({
-                "output": {"error": format!("No lease for action '{name}'")},
+                "output": output,
                 "is_error": true,
             });
             return ExtFunctionResult::Return(json_to_monty(&result));
         }
     };
 
-    // Check policy
+    // 2. Check policy
     let action_def = effects
         .available_actions(std::slice::from_ref(&lease))
         .await
@@ -656,8 +716,22 @@ async fn handle_execute_action(
     if let Some(ref ad) = action_def {
         match policy.evaluate(ad, &lease, &[]) {
             crate::capability::policy::PolicyDecision::Deny { reason } => {
+                let output = serde_json::json!({"error": format!("Denied: {reason}")});
+                emit_and_record(
+                    thread,
+                    event_tx,
+                    EventKind::ActionFailed {
+                        step_id: exec_ctx.step_id,
+                        action_name: name.clone(),
+                        call_id: call_id.clone(),
+                        error: reason,
+                    },
+                    &call_id,
+                    &name,
+                    &output,
+                );
                 let result = serde_json::json!({
-                    "output": {"error": format!("Denied: {reason}")},
+                    "output": output,
                     "is_error": true,
                 });
                 return ExtFunctionResult::Return(json_to_monty(&result));
@@ -673,12 +747,30 @@ async fn handle_execute_action(
         }
     }
 
-    // Execute
+    // 3. Consume a lease use
+    if let Err(e) = leases.consume_use(lease.id).await {
+        debug!(error = %e, "lease consumption failed (non-fatal)");
+    }
+
+    // 4. Execute
     match effects
         .execute_action(&name, params, &lease, &exec_ctx)
         .await
     {
         Ok(r) => {
+            emit_and_record(
+                thread,
+                event_tx,
+                EventKind::ActionExecuted {
+                    step_id: exec_ctx.step_id,
+                    action_name: name.clone(),
+                    call_id: call_id.clone(),
+                    duration_ms: r.duration.as_millis() as u64,
+                },
+                &call_id,
+                &name,
+                &r.output,
+            );
             let result = serde_json::json!({
                 "action_name": r.action_name,
                 "output": r.output,
@@ -688,8 +780,22 @@ async fn handle_execute_action(
             ExtFunctionResult::Return(json_to_monty(&result))
         }
         Err(e) => {
+            let output = serde_json::json!({"error": e.to_string()});
+            emit_and_record(
+                thread,
+                event_tx,
+                EventKind::ActionFailed {
+                    step_id: exec_ctx.step_id,
+                    action_name: name.clone(),
+                    call_id: call_id.clone(),
+                    error: e.to_string(),
+                },
+                &call_id,
+                &name,
+                &output,
+            );
             let result = serde_json::json!({
-                "output": {"error": e.to_string()},
+                "output": output,
                 "is_error": true,
             });
             ExtFunctionResult::Return(json_to_monty(&result))
@@ -784,6 +890,10 @@ fn handle_emit_event(
 }
 
 /// Handle `__add_message__(role, content)`.
+///
+/// ActionResult messages are NOT added here — they are handled by
+/// `__execute_action__` which is the single source of truth for
+/// action execution, event emission, and message recording.
 fn handle_add_message(
     args: &[MontyObject],
     _kwargs: &[(MontyObject, MontyObject)],
@@ -794,7 +904,7 @@ fn handle_add_message(
 
     match role.as_str() {
         "user" => thread.add_message(ThreadMessage::user(&content)),
-        "assistant" | "assistant_actions" => thread.add_message(ThreadMessage::assistant(&content)),
+        "assistant" => thread.add_message(ThreadMessage::assistant(&content)),
         "system" => thread.add_message(ThreadMessage::system(&content)),
         "system_append" => {
             // Append to existing system message (for doc injection)
@@ -807,15 +917,11 @@ fn handle_add_message(
                 msg.content.push_str(&content);
             }
         }
-        "action_result" => {
-            thread.add_message(ThreadMessage::action_result("", "", &content));
-        }
         _ => {
             thread.add_message(ThreadMessage::user(&content));
         }
     }
 
-    thread.step_count += 0; // Message addition tracked by thread itself
     ExtFunctionResult::Return(MontyObject::None)
 }
 

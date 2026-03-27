@@ -122,17 +122,6 @@ pub enum EventKind {
         approved: bool,
     },
 
-    // ── Reflection ───────────────────────────────────────────
-    ReflectionStarted,
-    ReflectionComplete {
-        docs_produced: usize,
-        doc_types: Vec<String>,
-        tokens_used: u64,
-    },
-    ReflectionFailed {
-        error: String,
-    },
-
     // ── Self-improvement ──────────────────────────────────────
     SelfImprovementStarted,
     SelfImprovementComplete {

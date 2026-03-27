@@ -38,7 +38,7 @@ impl Default for ThreadId {
 /// ```text
 /// Created → Running → Waiting → Running (resume)
 ///                   → Suspended → Running (resume)
-///                   → Completed → Reflecting → Done
+///                   → Completed → Done
 ///                   → Failed
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -51,10 +51,8 @@ pub enum ThreadState {
     Waiting,
     /// Paused by system (resource pressure, priority preemption).
     Suspended,
-    /// Execution finished successfully, may undergo reflection.
+    /// Execution finished successfully.
     Completed,
-    /// Post-completion reflection is running.
-    Reflecting,
     /// Fully finished (terminal).
     Done,
     /// Terminal failure.
@@ -81,11 +79,7 @@ impl ThreadState {
             | (Self::Suspended, Self::Running)
             | (Self::Suspended, Self::Failed)
             // From Completed
-            | (Self::Completed, Self::Reflecting)
             | (Self::Completed, Self::Done)
-            // From Reflecting
-            | (Self::Reflecting, Self::Done)
-            | (Self::Reflecting, Self::Failed)
         )
     }
 
@@ -111,8 +105,6 @@ pub enum ThreadType {
     Research,
     /// Long-running goal that spawns threads over time.
     Mission,
-    /// Post-completion analysis of another thread.
-    Reflection,
 }
 
 // ── Thread configuration ────────────────────────────────────
@@ -124,8 +116,6 @@ pub struct ThreadConfig {
     pub max_iterations: usize,
     /// Maximum wall-clock duration for the thread.
     pub max_duration: Option<std::time::Duration>,
-    /// Whether to run reflection after completion.
-    pub enable_reflection: bool,
     /// Whether to detect and nudge on tool intent without action calls.
     pub enable_tool_intent_nudge: bool,
     /// Maximum number of tool intent nudges per thread.
@@ -160,7 +150,6 @@ impl Default for ThreadConfig {
         Self {
             max_iterations: 50,
             max_duration: None,
-            enable_reflection: false,
             enable_tool_intent_nudge: true,
             max_tool_intent_nudges: 2,
             max_tokens_total: None,
@@ -351,18 +340,8 @@ mod tests {
     }
 
     #[test]
-    fn completed_can_transition_to_reflecting() {
-        assert!(ThreadState::Completed.can_transition_to(ThreadState::Reflecting));
-    }
-
-    #[test]
     fn completed_can_transition_to_done() {
         assert!(ThreadState::Completed.can_transition_to(ThreadState::Done));
-    }
-
-    #[test]
-    fn reflecting_can_transition_to_done() {
-        assert!(ThreadState::Reflecting.can_transition_to(ThreadState::Done));
     }
 
     #[test]
@@ -428,16 +407,6 @@ mod tests {
         assert!(t.state.is_terminal());
         assert_eq!(t.events.len(), 3);
         assert!(t.completed_at.is_some());
-    }
-
-    #[test]
-    fn full_lifecycle_with_reflection() {
-        let mut t = make_thread();
-        t.transition_to(ThreadState::Running, None).unwrap();
-        t.transition_to(ThreadState::Completed, None).unwrap();
-        t.transition_to(ThreadState::Reflecting, None).unwrap();
-        t.transition_to(ThreadState::Done, None).unwrap();
-        assert_eq!(t.events.len(), 4);
     }
 
     #[test]

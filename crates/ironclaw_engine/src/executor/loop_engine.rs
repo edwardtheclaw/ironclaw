@@ -1112,4 +1112,225 @@ mod tests {
         let text = "A very long explanation...\n\n🔚 Final Thought\n\nFINAL(\"the conclusion\")";
         assert_eq!(extract_final_from_text(text).unwrap(), "the conclusion");
     }
+
+    // ── call_id propagation through orchestrator pipeline ────
+    //
+    // These tests verify the end-to-end flow: LLM returns ActionCalls with
+    // call_ids → orchestrator executes them → ActionResult messages on the
+    // thread have correct call_ids (not empty). This catches the class of
+    // bugs that caused OpenAI/Codex HTTP 400 rejections.
+
+    #[tokio::test]
+    async fn action_result_messages_have_correct_call_id() {
+        // LLM returns a tool call, then a text response
+        let (mut exec, _tx) = make_loop(
+            vec![
+                action_response("test_tool", "call_xK9mZq123"),
+                text_response("Done!"),
+            ],
+            vec![Ok(ActionResult {
+                call_id: String::new(), // EffectExecutor returns empty
+                action_name: "test_tool".into(),
+                output: serde_json::json!({"data": "result"}),
+                is_error: false,
+                duration: Duration::from_millis(5),
+            })],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        exec.run().await.unwrap();
+
+        // Find the ActionResult message on the thread
+        let action_results: Vec<_> = exec
+            .thread
+            .messages
+            .iter()
+            .filter(|m| m.role == crate::types::message::MessageRole::ActionResult)
+            .collect();
+
+        assert!(
+            !action_results.is_empty(),
+            "thread should have at least one ActionResult message"
+        );
+
+        for msg in &action_results {
+            let call_id = msg.action_call_id.as_deref().unwrap_or("");
+            assert!(
+                !call_id.is_empty(),
+                "ActionResult message must have non-empty call_id, got empty for tool '{}'",
+                msg.action_name.as_deref().unwrap_or("?")
+            );
+        }
+    }
+
+    /// Verify that the ActionExecuted event carries the call_id from the LLM.
+    #[tokio::test]
+    async fn action_executed_events_carry_call_id() {
+        let (mut exec, _tx) = make_loop(
+            vec![
+                action_response("test_tool", "call_evt_id_42"),
+                text_response("ok"),
+            ],
+            vec![Ok(ActionResult {
+                call_id: String::new(),
+                action_name: "test_tool".into(),
+                output: serde_json::json!({}),
+                is_error: false,
+                duration: Duration::from_millis(1),
+            })],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        exec.run().await.unwrap();
+
+        let exec_events: Vec<_> = exec
+            .thread
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::ActionExecuted { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(!exec_events.is_empty(), "should have ActionExecuted events");
+        for call_id in &exec_events {
+            assert!(!call_id.is_empty(), "ActionExecuted event must have non-empty call_id");
+        }
+    }
+
+    /// When a tool call fails (no lease), the ActionResult message and
+    /// ActionFailed event must still carry the original call_id.
+    #[tokio::test]
+    async fn failed_action_preserves_call_id_in_message_and_event() {
+        let project_id = ProjectId::new();
+        let thread = Thread::new(
+            "test",
+            ThreadType::Foreground,
+            project_id,
+            ThreadConfig::default(),
+        );
+        let tid = thread.id;
+
+        // Create a tool that requires a separate capability
+        let missing_action = ActionDef {
+            name: "restricted_tool".into(),
+            description: "A tool with no lease".into(),
+            parameters_schema: serde_json::json!({"type": "object"}),
+            effects: vec![EffectType::WriteExternal],
+            requires_approval: false,
+        };
+
+        let llm = Arc::new(MockLlm::new(vec![
+            // LLM calls a tool the thread has no lease for
+            LlmOutput {
+                response: LlmResponse::ActionCalls {
+                    calls: vec![crate::types::step::ActionCall {
+                        id: "call_nolease_xyz".into(),
+                        action_name: "restricted_tool".into(),
+                        parameters: serde_json::json!({}),
+                    }],
+                    content: None,
+                },
+                usage: TokenUsage::default(),
+            },
+            text_response("I couldn't access that tool"),
+        ]));
+        let effects = Arc::new(MockEffects::new(vec![missing_action], vec![]));
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+
+        // Grant a lease that does NOT cover "restricted_tool"
+        leases
+            .grant(tid, "basic_cap", vec![], None, None)
+            .await;
+
+        let (_tx, rx) = crate::runtime::messaging::signal_channel(16);
+        let mut exec = ExecutionLoop::new(
+            thread,
+            llm,
+            effects,
+            leases,
+            policy,
+            rx,
+            "test-user".into(),
+        );
+
+        exec.run().await.unwrap();
+
+        // Check ActionResult messages
+        let action_results: Vec<_> = exec
+            .thread
+            .messages
+            .iter()
+            .filter(|m| m.role == crate::types::message::MessageRole::ActionResult)
+            .collect();
+
+        for msg in &action_results {
+            let call_id = msg.action_call_id.as_deref().unwrap_or("");
+            assert!(
+                !call_id.is_empty(),
+                "even failed ActionResult must have call_id"
+            );
+        }
+
+        // Check ActionFailed events
+        let fail_events: Vec<_> = exec
+            .thread
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::ActionFailed {
+                    call_id,
+                    action_name,
+                    ..
+                } => Some((call_id.clone(), action_name.clone())),
+                _ => None,
+            })
+            .collect();
+
+        for (call_id, _name) in &fail_events {
+            assert!(
+                !call_id.is_empty(),
+                "ActionFailed event must have call_id"
+            );
+        }
+    }
+
+    /// Verify the trace analyzer does NOT flag any issues on a clean
+    /// action execution (no empty call_ids).
+    #[tokio::test]
+    async fn trace_analysis_clean_after_successful_tool_use() {
+        let (mut exec, _tx) = make_loop(
+            vec![
+                action_response("test_tool", "call_clean_id"),
+                text_response("All done"),
+            ],
+            vec![Ok(ActionResult {
+                call_id: String::new(),
+                action_name: "test_tool".into(),
+                output: serde_json::json!({"status": "ok"}),
+                is_error: false,
+                duration: Duration::from_millis(3),
+            })],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        exec.run().await.unwrap();
+
+        let trace = crate::executor::trace::build_trace(&exec.thread);
+        let empty_id_issues: Vec<_> = trace
+            .issues
+            .iter()
+            .filter(|i| i.category == "empty_call_id")
+            .collect();
+
+        assert!(
+            empty_id_issues.is_empty(),
+            "clean execution should have no empty_call_id issues, got: {empty_id_issues:?}"
+        );
+    }
 }

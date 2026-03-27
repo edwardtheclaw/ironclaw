@@ -146,10 +146,7 @@ impl MissionManager {
                 &meta_prompt,
                 ThreadType::Mission,
                 mission.project_id,
-                ThreadConfig {
-                    enable_reflection: true,
-                    ..ThreadConfig::default()
-                },
+                ThreadConfig::default(),
                 None,
                 user_id,
             )
@@ -270,51 +267,62 @@ impl MissionManager {
         Ok(spawned)
     }
 
-    /// Start a background event listener that fires `OnSystemEvent` missions
-    /// when threads complete with issues.
+    /// Start a background event listener that fires learning missions when
+    /// threads complete.
     ///
     /// Subscribes to the ThreadManager's event broadcast channel and watches
-    /// for thread completion events. When a non-Mission, non-Reflection thread
-    /// completes and its trace has issues, fires matching OnSystemEvent missions
-    /// with trace data as the trigger payload.
+    /// for `StateChanged { to: Done }`. For each completed non-Mission thread:
+    ///
+    /// 1. **Error diagnosis** — if trace has issues, fires `thread_completed_with_issues`
+    /// 2. **Playbook extraction** — if thread succeeded with many steps/actions,
+    ///    fires `thread_completed_with_learnings`
+    /// 3. **Conversation insights** — after every N threads in a conversation,
+    ///    fires `conversation_insights_due`
     pub fn start_event_listener(self: &Arc<Self>, user_id: String) {
         let mgr = Arc::clone(self);
         let mut rx = mgr.thread_manager.subscribe_events();
+
+        /// Minimum steps for a thread to be a playbook candidate.
+        const PLAYBOOK_MIN_STEPS: usize = 5;
+        /// Minimum distinct action executions for playbook extraction.
+        const PLAYBOOK_MIN_ACTIONS: usize = 3;
+        /// Completed thread interval for conversation insights.
+        const CONVERSATION_INSIGHTS_INTERVAL: u32 = 5;
+
         tokio::spawn(async move {
+            // Track completed thread count per conversation for insights trigger.
+            let mut conv_thread_counts: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
+
             loop {
                 match rx.recv().await {
                     Ok(event) => {
-                        // React to ReflectionComplete — the thread is done and
-                        // we have reflection doc info for the trigger payload.
-                        if let crate::types::event::EventKind::ReflectionComplete {
-                            docs_produced,
-                            ref doc_types,
-                            ..
-                        } = event.kind
-                        {
-                            // Load the thread to check its type and build the payload
-                            let thread = mgr.store.load_thread(event.thread_id).await;
-                            let thread = match thread {
-                                Ok(Some(t)) => t,
-                                _ => continue,
-                            };
-
-                            // Skip Mission and Reflection threads (no recursive self-improvement)
-                            if matches!(
-                                thread.thread_type,
-                                ThreadType::Mission | ThreadType::Reflection
-                            ) {
-                                continue;
+                        // Only react to threads transitioning to Done
+                        let is_done = matches!(
+                            event.kind,
+                            crate::types::event::EventKind::StateChanged {
+                                to: crate::types::thread::ThreadState::Done,
+                                ..
                             }
+                        );
+                        if !is_done {
+                            continue;
+                        }
 
-                            // Build trace to check for issues
-                            let trace = crate::executor::trace::build_trace(&thread);
-                            if trace.issues.is_empty() {
-                                continue;
-                            }
+                        // Load the completed thread
+                        let thread = match mgr.store.load_thread(event.thread_id).await {
+                            Ok(Some(t)) => t,
+                            _ => continue,
+                        };
 
-                            // Build trigger payload with trace issues, error messages,
-                            // and reflection summary
+                        // Skip Mission threads (no recursive self-improvement)
+                        if thread.thread_type == ThreadType::Mission {
+                            continue;
+                        }
+
+                        // ── Trigger 1: Error diagnosis ──────────────────
+                        let trace = crate::executor::trace::build_trace(&thread);
+                        if !trace.issues.is_empty() {
                             let issues: Vec<serde_json::Value> = trace
                                 .issues
                                 .iter()
@@ -328,8 +336,6 @@ impl MissionManager {
                                 })
                                 .collect();
 
-                            // Extract actual error text from ActionFailed events
-                            // and system messages (these contain the real diagnostics)
                             let error_messages: Vec<String> = thread
                                 .events
                                 .iter()
@@ -345,7 +351,7 @@ impl MissionManager {
                                         None
                                     }
                                 })
-                                .take(10) // cap to avoid bloating payload
+                                .take(10)
                                 .collect();
 
                             let payload = serde_json::json!({
@@ -353,10 +359,6 @@ impl MissionManager {
                                 "goal": thread.goal,
                                 "issues": issues,
                                 "error_messages": error_messages,
-                                "reflection": {
-                                    "docs_produced": docs_produced,
-                                    "doc_types": doc_types,
-                                },
                             });
 
                             if let Err(e) = mgr
@@ -368,7 +370,121 @@ impl MissionManager {
                                 )
                                 .await
                             {
-                                warn!("event listener: failed to fire self-improvement: {e}");
+                                warn!("event listener: failed to fire error diagnosis: {e}");
+                            }
+                        }
+
+                        // ── Trigger 2: Playbook extraction ──────────────
+                        let action_count = thread
+                            .events
+                            .iter()
+                            .filter(|e| {
+                                matches!(
+                                    e.kind,
+                                    crate::types::event::EventKind::ActionExecuted { .. }
+                                )
+                            })
+                            .count();
+
+                        if thread.state == crate::types::thread::ThreadState::Done
+                            && trace.issues.iter().all(|i| {
+                                i.severity != crate::executor::trace::IssueSeverity::Error
+                            })
+                            && thread.step_count >= PLAYBOOK_MIN_STEPS
+                            && action_count >= PLAYBOOK_MIN_ACTIONS
+                        {
+                            let actions_used: Vec<String> = thread
+                                .events
+                                .iter()
+                                .filter_map(|e| {
+                                    if let crate::types::event::EventKind::ActionExecuted {
+                                        action_name,
+                                        ..
+                                    } = &e.kind
+                                    {
+                                        Some(action_name.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+
+                            let payload = serde_json::json!({
+                                "source_thread_id": event.thread_id.0.to_string(),
+                                "goal": thread.goal,
+                                "step_count": thread.step_count,
+                                "action_count": action_count,
+                                "actions_used": actions_used,
+                                "total_tokens": thread.total_tokens_used,
+                            });
+
+                            if let Err(e) = mgr
+                                .fire_on_system_event(
+                                    "engine",
+                                    "thread_completed_with_learnings",
+                                    &user_id,
+                                    Some(payload),
+                                )
+                                .await
+                            {
+                                warn!("event listener: failed to fire playbook extraction: {e}");
+                            }
+                        }
+
+                        // ── Trigger 3: Conversation insights ────────────
+                        // Use the thread's project_id as a proxy for conversation scope.
+                        let conv_key = thread.project_id.0.to_string();
+                        let count = conv_thread_counts
+                            .entry(conv_key.clone())
+                            .or_insert(0);
+                        *count += 1;
+
+                        if (*count).is_multiple_of(CONVERSATION_INSIGHTS_INTERVAL) {
+                            // Collect recent thread goals for context
+                            let thread_goals: Vec<String> = match mgr
+                                .store
+                                .list_threads(thread.project_id)
+                                .await
+                            {
+                                Ok(threads) => threads
+                                    .iter()
+                                    .rev()
+                                    .take(CONVERSATION_INSIGHTS_INTERVAL as usize)
+                                    .map(|t| t.goal.clone())
+                                    .collect(),
+                                Err(_) => vec![thread.goal.clone()],
+                            };
+
+                            // Collect sample user messages from recent threads
+                            let sample_messages: Vec<String> = thread
+                                .messages
+                                .iter()
+                                .filter(|m| {
+                                    m.role == crate::types::message::MessageRole::User
+                                })
+                                .map(|m| {
+                                    m.content.chars().take(200).collect::<String>()
+                                })
+                                .take(10)
+                                .collect();
+
+                            let payload = serde_json::json!({
+                                "project_id": thread.project_id.0.to_string(),
+                                "completed_thread_count": *count,
+                                "thread_goals": thread_goals,
+                                "sample_user_messages": sample_messages,
+                            });
+
+                            if let Err(e) = mgr
+                                .fire_on_system_event(
+                                    "engine",
+                                    "conversation_insights_due",
+                                    &user_id,
+                                    Some(payload),
+                                )
+                                .await
+                            {
+                                warn!("event listener: failed to fire conversation insights: {e}");
                             }
                         }
                     }
@@ -443,6 +559,88 @@ impl MissionManager {
         }
 
         debug!(mission_id = %id, "created self-improvement mission");
+        Ok(id)
+    }
+
+    /// Ensure all three learning missions exist for the given project.
+    ///
+    /// Creates (if missing) the self-improvement, playbook extraction, and
+    /// conversation insights missions. This is the preferred entry point —
+    /// call once at project bootstrap.
+    pub async fn ensure_learning_missions(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<(), EngineError> {
+        // 1. Error diagnosis (self-improvement) — existing
+        self.ensure_self_improvement_mission(project_id).await?;
+
+        // 2. Playbook extraction
+        self.ensure_mission_by_metadata(
+            project_id,
+            "playbook_extraction",
+            "playbook-extraction",
+            PLAYBOOK_EXTRACTION_GOAL,
+            MissionCadence::OnSystemEvent {
+                source: "engine".into(),
+                event_type: "thread_completed_with_learnings".into(),
+            },
+            "Extract reusable playbooks from successful multi-step threads",
+            3, // max 3/day
+        )
+        .await?;
+
+        // 3. Conversation insights
+        self.ensure_mission_by_metadata(
+            project_id,
+            "conversation_insights",
+            "conversation-insights",
+            CONVERSATION_INSIGHTS_GOAL,
+            MissionCadence::OnSystemEvent {
+                source: "engine".into(),
+                event_type: "conversation_insights_due".into(),
+            },
+            "Extract user preferences, domain knowledge, and workflow patterns from conversations",
+            2, // max 2/day
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Ensure a mission with a specific metadata tag exists, creating it if not.
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_mission_by_metadata(
+        &self,
+        project_id: ProjectId,
+        metadata_key: &str,
+        name: &str,
+        goal: &str,
+        cadence: MissionCadence,
+        success_criteria: &str,
+        max_per_day: u32,
+    ) -> Result<MissionId, EngineError> {
+        let missions = self.store.list_missions(project_id).await?;
+        if let Some(existing) = missions
+            .iter()
+            .find(|m| m.metadata.get(metadata_key).is_some())
+        {
+            let mut active = self.active.write().await;
+            if !active.contains(&existing.id) {
+                active.push(existing.id);
+            }
+            return Ok(existing.id);
+        }
+
+        let mut mission = Mission::new(project_id, name, goal, cadence);
+        mission.success_criteria = Some(success_criteria.into());
+        mission.metadata = serde_json::json!({metadata_key: true});
+        mission.max_threads_per_day = max_per_day;
+
+        let id = mission.id;
+        self.store.save_mission(&mission).await?;
+        self.active.write().await.push(id);
+
+        debug!(mission_id = %id, name, "created learning mission");
         Ok(id)
     }
 
@@ -900,6 +1098,91 @@ pub const FIX_PATTERN_DB_TITLE: &str = "fix_pattern_database";
 
 /// Well-known tag for the fix pattern database.
 pub const FIX_PATTERN_DB_TAG: &str = "fix_patterns";
+
+/// The goal for the playbook extraction mission.
+const PLAYBOOK_EXTRACTION_GOAL: &str = "\
+You extract reusable playbooks from successfully completed multi-step threads.
+
+## Input
+
+`state[\"trigger_payload\"]` contains:
+- `source_thread_id` — the thread that completed successfully
+- `goal` — what the thread accomplished
+- `step_count` — number of execution steps
+- `action_count` — number of tool actions executed
+- `actions_used` — list of tool names used
+- `total_tokens` — tokens consumed
+
+## Process
+
+1. Search for the source thread's messages in memory: `memory_search(query=goal)`
+2. Check for existing playbooks that cover this procedure: `memory_search(query=\"playbook\")`
+3. If a similar playbook already exists, decide whether this thread adds new detail worth updating
+4. Extract the step-by-step procedure, noting specific tool names and parameter patterns
+5. Save as a Playbook memory doc via `memory_write(target=\"memory\", content=playbook_text)` \
+   with title format \"playbook:<short-name>\"
+
+## Output (FINAL)
+
+Report what you did:
+- The playbook title and a one-line summary
+- Whether it is new or an update to an existing playbook
+- Next focus: what patterns to watch for
+
+## Rules
+
+- Only extract playbooks from threads with 3+ distinct tool calls
+- Be specific about tool names and parameters — vague playbooks are useless
+- If the thread was a trivial query-response, call FINAL(\"No playbook needed — simple interaction\") \
+  and stop immediately
+- One playbook per FINAL — do not combine unrelated procedures
+";
+
+/// The goal for the conversation insights mission.
+const CONVERSATION_INSIGHTS_GOAL: &str = "\
+You extract user preferences, patterns, and domain knowledge from a batch of recent \
+conversation threads.
+
+## Input
+
+`state[\"trigger_payload\"]` contains:
+- `project_id` — the project scope
+- `completed_thread_count` — total threads completed in this conversation
+- `thread_goals` — list of recent thread goals (what the user asked for)
+- `sample_user_messages` — sample of actual user messages (truncated to 200 chars)
+
+## Process
+
+1. Analyze the thread goals and user messages for patterns
+2. Search existing insights: `memory_search(query=\"user preferences\")` and \
+   `memory_search(query=\"domain knowledge\")`
+3. Extract NEW insights not already recorded in memory
+4. Write each insight to memory via `memory_write(target=\"memory\", content=insight_text)` \
+   with title format \"insight:<category>:<topic>\"
+
+## Categories to look for
+
+- **Preferences**: communication style, format choices, tool preferences
+- **Domain**: project names, API patterns, data formats, technology stack
+- **Workflow**: recurring task sequences, common follow-up questions
+- **Corrections**: things the user corrected or repeated — these signal unmet expectations
+
+## Output (FINAL)
+
+Report:
+- Number of new insights extracted (0 is fine)
+- Brief list of what was found
+- Next focus
+
+## Rules
+
+- Only record actionable, specific insights — not vague observations
+- Do not record personal information, only work patterns
+- If no meaningful new insights after analysis, call FINAL(\"No new insights — \
+  conversation patterns already captured\") immediately
+- Merge with existing insight docs rather than creating duplicates
+- Max 5 insights per run to keep quality high
+";
 
 /// Seed content for the fix pattern database.
 const SEED_FIX_PATTERNS: &str = "\

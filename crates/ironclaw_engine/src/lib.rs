@@ -17,7 +17,6 @@
 pub mod capability;
 pub mod executor;
 pub mod memory;
-pub mod reflection;
 pub mod reliability;
 pub mod runtime;
 pub mod traits;
@@ -74,10 +73,6 @@ pub use executor::ExecutionLoop;
 
 pub use memory::MemoryStore;
 pub use memory::RetrievalEngine;
-
-// ── Re-exports: reflection ────────────────────────────────────
-
-pub use reflection::ReflectionResult;
 
 // ── Re-exports: reliability ──────────────────────────────────
 

@@ -201,12 +201,12 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     mission_manager.start_cron_ticker(agent.deps.owner_id.clone());
     mission_manager.start_event_listener(agent.deps.owner_id.clone());
 
-    // Ensure self-improvement mission exists for this project
+    // Ensure all learning missions exist for this project
     if let Err(e) = mission_manager
-        .ensure_self_improvement_mission(project_id)
+        .ensure_learning_missions(project_id)
         .await
     {
-        debug!("engine v2: failed to create self-improvement mission: {e}");
+        debug!("engine v2: failed to create learning missions: {e}");
     }
 
     // Wire mission manager into effect adapter for mission_* function calls
@@ -816,10 +816,7 @@ pub async fn handle_with_engine(
             content,
             state.default_project_id,
             &message.user_id,
-            ThreadConfig {
-                enable_reflection: true,
-                ..ThreadConfig::default()
-            },
+            ThreadConfig::default(),
         )
         .await
         .map_err(|e| engine_err("thread error", e))?;
@@ -1108,26 +1105,6 @@ async fn forward_event_to_channel(
                     .await;
             }
         }
-        EventKind::ReflectionStarted => {
-            let _ = channels
-                .send_status(
-                    channel_name,
-                    StatusUpdate::Thinking("Reflecting on execution...".into()),
-                    metadata,
-                )
-                .await;
-        }
-        EventKind::ReflectionComplete { docs_produced, .. } => {
-            let _ = channels
-                .send_status(
-                    channel_name,
-                    StatusUpdate::Thinking(format!(
-                        "Reflection complete — {docs_produced} insight(s) saved"
-                    )),
-                    metadata,
-                )
-                .await;
-        }
         _ => {}
     }
 }
@@ -1211,14 +1188,6 @@ fn thread_event_to_app_events(
             .into_iter()
             .collect()
         }
-        EventKind::ReflectionStarted => vec![AppEvent::Thinking {
-            message: "Reflecting on execution...".into(),
-            thread_id: Some(thread_id.into()),
-        }],
-        EventKind::ReflectionComplete { docs_produced, .. } => vec![AppEvent::Status {
-            message: format!("Reflection complete — {docs_produced} insight(s) saved"),
-            thread_id: Some(thread_id.into()),
-        }],
         EventKind::StateChanged { from, to, reason } => {
             vec![AppEvent::ThreadStateChanged {
             thread_id: thread_id.into(),

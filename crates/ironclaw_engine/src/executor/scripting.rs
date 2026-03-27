@@ -770,7 +770,6 @@ async fn handle_rlm_query(
     // Build child thread with inherited budget
     let child_config = crate::types::thread::ThreadConfig {
         max_iterations: parent_thread.config.max_iterations.min(20), // cap child iterations
-        enable_reflection: false,
         enable_tool_intent_nudge: false,
         max_tokens_total: parent_thread
             .config

@@ -534,22 +534,17 @@ impl Channel for GatewayChannel {
         user_id: &str,
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
-        let thread_id = match response.thread_id {
-            Some(tid) => tid,
-            None => {
-                tracing::warn!(
-                    "Gateway broadcast with no thread_id — skipping (clients would drop it)"
-                );
-                return Ok(());
-            }
-        };
-        self.state.sse.broadcast_for_user(
-            user_id,
-            AppEvent::Response {
+        let event = match response.thread_id {
+            Some(thread_id) => AppEvent::Response {
                 content: response.content,
                 thread_id,
             },
-        );
+            None => AppEvent::Status {
+                message: response.content,
+                thread_id: None,
+            },
+        };
+        self.state.sse.broadcast_for_user(user_id, event);
         Ok(())
     }
 

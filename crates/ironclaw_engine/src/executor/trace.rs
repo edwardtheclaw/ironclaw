@@ -33,20 +33,12 @@ pub struct ExecutionTrace {
     pub messages: Vec<MessageRecord>,
     pub events: Vec<ThreadEvent>,
     pub issues: Vec<TraceIssue>,
-    pub reflection: Option<ReflectionTrace>,
     pub timestamp: chrono::DateTime<Utc>,
 }
 
-/// Reflection results captured in the trace.
+/// A single doc record, for the trace.
 #[derive(Debug, Serialize)]
-pub struct ReflectionTrace {
-    pub docs: Vec<ReflectionDocRecord>,
-    pub tokens_used: u64,
-}
-
-/// A single doc produced by reflection, for the trace.
-#[derive(Debug, Serialize)]
-pub struct ReflectionDocRecord {
+pub struct DocRecord {
     pub doc_type: String,
     pub title: String,
     pub content: String,
@@ -72,7 +64,7 @@ pub struct TraceIssue {
     pub step: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 pub enum IssueSeverity {
     Error,
     Warning,
@@ -112,7 +104,6 @@ pub fn build_trace(thread: &Thread) -> ExecutionTrace {
         messages,
         events: thread.events.clone(),
         issues,
-        reflection: None,
         timestamp: Utc::now(),
     }
 }
@@ -138,22 +129,6 @@ pub fn write_trace(trace: &ExecutionTrace) -> Option<PathBuf> {
             None
         }
     }
-}
-
-/// Attach reflection results to a trace.
-pub fn attach_reflection(trace: &mut ExecutionTrace, result: &crate::reflection::ReflectionResult) {
-    trace.reflection = Some(ReflectionTrace {
-        docs: result
-            .docs
-            .iter()
-            .map(|d| ReflectionDocRecord {
-                doc_type: format!("{:?}", d.doc_type),
-                title: d.title.clone(),
-                content: d.content.clone(),
-            })
-            .collect(),
-        tokens_used: result.tokens_used.total(),
-    });
 }
 
 /// Print a summary of the trace to the log.
@@ -190,28 +165,6 @@ pub fn log_trace_summary(trace: &ExecutionTrace) {
                 "NOTE: {}",
                 issue.description
             ),
-        }
-    }
-
-    if let Some(ref refl) = trace.reflection {
-        debug!(
-            thread_id = %trace.thread_id,
-            docs = refl.docs.len(),
-            tokens = refl.tokens_used,
-            "=== Reflection ==="
-        );
-        for doc in &refl.docs {
-            let preview: String = doc.content.chars().take(200).collect();
-            let truncated = if doc.content.chars().count() > 200 {
-                "..."
-            } else {
-                ""
-            };
-            debug!(
-                doc_type = %doc.doc_type,
-                title = %doc.title,
-                "  {preview}{truncated}"
-            );
         }
     }
 }
@@ -427,5 +380,179 @@ fn truncate(s: &str, max_chars: usize) -> String {
         format!("{chars}...")
     } else {
         chars
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::event::EventKind;
+    use crate::types::message::ThreadMessage;
+    use crate::types::project::ProjectId;
+    use crate::types::step::StepId;
+    use crate::types::thread::{ThreadConfig, ThreadType};
+
+    fn make_thread() -> Thread {
+        Thread::new(
+            "test goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            ThreadConfig::default(),
+        )
+    }
+
+    // ── empty_call_id detection (OpenAI / Codex rejection) ───
+
+    /// OpenAI and Codex reject ActionResult messages with empty call_id.
+    /// The trace analyzer must flag these as errors.
+    #[test]
+    fn detects_empty_call_id_on_action_result() {
+        let mut thread = make_thread();
+        thread.add_message(ThreadMessage::system("sys"));
+        thread.add_message(ThreadMessage::assistant("calling tool"));
+        // Simulate the bug: empty call_id
+        thread.add_message(ThreadMessage::action_result("", "web_search", "result"));
+
+        let issues = analyze_trace(&thread);
+        let empty_id_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.category == "empty_call_id")
+            .collect();
+
+        assert_eq!(empty_id_issues.len(), 1);
+        assert_eq!(empty_id_issues[0].severity, IssueSeverity::Error);
+        assert!(empty_id_issues[0].description.contains("web_search"));
+    }
+
+    /// ActionResult with None call_id should also be flagged.
+    #[test]
+    fn detects_none_call_id_on_action_result() {
+        let mut thread = make_thread();
+        thread.add_message(ThreadMessage::system("sys"));
+        thread.add_message(ThreadMessage::assistant("calling tool"));
+        // Manually construct a message with None call_id
+        thread.add_message(ThreadMessage {
+            role: crate::types::message::MessageRole::ActionResult,
+            content: "result".into(),
+            provenance: crate::types::provenance::Provenance::ToolOutput {
+                action_name: "shell".into(),
+            },
+            action_call_id: None,
+            action_name: Some("shell".into()),
+            action_calls: None,
+            timestamp: chrono::Utc::now(),
+        });
+
+        let issues = analyze_trace(&thread);
+        assert!(issues.iter().any(|i| i.category == "empty_call_id"));
+    }
+
+    /// No false positive: valid call_id should not be flagged.
+    #[test]
+    fn no_false_positive_for_valid_call_id() {
+        let mut thread = make_thread();
+        thread.add_message(ThreadMessage::system("sys"));
+        thread.add_message(ThreadMessage::assistant("calling tool"));
+        thread.add_message(ThreadMessage::action_result(
+            "call_abc123",
+            "web_search",
+            "result",
+        ));
+
+        let issues = analyze_trace(&thread);
+        assert!(
+            !issues.iter().any(|i| i.category == "empty_call_id"),
+            "valid call_id should not be flagged"
+        );
+    }
+
+    // ── tool_error detection ─────────────────────────────────
+
+    /// ActionFailed events should produce tool_error warnings.
+    #[test]
+    fn detects_tool_failures_in_events() {
+        let mut thread = make_thread();
+        thread.add_message(ThreadMessage::system("sys"));
+        thread.add_message(ThreadMessage::assistant("ok"));
+        thread.events.push(ThreadEvent::new(
+            thread.id,
+            EventKind::ActionFailed {
+                step_id: StepId::new(),
+                action_name: "web_search".into(),
+                call_id: "call_123".into(),
+                error: "No lease for action 'web_search'".into(),
+            },
+        ));
+
+        let issues = analyze_trace(&thread);
+        let tool_errors: Vec<_> = issues
+            .iter()
+            .filter(|i| i.category == "tool_error")
+            .collect();
+        assert_eq!(tool_errors.len(), 1);
+        assert!(tool_errors[0].description.contains("web_search"));
+    }
+
+    // ── thread_failure detection ─────────────────────────────
+
+    #[test]
+    fn detects_failed_thread_state() {
+        let mut thread = make_thread();
+        thread.add_message(ThreadMessage::system("sys"));
+        thread.add_message(ThreadMessage::assistant("trying"));
+        thread.state = ThreadState::Failed;
+
+        let issues = analyze_trace(&thread);
+        assert!(issues.iter().any(|i| i.category == "thread_failure"));
+    }
+
+    // ── LLM error detection from StateChanged events ─────────
+
+    /// Reproduces the exact pattern from the trace: OpenAI rejects empty call_id.
+    #[test]
+    fn detects_llm_error_from_state_changed() {
+        let mut thread = make_thread();
+        thread.add_message(ThreadMessage::system("sys"));
+        thread.add_message(ThreadMessage::assistant("ok"));
+        thread.state = ThreadState::Failed;
+        thread.events.push(ThreadEvent::new(
+            thread.id,
+            EventKind::StateChanged {
+                from: ThreadState::Running,
+                to: ThreadState::Failed,
+                reason: Some(
+                    "LLM error: Provider openai_codex request failed: HTTP 400 Bad Request: \
+                     Invalid 'input[5].call_id': empty string"
+                        .into(),
+                ),
+            },
+        ));
+
+        let issues = analyze_trace(&thread);
+        assert!(
+            issues.iter().any(|i| i.category == "llm_error"),
+            "should detect LLM provider error in StateChanged reason"
+        );
+    }
+
+    // ── Multiple empty call_ids ──────────────────────────────
+
+    /// Anthropic sends consecutive tool results merged into one User message.
+    /// If multiple ActionResults have empty call_ids, each must be flagged.
+    #[test]
+    fn flags_each_empty_call_id_separately() {
+        let mut thread = make_thread();
+        thread.add_message(ThreadMessage::system("sys"));
+        thread.add_message(ThreadMessage::assistant("parallel calls"));
+        thread.add_message(ThreadMessage::action_result("", "tool_a", "result_a"));
+        thread.add_message(ThreadMessage::action_result("", "tool_b", "result_b"));
+        thread.add_message(ThreadMessage::action_result("call_ok", "tool_c", "result_c"));
+
+        let issues = analyze_trace(&thread);
+        let empty_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.category == "empty_call_id")
+            .collect();
+        assert_eq!(empty_issues.len(), 2, "should flag exactly the 2 empty call_ids");
     }
 }
