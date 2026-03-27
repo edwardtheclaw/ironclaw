@@ -80,23 +80,17 @@ pub struct GetConfigRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GetUpdatesResponse {
-    #[serde(default)]
     pub ret: Option<i32>,
-    #[serde(default)]
     pub errcode: Option<i32>,
-    #[serde(default)]
     pub errmsg: Option<String>,
     #[serde(default)]
     pub msgs: Vec<WechatMessage>,
-    #[serde(default)]
     pub get_updates_buf: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GetUploadUrlResponse {
-    #[serde(default)]
     pub upload_param: Option<String>,
-    #[serde(default)]
     pub thumb_upload_param: Option<String>,
 }
 
@@ -128,17 +122,11 @@ pub struct OutboundWechatMessage {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WechatMessage {
-    #[serde(default)]
     pub message_id: Option<i64>,
-    #[serde(default)]
     pub from_user_id: Option<String>,
-    #[serde(default)]
     pub to_user_id: Option<String>,
-    #[serde(default)]
     pub session_id: Option<String>,
-    #[serde(default)]
     pub message_type: Option<i32>,
-    #[serde(default)]
     pub context_token: Option<String>,
     #[serde(default)]
     pub item_list: Vec<MessageItem>,
@@ -146,33 +134,23 @@ pub struct WechatMessage {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GetConfigResponse {
-    #[serde(default)]
     pub ret: Option<i32>,
-    #[serde(default)]
     pub errmsg: Option<String>,
-    #[serde(default)]
     pub typing_ticket: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SendTypingResponse {
-    #[serde(default)]
     pub ret: Option<i32>,
-    #[serde(default)]
     pub errmsg: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MessageItem {
-    #[serde(default)]
     pub r#type: Option<i32>,
-    #[serde(default)]
     pub text_item: Option<TextItem>,
-    #[serde(default)]
     pub image_item: Option<ImageItem>,
-    #[serde(default)]
     pub voice_item: Option<VoiceItem>,
-    #[serde(default)]
     pub file_item: Option<FileItem>,
 }
 
@@ -183,56 +161,39 @@ pub struct TextItem {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CdnMedia {
-    #[serde(default)]
     pub encrypt_query_param: Option<String>,
-    #[serde(default)]
     pub aes_key: Option<String>,
-    #[serde(default)]
     pub encrypt_type: Option<i32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ImageItem {
-    #[serde(default)]
     pub media: Option<CdnMedia>,
-    #[serde(default)]
     pub aeskey: Option<String>,
-    #[serde(default)]
     pub mid_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VoiceItem {
-    #[serde(default)]
     pub media: Option<CdnMedia>,
-    #[serde(default)]
     pub encode_type: Option<i32>,
-    #[serde(default)]
     pub playtime: Option<u64>,
-    #[serde(default)]
     pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FileItem {
-    #[serde(default)]
     pub media: Option<CdnMedia>,
-    #[serde(default)]
     pub file_name: Option<String>,
-    #[serde(default)]
     pub len: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OutboundMetadata {
     pub from_user_id: String,
-    #[serde(default)]
     pub to_user_id: Option<String>,
-    #[serde(default)]
     pub message_id: Option<i64>,
-    #[serde(default)]
     pub session_id: Option<String>,
-    #[serde(default)]
     pub context_token: Option<String>,
 }
 

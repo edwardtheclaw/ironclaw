@@ -16,7 +16,6 @@ const WECHAT_SILK_SAMPLE_RATE_HZ: i32 = 24_000;
 
 #[derive(Debug, Deserialize)]
 struct WechatAttachmentExtras {
-    #[serde(default)]
     wechat_aes_key: Option<String>,
 }
 

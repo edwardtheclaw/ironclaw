@@ -57,11 +57,8 @@ struct QrCodeResponse {
 #[derive(Debug, Clone, Deserialize)]
 struct QrStatusResponse {
     status: String,
-    #[serde(default)]
     bot_token: Option<String>,
-    #[serde(default)]
     ilink_bot_id: Option<String>,
-    #[serde(default)]
     baseurl: Option<String>,
 }
 
