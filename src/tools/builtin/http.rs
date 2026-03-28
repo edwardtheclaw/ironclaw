@@ -10,10 +10,10 @@ use futures::StreamExt;
 use reqwest::Client;
 
 use crate::context::JobContext;
-use crate::safety::LeakDetector;
 use crate::secrets::SecretsStore;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput, require_str};
 use crate::tools::wasm::{InjectedCredentials, SharedCredentialRegistry, inject_credential};
+use ironclaw_safety::LeakDetector;
 
 #[cfg(feature = "html-to-markdown")]
 use crate::tools::builtin::convert_html_to_markdown;
@@ -285,7 +285,7 @@ fn parse_headers_param(
     }
 
     match headers {
-        None => Ok(Vec::new()),
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
         Some(serde_json::Value::String(raw)) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -472,12 +472,7 @@ impl Tool for HttpTool {
         if let Some(registry) = self.credential_registry.as_ref() {
             let cred_host = parsed_url.host_str().unwrap_or("");
             if registry.has_credentials_for_host(cred_host) {
-                let forbidden: &[&str] = &[
-                    "authorization",
-                    "x-api-key",
-                    "api-key",
-                    "x-auth-token",
-                ];
+                let forbidden: &[&str] = &["authorization", "x-api-key", "api-key", "x-auth-token"];
                 for (name, _) in &headers_vec {
                     if forbidden.iter().any(|f| name.eq_ignore_ascii_case(f)) {
                         return Err(ToolError::NotAuthorized(format!(
@@ -516,8 +511,10 @@ impl Tool for HttpTool {
             request = request.header(key.as_str(), value.as_str());
         }
 
-        // Add body if present
-        let body_bytes = if let Some(body) = params.get("body") {
+        // Add body if present (skip null — Python's None becomes JSON null)
+        let body_bytes = if let Some(body) = params.get("body")
+            && !body.is_null()
+        {
             if let Some(body_str) = body.as_str() {
                 if body_str.is_empty() {
                     None
@@ -908,7 +905,7 @@ impl Tool for HttpTool {
     }
 
     fn requires_approval(&self, params: &serde_json::Value) -> ApprovalRequirement {
-        let has_credentials = crate::safety::params_contain_manual_credentials(params)
+        let has_credentials = ironclaw_safety::params_contain_manual_credentials(params)
             || (self.credential_registry.as_ref().is_some_and(|registry| {
                 extract_host_from_params(params)
                     .is_some_and(|host| registry.has_credentials_for_host(&host))
@@ -1582,12 +1579,18 @@ mod tests {
         assert!(registry.has_credentials_for_host(cred_host));
 
         let forbidden: &[&str] = &["authorization", "x-api-key", "api-key", "x-auth-token"];
-        let llm_headers = [("Authorization".to_string(), "Bearer stolen_token".to_string())];
+        let llm_headers = [(
+            "Authorization".to_string(),
+            "Bearer stolen_token".to_string(),
+        )];
 
-        let blocked = llm_headers.iter().any(|(name, _)| {
-            forbidden.iter().any(|f| name.eq_ignore_ascii_case(f))
-        });
-        assert!(blocked, "LLM-provided Authorization header should be blocked");
+        let blocked = llm_headers
+            .iter()
+            .any(|(name, _)| forbidden.iter().any(|f| name.eq_ignore_ascii_case(f)));
+        assert!(
+            blocked,
+            "LLM-provided Authorization header should be blocked"
+        );
     }
 
     #[test]
@@ -1607,9 +1610,9 @@ mod tests {
             ("Content-Type".to_string(), "application/json".to_string()),
         ];
 
-        let blocked = llm_headers.iter().any(|(name, _)| {
-            forbidden.iter().any(|f| name.eq_ignore_ascii_case(f))
-        });
+        let blocked = llm_headers
+            .iter()
+            .any(|(name, _)| forbidden.iter().any(|f| name.eq_ignore_ascii_case(f)));
         assert!(!blocked, "Non-auth headers should not be blocked");
     }
 

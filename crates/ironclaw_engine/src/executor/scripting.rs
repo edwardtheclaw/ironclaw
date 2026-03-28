@@ -1035,6 +1035,8 @@ async fn dispatch_action(
         )));
     }
 
+    let ps = crate::types::event::summarize_params(action_name, &params);
+
     match effects
         .execute_action(action_name, params, &lease, context)
         .await
@@ -1045,7 +1047,7 @@ async fn dispatch_action(
                 action_name: action_name.into(),
                 call_id: call_id.into(),
                 duration_ms: result.duration.as_millis() as u64,
-                params_summary: None,
+                params_summary: ps,
             });
             let monty_obj = json_to_monty(&result.output);
             action_results.push(result);
@@ -1064,7 +1066,7 @@ async fn dispatch_action(
                 action_name: action_name.into(),
                 call_id: call_id.into(),
                 error: e.to_string(),
-                params_summary: None,
+                params_summary: ps,
             });
             DispatchResult::Ok(ExtFunctionResult::Error(MontyException::new(
                 ExcType::RuntimeError,
