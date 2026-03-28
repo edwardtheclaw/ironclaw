@@ -400,7 +400,7 @@ impl HeartbeatRunner {
     }
 
     /// Send a notification about heartbeat findings.
-    pub(crate) async fn send_notification(&self, message: &str) {
+    async fn send_notification(&self, message: &str) {
         let Some(ref tx) = self.response_tx else {
             tracing::debug!("No response channel configured for heartbeat notifications");
             return;
@@ -512,8 +512,8 @@ pub fn spawn_heartbeat(
     })
 }
 
-/// Spawn a multi-user heartbeat runner that cycles through all users that
-/// own routines (enabled or not). Each tick, it queries the DB for distinct
+/// Spawn a multi-user heartbeat runner that cycles through all users who
+/// have routines (enabled or not). Each tick, it queries the DB for distinct
 /// user_ids, creates a per-user workspace, and runs a heartbeat check for
 /// each user concurrently. Per-user failure counts are tracked independently.
 pub fn spawn_multi_user_heartbeat(
@@ -574,8 +574,10 @@ pub fn spawn_multi_user_heartbeat(
                 }
             };
 
-            // Run user heartbeats concurrently so one slow LLM call doesn't
-            // block others. Cap concurrency to avoid flooding the LLM provider.
+            // Run user heartbeats (and hygiene) concurrently so one slow LLM
+            // call doesn't block others. Cap concurrency to avoid flooding the
+            // LLM provider. Hygiene runs inside the same JoinSet so it is
+            // tracked and bounded by the same concurrency cap.
             const MAX_CONCURRENT_HEARTBEATS: usize = 8;
             let mut join_set = tokio::task::JoinSet::new();
 
@@ -613,13 +615,30 @@ pub fn spawn_multi_user_heartbeat(
                 }
 
                 let uid = user_id.clone();
-                let cfg = config.clone();
+                // In multi-tenant mode, clear notify_user_id so that
+                // HeartbeatRunner::send_notification falls back to
+                // workspace.user_id() — each user's heartbeat should persist
+                // and notify that user, not the shared config target.
+                let mut cfg = config.clone();
+                cfg.notify_user_id = None;
                 let hyg = hygiene_config.clone();
                 let llm_clone = llm.clone();
                 let tx = response_tx.clone();
                 let admin = store.clone();
 
                 join_set.spawn(async move {
+                    // Run memory hygiene per user (same as single-user heartbeat)
+                    // inside the tracked task so concurrency is bounded.
+                    let report = crate::workspace::hygiene::run_if_due(&workspace, &hyg).await;
+                    if report.had_work() {
+                        tracing::info!(
+                            user_id = uid,
+                            directories_cleaned = ?report.directories_cleaned,
+                            versions_pruned = report.versions_pruned,
+                            "multi-user heartbeat: memory hygiene deleted stale documents"
+                        );
+                    }
+
                     let mut runner = HeartbeatRunner::new(cfg, hyg, workspace, llm_clone);
                     if let Some(tx) = tx {
                         runner = runner.with_response_channel(tx);
