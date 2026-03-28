@@ -127,7 +127,8 @@ impl Agent {
         let mut reasoning = Reasoning::new(self.llm().clone())
             .with_channel(message.channel.clone())
             .with_model_name(self.llm().active_model_name())
-            .with_group_chat(is_group_chat);
+            .with_group_chat(is_group_chat)
+            .with_platform_info(self.platform_info().await);
 
         // Pass channel-specific conversation context to the LLM.
         // This helps the agent know who/group it's talking to.

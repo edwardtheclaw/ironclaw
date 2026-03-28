@@ -55,6 +55,7 @@ pub use capability::registry::CapabilityRegistry;
 
 // ── Re-exports: runtime ───────────────────────────────────────
 
+pub use executor::prompt::PlatformInfo;
 pub use runtime::conversation::ConversationManager;
 pub use runtime::manager::ThreadManager;
 pub use runtime::messaging::ThreadOutcome;

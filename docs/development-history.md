@@ -158,6 +158,42 @@ Users reported `"No lease for action 'routine_create'"` when asking the engine t
 
 **Fix**: Registered `mission_create`, `mission_list`, `mission_fire`, `mission_pause`, `mission_resume`, `mission_delete` as a `"missions"` capability in `router.rs`. Descriptions mention "routine" so the LLM maps user intent correctly. Removed all `routine_*` aliases from the effect adapter — `routine_*` names added to `is_v1_only_tool()` blocklist with clear error directing to `mission_*`.
 
+## Session 9: Trace Pipeline Fix, Monty Builtins, Self-Awareness (2026-03-28)
+
+Three fixes driven by analyzing a live engine trace (`engine_trace_20260328T030519.json`) from the hourly Iran-region monitor mission.
+
+### Event Pipeline Loss in CodeAct
+
+**The bug**: The `no_tools_used` trace issue fired as a false positive — the mission thread called `web_search` 5 times, `llm_context` once, and `llm_query` once, yet the trace had zero `ActionExecuted` events.
+
+**Root cause**: `handle_execute_code_step()` in `orchestrator.rs` received `CodeExecutionResult::events` (populated by `dispatch_action()` in `scripting.rs`) but never transferred them to `thread.events` or broadcast them via `event_tx`. The function took `&Thread` (immutable) and had no access to the event broadcast channel. Compare with `handle_execute_action()` which correctly calls `emit_and_record()` for each action.
+
+**Fix**: Changed `handle_execute_code_step()` to take `&mut Thread` + `event_tx`, iterate over `result.events`, push each to `thread.events` and broadcast via `event_tx` — same pattern as `handle_execute_action()`. The `no_tools_used` detector in `trace.rs` now works correctly for CodeAct because `ActionExecuted` events are present.
+
+### globals() NameError in Monty
+
+**The bug**: LLM-generated code used `"mission_create" in globals()` to probe available capabilities before calling them. Monty doesn't implement `globals()` as a builtin, so NameLookup returned `Undefined` → NameError → code execution failure.
+
+**Fix**: Added `globals`/`locals` to the NameLookup handler as callable function stubs, and a FunctionCall handler that returns a `Dict` of all known action names (from capability leases) as keys. Code like `"tool_name" in globals()` now works for capability probing.
+
+### Platform Self-Awareness
+
+**The problem**: The agent had no knowledge of its own identity. It didn't know it was IronClaw, its GitHub repo, its version, active channels, LLM backend, or database. The system prompt just said "You are IronClaw Agent, a secure autonomous assistant" with no specifics.
+
+**The insight**: Identity infrastructure was 85% built — `IDENTITY.md`, `SOUL.md`, `USER.md`, `AGENTS.md` injection worked for *user* identity. But nothing existed for *platform* identity. This isn't workspace-level (it changes with runtime config), so a seed file was wrong — it needed to be injected dynamically.
+
+**Implementation** (8 files):
+
+1. **`PlatformInfo` struct** (`executor/prompt.rs`) — version, llm_backend, model_name, database_backend, active_channels, owner_id, repo_url. `to_prompt_section()` renders a `## Platform` block.
+
+2. **CodeAct path** — `build_codeact_system_prompt()` accepts optional `PlatformInfo`, injects before tool listing.
+
+3. **Tier 0 path** — `Reasoning` struct gets `with_platform_info()` builder, `build_runtime_section()` prepends the platform block.
+
+4. **Runtime wiring** — `Agent::platform_info()` constructs from `AgentDeps` (version from `CARGO_PKG_VERSION`, backend/model/owner from deps, channels from `ChannelManager`).
+
+**Test coverage**: 2 new tests (platform info injection + absence). 195 engine tests pass, zero clippy warnings.
+
 ## Architecture Evolution
 
 ```
@@ -171,6 +207,8 @@ Session 7:    Integration scaling: Capabilities as knowledge → http action
               (not Pica-style per-action tools — tool list bloat kills LLM accuracy)
 Session 8:    Skills-based OAuth (credential specs in YAML frontmatter)
               + HTTP tool zero-leak hardening + mission capability leases
+Session 9:    CodeAct event pipeline fix (ActionExecuted events were lost)
+              + Monty globals() builtin + platform self-awareness injection
 ```
 
 ## Key Commits

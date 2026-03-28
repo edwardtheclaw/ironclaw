@@ -50,6 +50,8 @@ pub struct ExecutionLoop {
     retrieval: Option<crate::memory::RetrievalEngine>,
     /// Optional Store for runtime prompt overlay loading and skill retrieval.
     store: Option<Arc<dyn crate::traits::store::Store>>,
+    /// Runtime platform metadata for self-awareness in system prompts.
+    platform_info: Option<crate::executor::prompt::PlatformInfo>,
 }
 
 impl ExecutionLoop {
@@ -74,6 +76,7 @@ impl ExecutionLoop {
             event_tx: None,
             retrieval: None,
             store: None,
+            platform_info: None,
         }
     }
 
@@ -104,6 +107,12 @@ impl ExecutionLoop {
     /// Set the Store for runtime prompt overlay loading and skill retrieval.
     pub fn with_store(mut self, store: Arc<dyn crate::traits::store::Store>) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Set platform metadata for self-awareness in system prompts.
+    pub fn with_platform_info(mut self, info: crate::executor::prompt::PlatformInfo) -> Self {
+        self.platform_info = Some(info);
         self
     }
 
@@ -232,6 +241,7 @@ impl ExecutionLoop {
                 &actions,
                 self.store.as_ref(),
                 self.thread.project_id,
+                self.platform_info.as_ref(),
             )
             .await;
 

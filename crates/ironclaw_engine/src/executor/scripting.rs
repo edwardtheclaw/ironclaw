@@ -437,6 +437,21 @@ pub async fn execute_code_with_skills(
                         .await
                     }
 
+                    // globals() / locals() — return dict with known names so
+                    // `"tool_name" in globals()` works for capability probing
+                    "globals" | "locals" => {
+                        let entries: Vec<(MontyObject, MontyObject)> = known_actions
+                            .iter()
+                            .map(|name| {
+                                (
+                                    MontyObject::String(name.clone()),
+                                    MontyObject::Bool(true),
+                                )
+                            })
+                            .collect();
+                        ExtFunctionResult::Return(MontyObject::Dict(entries.into()))
+                    }
+
                     // Regular tool dispatch
                     _ => {
                         let dispatch = dispatch_action(
@@ -514,6 +529,13 @@ pub async fn execute_code_with_skills(
                 // executor) instead of raising NameError.
                 let result = if known_actions.contains(&name) {
                     debug!(name = %name, "Monty: resolved as tool function");
+                    NameLookupResult::Value(MontyObject::Function {
+                        name: name.clone(),
+                        docstring: None,
+                    })
+                } else if name == "globals" || name == "locals" {
+                    // Python builtins for namespace introspection — resolve as
+                    // callable so code like `"tool" in globals()` works.
                     NameLookupResult::Value(MontyObject::Function {
                         name: name.clone(),
                         docstring: None,

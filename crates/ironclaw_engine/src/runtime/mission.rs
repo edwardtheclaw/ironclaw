@@ -604,6 +604,21 @@ impl MissionManager {
         )
         .await?;
 
+        // 4. Expected behavior (user feedback loop)
+        self.ensure_mission_by_metadata(
+            project_id,
+            "expected_behavior",
+            "expected-behavior",
+            EXPECTED_BEHAVIOR_GOAL,
+            MissionCadence::OnSystemEvent {
+                source: "user_feedback".into(),
+                event_type: "expected_behavior".into(),
+            },
+            "Investigate user-reported expectation gaps and apply fixes",
+            5, // max 5/day
+        )
+        .await?;
+
         Ok(())
     }
 
@@ -1013,85 +1028,8 @@ fn extract_json_from_response(response: &str) -> Option<serde_json::Value> {
 /// This is the "program.md" — a concrete, step-by-step prompt that tells the
 /// agent exactly what to do. Inspired by karpathy/autoresearch: the entire
 /// research org is a markdown file with an explicit loop.
-const SELF_IMPROVEMENT_GOAL: &str = "\
-You are a self-improvement agent for the IronClaw engine. You receive trigger \
-payloads containing execution trace issues from completed threads. Your job is \
-to diagnose root causes and apply fixes so the same issue doesn't recur.
-
-## What you have access to
-
-- `state[\"trigger_payload\"]` — JSON with `issues` (list of {severity, category, description, step}), \
-  `error_messages` (actual error text from failed actions), `goal` (what the thread was trying to do), \
-  and `source_thread_id`.
-- All tools: shell, read_file, write_file, apply_patch, web_search, memory_write, etc.
-- The codebase at the current working directory.
-- The fix pattern database in prior knowledge (if loaded).
-
-## The experiment loop
-
-For each issue in the trigger payload:
-
-1. **Diagnose**: Read the error messages and issue descriptions. Classify the root cause:
-   - PROMPT: The LLM made a mistake because the system prompt is missing a rule \
-     (wrong tool name, bad API usage, ignoring tool results)
-   - CONFIG: A default value is wrong (truncation length, iteration limit, timeout)
-   - CODE: There is a bug in the engine or bridge code (crash, type error, missing conversion)
-
-2. **Check the fix pattern database** in prior knowledge. Has this pattern been seen before? \
-   If yes, apply the known strategy. If no, proceed to step 3.
-
-3. **Apply the fix** based on the level:
-
-   Level 1 (PROMPT — low risk, apply directly):
-   - Read the current prompt overlay: `memory_search(\"prompt:codeact_preamble\")`
-   - Write an updated overlay with a new rule appended
-   - Use `memory_write` with title=\"prompt:codeact_preamble\" and tags=[\"prompt_overlay\"]
-   - The rule should be specific and actionable (e.g. \"Never call web_fetch — use http() instead\")
-
-   Level 2 (CONFIG — medium risk):
-   - Use `read_file` to find the relevant constant or default
-   - Use `shell` to create a git branch: `git checkout -b self-improve/issue-description`
-   - Apply the change with `apply_patch` or `write_file`
-   - Run tests: `cargo test -p ironclaw_engine`
-   - If tests pass, commit. If not, revert: `git checkout main`
-
-   Level 3 (CODE — high risk, just propose):
-   - Read the relevant source files
-   - Describe the fix needed but DO NOT apply it directly
-   - Log it as a recommendation in your FINAL() response
-
-4. **Record what you did** — include in your FINAL() response:
-   - What issue you analyzed
-   - What level fix you applied (1/2/3)
-   - What specific change you made
-   - Next focus: what to look for next time
-
-## Important rules
-
-- Be specific. \"Never call web_fetch\" is good. \"Be careful with tool names\" is useless.
-- One fix per issue. Don't try to fix everything at once.
-- For Level 1 fixes, the rule must be one sentence that can be appended to the prompt.
-- If the trigger payload has no actionable issues (only Info severity), skip and call FINAL() immediately.
-- NEVER modify test files to make a fix pass.
-- NEVER modify security-sensitive code (safety layer, policy engine, leak detection).
-- If you can't diagnose the root cause after reading the errors, log it and move on.
-
-## Level 1.5: Orchestrator patches (medium risk, auto-rollback)
-
-The execution loop itself is Python code that you can modify. This is the \
-orchestrator — it handles tool dispatch, output formatting, state management, \
-and context building. If the bug is in the glue between the LLM and tools \
-(wrong output format, bad truncation, missing state), you can patch it directly.
-
-To modify the orchestrator:
-1. Read current version: `memory_search(\"orchestrator:main\")`
-2. Make your change (keep it minimal — one fix at a time)
-3. Save the new version: `memory_write` with title=\"orchestrator:main\", \
-   tags=[\"orchestrator_code\"], metadata={\"version\": N+1, \"parent_version\": N}
-4. The next thread will use your updated orchestrator
-
-If your change causes 3 consecutive failures, the system auto-rolls back to \
-the previous version. So be conservative — test your logic mentally before saving.";
+const SELF_IMPROVEMENT_GOAL: &str =
+    include_str!("../../prompts/mission_self_improvement.md");
 
 /// Well-known title for the fix pattern database.
 pub const FIX_PATTERN_DB_TITLE: &str = "fix_pattern_database";
@@ -1100,124 +1038,16 @@ pub const FIX_PATTERN_DB_TITLE: &str = "fix_pattern_database";
 pub const FIX_PATTERN_DB_TAG: &str = "fix_patterns";
 
 /// The goal for the skill extraction mission.
-const SKILL_EXTRACTION_GOAL: &str = "\
-You extract reusable skills from successfully completed multi-step threads.
-
-## Input
-
-`state[\"trigger_payload\"]` contains:
-- `source_thread_id` — the thread that completed successfully
-- `goal` — what the thread accomplished
-- `step_count` — number of execution steps
-- `action_count` — number of tool actions executed
-- `actions_used` — list of tool names used
-- `total_tokens` — tokens consumed
-
-## Output Format
-
-Save as a Skill memory doc via `memory_write(target=\"memory\", content=skill_prompt)` with:
-- title: `\"skill:<short-name>\"` (e.g., \"skill:github-issue-triage\")
-- doc_type: `\"skill\"`
-- metadata JSON:
-  ```json
-  {
-    \"name\": \"<short-name>\",
-    \"version\": 1,
-    \"description\": \"<one-line description>\",
-    \"activation\": {
-      \"keywords\": [\"<keyword1>\", \"<keyword2>\"],
-      \"patterns\": [\"<optional regex>\"],
-      \"tags\": [\"<domain-tag>\"],
-      \"exclude_keywords\": [],
-      \"max_context_tokens\": <estimated budget, e.g. 1000>
-    },
-    \"source\": \"extracted\",
-    \"trust\": \"trusted\",
-    \"code_snippets\": [
-      {
-        \"name\": \"<function_name>\",
-        \"code\": \"def <function_name>(...):\\n    ...\",
-        \"description\": \"<what it does>\"
-      }
-    ],
-    \"metrics\": {\"usage_count\": 0, \"success_count\": 0, \"failure_count\": 0},
-    \"content_hash\": \"\"
-  }
-  ```
-
-## Process
-
-1. Search for the source thread's context: `memory_search(query=goal)`
-2. Check for existing skills: `memory_search(query=\"skill:\")`
-3. If a similar skill exists, update it (increment version) rather than creating a duplicate
-4. Extract:
-   - Activation keywords from the goal + user messages (be specific, not generic)
-   - Step-by-step instructions as the prompt content
-   - Python code snippets for CodeAct (reusable functions using exact tool names)
-   - Domain tags (e.g., \"github\", \"api\", \"data\")
-
-## Output (FINAL)
-
-Report what you did:
-- The skill title and a one-line summary
-- Whether it is new or an update to an existing skill
-- Next focus: what patterns to watch for
-
-## Rules
-
-- Only extract skills from threads with 3+ distinct tool calls
-- Keywords must be specific (not generic words like \"help\", \"do\", \"make\")
-- Code snippets must use exact tool function names as they appear in the thread
-- If the thread was a trivial query-response, call FINAL(\"No skill needed — simple interaction\") \
-  and stop immediately
-- One skill per FINAL — do not combine unrelated procedures
-";
+const SKILL_EXTRACTION_GOAL: &str =
+    include_str!("../../prompts/mission_skill_extraction.md");
 
 /// The goal for the conversation insights mission.
-const CONVERSATION_INSIGHTS_GOAL: &str = "\
-You extract user preferences, patterns, and domain knowledge from a batch of recent \
-conversation threads.
+const CONVERSATION_INSIGHTS_GOAL: &str =
+    include_str!("../../prompts/mission_conversation_insights.md");
 
-## Input
-
-`state[\"trigger_payload\"]` contains:
-- `project_id` — the project scope
-- `completed_thread_count` — total threads completed in this conversation
-- `thread_goals` — list of recent thread goals (what the user asked for)
-- `sample_user_messages` — sample of actual user messages (truncated to 200 chars)
-
-## Process
-
-1. Analyze the thread goals and user messages for patterns
-2. Search existing insights: `memory_search(query=\"user preferences\")` and \
-   `memory_search(query=\"domain knowledge\")`
-3. Extract NEW insights not already recorded in memory
-4. Write each insight to memory via `memory_write(target=\"memory\", content=insight_text)` \
-   with title format \"insight:<category>:<topic>\"
-
-## Categories to look for
-
-- **Preferences**: communication style, format choices, tool preferences
-- **Domain**: project names, API patterns, data formats, technology stack
-- **Workflow**: recurring task sequences, common follow-up questions
-- **Corrections**: things the user corrected or repeated — these signal unmet expectations
-
-## Output (FINAL)
-
-Report:
-- Number of new insights extracted (0 is fine)
-- Brief list of what was found
-- Next focus
-
-## Rules
-
-- Only record actionable, specific insights — not vague observations
-- Do not record personal information, only work patterns
-- If no meaningful new insights after analysis, call FINAL(\"No new insights — \
-  conversation patterns already captured\") immediately
-- Merge with existing insight docs rather than creating duplicates
-- Max 5 insights per run to keep quality high
-";
+/// The goal for the expected-behavior mission (user feedback loop).
+const EXPECTED_BEHAVIOR_GOAL: &str =
+    include_str!("../../prompts/mission_expected_behavior.md");
 
 /// Seed content for the fix pattern database.
 const SEED_FIX_PATTERNS: &str = "\

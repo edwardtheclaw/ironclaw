@@ -334,8 +334,10 @@ pub async fn execute_orchestrator(
 
                     // __execute_code_step__(code, state)
                     "__execute_code_step__" => {
-                        handle_execute_code_step(args, kwargs, thread, llm, effects, leases, policy)
-                            .await
+                        handle_execute_code_step(
+                            args, kwargs, thread, llm, effects, leases, policy, event_tx,
+                        )
+                        .await
                     }
 
                     // __execute_action__(name, params, call_id=...)
@@ -539,14 +541,16 @@ async fn handle_llm_complete(
 ///
 /// Runs user CodeAct code in a nested Monty VM with full tool dispatch.
 /// Returns a dict with stdout, return_value, action_results, etc.
+#[allow(clippy::too_many_arguments)]
 async fn handle_execute_code_step(
     args: &[MontyObject],
     _kwargs: &[(MontyObject, MontyObject)],
-    thread: &Thread,
+    thread: &mut Thread,
     llm: &Arc<dyn LlmBackend>,
     effects: &Arc<dyn EffectExecutor>,
     leases: &Arc<LeaseManager>,
     policy: &Arc<PolicyEngine>,
+    event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
 ) -> ExtFunctionResult {
     let code = match args.first() {
         Some(obj) => monty_to_string(obj),
@@ -586,6 +590,18 @@ async fn handle_execute_code_step(
     .await
     {
         Ok(result) => {
+            // Broadcast events from code execution to the thread and event channel.
+            // Without this, ActionExecuted events from CodeAct tool calls are lost
+            // and never appear in traces.
+            for event_kind in &result.events {
+                let event = ThreadEvent::new(thread.id, event_kind.clone());
+                if let Some(tx) = event_tx {
+                    let _ = tx.send(event.clone());
+                }
+                thread.events.push(event);
+            }
+            thread.updated_at = chrono::Utc::now();
+
             let action_results: Vec<serde_json::Value> = result
                 .action_results
                 .iter()

@@ -14,6 +14,64 @@ use crate::traits::store::Store;
 use crate::types::capability::ActionDef;
 use crate::types::project::ProjectId;
 
+/// Runtime platform metadata injected into system prompts for self-awareness.
+///
+/// Provides the agent with knowledge about its own identity and environment
+/// so it can answer questions about itself, its capabilities, and its
+/// configuration without relying on training data.
+#[derive(Debug, Clone, Default)]
+pub struct PlatformInfo {
+    /// Software version (from CARGO_PKG_VERSION).
+    pub version: Option<String>,
+    /// LLM backend name (e.g. "nearai", "openai", "anthropic").
+    pub llm_backend: Option<String>,
+    /// Active model name.
+    pub model_name: Option<String>,
+    /// Database backend (e.g. "libsql", "postgres").
+    pub database_backend: Option<String>,
+    /// Active channel names (e.g. ["telegram", "cli"]).
+    pub active_channels: Vec<String>,
+    /// Owner identifier.
+    pub owner_id: Option<String>,
+    /// Project repository URL.
+    pub repo_url: Option<String>,
+}
+
+impl PlatformInfo {
+    /// Format as a prompt section. Returns empty string if no info is set.
+    pub fn to_prompt_section(&self) -> String {
+        let mut lines = Vec::new();
+
+        lines.push("You are **IronClaw**, a secure autonomous AI assistant platform.".into());
+        if let Some(ref v) = self.version {
+            lines.push(format!("- Version: {v}"));
+        }
+        if let Some(ref repo) = self.repo_url {
+            lines.push(format!("- Repository: {repo}"));
+        }
+        if let Some(ref owner) = self.owner_id {
+            lines.push(format!("- Owner: {owner}"));
+        }
+        if let Some(ref backend) = self.llm_backend {
+            let model = self.model_name.as_deref().unwrap_or("default");
+            lines.push(format!("- LLM: {backend} ({model})"));
+        }
+        if let Some(ref db) = self.database_backend {
+            lines.push(format!("- Database: {db}"));
+        }
+        if !self.active_channels.is_empty() {
+            lines.push(format!("- Channels: {}", self.active_channels.join(", ")));
+        }
+
+        if lines.len() <= 1 {
+            // Only the identity line, no runtime details — still include it
+            return format!("\n\n## Platform\n\n{}\n", lines[0]);
+        }
+
+        format!("\n\n## Platform\n\n{}\n", lines.join("\n"))
+    }
+}
+
 /// The main instruction block (before tool listing).
 const CODEACT_PREAMBLE: &str = include_str!("../../prompts/codeact_preamble.md");
 
@@ -46,8 +104,14 @@ pub async fn build_codeact_system_prompt(
     actions: &[ActionDef],
     store: Option<&Arc<dyn Store>>,
     project_id: ProjectId,
+    platform: Option<&PlatformInfo>,
 ) -> String {
     let mut prompt = String::from(CODEACT_PREAMBLE);
+
+    // Inject platform identity and runtime metadata
+    if let Some(info) = platform {
+        prompt.push_str(&info.to_prompt_section());
+    }
 
     // Append runtime prompt overlay if available
     if let Some(store) = store
@@ -102,7 +166,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_without_store_uses_compiled_preamble() {
-        let prompt = build_codeact_system_prompt(&[], None, ProjectId(uuid::Uuid::nil())).await;
+        let prompt = build_codeact_system_prompt(&[], None, ProjectId(uuid::Uuid::nil()), None).await;
         assert!(prompt.contains("Python REPL environment"));
         assert!(prompt.contains("Strategy"));
         assert!(!prompt.contains("Learned Rules"));
@@ -126,7 +190,7 @@ mod tests {
 
         let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![overlay]));
         let prompt =
-            build_codeact_system_prompt(&[], Some(&(store as Arc<dyn Store>)), project_id).await;
+            build_codeact_system_prompt(&[], Some(&(store as Arc<dyn Store>)), project_id, None).await;
         assert!(prompt.contains("Learned Rules"));
         assert!(prompt.contains("Never call web_fetch"));
     }
@@ -152,7 +216,7 @@ mod tests {
 
         let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![overlay]));
         let prompt =
-            build_codeact_system_prompt(&[], Some(&(store as Arc<dyn Store>)), project_id).await;
+            build_codeact_system_prompt(&[], Some(&(store as Arc<dyn Store>)), project_id, None).await;
 
         let snowman_count = prompt.chars().filter(|c| *c == '\u{2603}').count();
         assert_eq!(snowman_count, MAX_PROMPT_OVERLAY_CHARS);
@@ -177,8 +241,43 @@ mod tests {
 
         let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![overlay]));
         let prompt =
-            build_codeact_system_prompt(&[], Some(&(store as Arc<dyn Store>)), project_id).await;
+            build_codeact_system_prompt(&[], Some(&(store as Arc<dyn Store>)), project_id, None).await;
         assert!(!prompt.contains("Should not appear"));
         assert!(!prompt.contains("Learned Rules"));
+    }
+
+    #[tokio::test]
+    async fn prompt_with_platform_info_injects_identity() {
+        let info = PlatformInfo {
+            version: Some("1.2.3".into()),
+            llm_backend: Some("nearai".into()),
+            model_name: Some("qwen3-235b".into()),
+            database_backend: Some("libsql".into()),
+            active_channels: vec!["telegram".into(), "cli".into()],
+            owner_id: Some("alice.near".into()),
+            repo_url: Some("https://github.com/nearai/ironclaw".into()),
+        };
+        let prompt = build_codeact_system_prompt(
+            &[],
+            None,
+            ProjectId(uuid::Uuid::nil()),
+            Some(&info),
+        )
+        .await;
+        assert!(prompt.contains("IronClaw"));
+        assert!(prompt.contains("1.2.3"));
+        assert!(prompt.contains("nearai"));
+        assert!(prompt.contains("qwen3-235b"));
+        assert!(prompt.contains("libsql"));
+        assert!(prompt.contains("telegram"));
+        assert!(prompt.contains("alice.near"));
+        assert!(prompt.contains("github.com/nearai/ironclaw"));
+    }
+
+    #[tokio::test]
+    async fn prompt_without_platform_info_has_no_platform_section() {
+        let prompt =
+            build_codeact_system_prompt(&[], None, ProjectId(uuid::Uuid::nil()), None).await;
+        assert!(!prompt.contains("## Platform"));
     }
 }

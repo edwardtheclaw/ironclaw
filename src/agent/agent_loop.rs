@@ -203,6 +203,9 @@ pub struct Agent {
     /// the engine to gateway/manual trigger entry points.
     pub(super) routine_engine_slot:
         Arc<tokio::sync::RwLock<Option<Arc<crate::agent::routine_engine::RoutineEngine>>>>,
+    /// Engine v2 mission manager for firing learning missions (set after engine init).
+    pub(crate) mission_manager_slot:
+        Arc<tokio::sync::RwLock<Option<Arc<ironclaw_engine::MissionManager>>>>,
 }
 
 impl Agent {
@@ -274,6 +277,7 @@ impl Agent {
             hygiene_config,
             routine_config,
             routine_engine_slot: Arc::new(tokio::sync::RwLock::new(None)),
+            mission_manager_slot: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -286,8 +290,19 @@ impl Agent {
         self.routine_engine_slot = slot;
     }
 
-    async fn routine_engine(&self) -> Option<Arc<crate::agent::routine_engine::RoutineEngine>> {
+    pub(super) async fn routine_engine(&self) -> Option<Arc<crate::agent::routine_engine::RoutineEngine>> {
         self.routine_engine_slot.read().await.clone()
+    }
+
+    /// Set the engine v2 mission manager (called after engine init).
+    pub async fn set_mission_manager(&self, mgr: Arc<ironclaw_engine::MissionManager>) {
+        *self.mission_manager_slot.write().await = Some(mgr);
+    }
+
+    pub(crate) async fn mission_manager(
+        &self,
+    ) -> Option<Arc<ironclaw_engine::MissionManager>> {
+        self.mission_manager_slot.read().await.clone()
     }
 
     // Convenience accessors
@@ -324,6 +339,23 @@ impl Agent {
 
     pub(crate) fn hooks(&self) -> &Arc<HookRegistry> {
         &self.deps.hooks
+    }
+
+    /// Build platform metadata for self-awareness in system prompts.
+    pub(crate) async fn platform_info(&self) -> ironclaw_engine::PlatformInfo {
+        let active_channels = self.channels.channel_names().await;
+        let database_backend = std::env::var("DATABASE_BACKEND")
+            .ok()
+            .or_else(|| self.deps.store.as_ref().map(|_| "postgres".to_string()));
+        ironclaw_engine::PlatformInfo {
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            llm_backend: Some(self.deps.llm_backend.clone()),
+            model_name: Some(self.deps.llm.active_model_name()),
+            database_backend,
+            active_channels,
+            owner_id: Some(self.deps.owner_id.clone()),
+            repo_url: Some("https://github.com/nearai/ironclaw".to_string()),
+        }
     }
 
     pub(super) fn cost_guard(&self) -> &Arc<crate::agent::cost_guard::CostGuard> {
@@ -1456,6 +1488,10 @@ impl Agent {
             Submission::Heartbeat => self.process_heartbeat().await,
             Submission::Summarize => self.process_summarize(session, thread_id).await,
             Submission::Suggest => self.process_suggest(session, thread_id).await,
+            Submission::Expected { description } => {
+                self.process_expected(session, thread_id, &description, &message.user_id)
+                    .await
+            }
             Submission::JobStatus { job_id } => {
                 self.process_job_status(&tenant, job_id.as_deref()).await
             }
