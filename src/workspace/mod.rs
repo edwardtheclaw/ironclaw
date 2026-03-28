@@ -53,8 +53,9 @@ mod search;
 
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{
-    IDENTITY_PATHS, MemoryChunk, MemoryDocument, WorkspaceEntry, is_identity_path,
-    merge_workspace_entries, paths,
+    CONFIG_FILE_NAME, DocumentMetadata, DocumentVersion, HygieneMetadata, IDENTITY_PATHS,
+    MemoryChunk, MemoryDocument, PatchResult, VersionSummary, WorkspaceEntry, content_sha256,
+    is_config_path, is_identity_path, merge_workspace_entries, paths,
 };
 pub use embedding_cache::{CachedEmbeddingProvider, EmbeddingCacheConfig};
 pub use embeddings::{
@@ -364,6 +365,101 @@ impl WorkspaceStorage {
                 db.get_document_by_path_multi(user_ids, agent_id, path)
                     .await
             }
+        }
+    }
+
+    // ==================== Metadata ====================
+
+    async fn update_document_metadata(
+        &self,
+        id: Uuid,
+        metadata: &serde_json::Value,
+    ) -> Result<(), WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => repo.update_document_metadata(id, metadata).await,
+            Self::Db(db) => db.update_document_metadata(id, metadata).await,
+        }
+    }
+
+    async fn find_config_documents(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => repo.find_config_documents(user_id, agent_id).await,
+            Self::Db(db) => db.find_config_documents(user_id, agent_id).await,
+        }
+    }
+
+    // ==================== Versioning ====================
+
+    async fn save_version(
+        &self,
+        document_id: Uuid,
+        content: &str,
+        content_hash: &str,
+        changed_by: Option<&str>,
+    ) -> Result<i32, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => {
+                repo.save_version(document_id, content, content_hash, changed_by)
+                    .await
+            }
+            Self::Db(db) => {
+                db.save_version(document_id, content, content_hash, changed_by)
+                    .await
+            }
+        }
+    }
+
+    async fn get_version(
+        &self,
+        document_id: Uuid,
+        version: i32,
+    ) -> Result<DocumentVersion, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => repo.get_version(document_id, version).await,
+            Self::Db(db) => db.get_version(document_id, version).await,
+        }
+    }
+
+    async fn list_versions(
+        &self,
+        document_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<VersionSummary>, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => repo.list_versions(document_id, limit).await,
+            Self::Db(db) => db.list_versions(document_id, limit).await,
+        }
+    }
+
+    async fn get_latest_version_number(
+        &self,
+        document_id: Uuid,
+    ) -> Result<Option<i32>, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => repo.get_latest_version_number(document_id).await,
+            Self::Db(db) => db.get_latest_version_number(document_id).await,
+        }
+    }
+
+    async fn prune_versions(
+        &self,
+        document_id: Uuid,
+        keep_count: i32,
+    ) -> Result<u64, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => repo.prune_versions(document_id, keep_count).await,
+            Self::Db(db) => db.prune_versions(document_id, keep_count).await,
         }
     }
 }
@@ -696,10 +792,199 @@ impl Workspace {
             .await
     }
 
+    // ==================== Metadata ====================
+
+    /// Update the metadata JSON on a document by ID (full replacement).
+    pub async fn update_metadata(
+        &self,
+        id: Uuid,
+        metadata: &serde_json::Value,
+    ) -> Result<(), WorkspaceError> {
+        self.storage.update_document_metadata(id, metadata).await
+    }
+
+    /// Prune old versions for a document, keeping only the most recent `keep_count`.
+    ///
+    /// Returns the number of versions deleted.
+    pub async fn prune_versions(
+        &self,
+        document_id: Uuid,
+        keep_count: i32,
+    ) -> Result<u64, WorkspaceError> {
+        self.storage.prune_versions(document_id, keep_count).await
+    }
+
+    /// Find all `.config` documents in this workspace scope.
+    pub async fn find_config_documents(&self) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        self.storage
+            .find_config_documents(&self.user_id, self.agent_id)
+            .await
+    }
+
+    /// Resolve effective metadata for a document path.
+    ///
+    /// Resolution chain: document's own metadata → nearest ancestor `.config` → defaults.
+    pub async fn resolve_metadata(&self, path: &str) -> DocumentMetadata {
+        // 1. Document's own metadata
+        let doc_meta = self
+            .storage
+            .get_document_by_path(&self.user_id, self.agent_id, path)
+            .await
+            .ok()
+            .map(|d| d.metadata);
+
+        // 2. Walk up parent directories looking for .config
+        let mut config_meta = None;
+        let normalized = normalize_path(path);
+        let mut current = normalized.as_str();
+        while let Some(slash_pos) = current.rfind('/') {
+            let parent = &current[..slash_pos];
+            let config_path = format!("{}/{CONFIG_FILE_NAME}", parent);
+            if let Ok(doc) = self
+                .storage
+                .get_document_by_path(&self.user_id, self.agent_id, &config_path)
+                .await
+            {
+                config_meta = Some(doc.metadata);
+                break;
+            }
+            current = parent;
+        }
+        // Also check root-level .config
+        if config_meta.is_none()
+            && let Ok(doc) = self
+                .storage
+                .get_document_by_path(&self.user_id, self.agent_id, CONFIG_FILE_NAME)
+                .await
+        {
+            config_meta = Some(doc.metadata);
+        }
+
+        // 3. Merge: config as base, document metadata as overlay
+        let base = config_meta.unwrap_or(serde_json::json!({}));
+        let overlay = doc_meta.unwrap_or(serde_json::json!({}));
+        let merged = DocumentMetadata::merge(&base, &overlay);
+        DocumentMetadata::from_value(&merged)
+    }
+
+    // ==================== Versioning ====================
+
+    /// List versions of a document (newest first).
+    pub async fn list_versions(
+        &self,
+        document_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<VersionSummary>, WorkspaceError> {
+        self.storage.list_versions(document_id, limit).await
+    }
+
+    /// Get a specific version of a document.
+    pub async fn get_version(
+        &self,
+        document_id: Uuid,
+        version: i32,
+    ) -> Result<DocumentVersion, WorkspaceError> {
+        self.storage.get_version(document_id, version).await
+    }
+
+    /// Save the current content as a version if it differs from the latest.
+    ///
+    /// Returns the new version number, or `None` if skipped (empty content,
+    /// identical hash, or versioning disabled via metadata).
+    async fn maybe_save_version(
+        &self,
+        document_id: Uuid,
+        current_content: &str,
+        path: &str,
+        changed_by: Option<&str>,
+    ) -> Result<Option<i32>, WorkspaceError> {
+        // Don't version empty documents
+        if current_content.is_empty() {
+            return Ok(None);
+        }
+
+        // Check metadata for skip_versioning flag
+        let metadata = self.resolve_metadata(path).await;
+        if metadata.skip_versioning == Some(true) {
+            return Ok(None);
+        }
+
+        let hash = content_sha256(current_content);
+
+        // Check if latest version already has this hash (skip duplicate saves)
+        if let Ok(Some(latest)) = self.storage.get_latest_version_number(document_id).await
+            && let Ok(ver) = self.storage.get_version(document_id, latest).await
+            && ver.content_hash == hash
+        {
+            return Ok(None);
+        }
+
+        let version = self
+            .storage
+            .save_version(document_id, current_content, &hash, changed_by)
+            .await?;
+        Ok(Some(version))
+    }
+
+    // ==================== Patch ====================
+
+    /// Apply a search-and-replace patch to a workspace document.
+    ///
+    /// Finds `old_string` in the document and replaces it with `new_string`.
+    /// If `replace_all` is true, replaces all occurrences; otherwise only the first.
+    /// Auto-versions before applying the patch.
+    pub async fn patch(
+        &self,
+        path: &str,
+        old_string: &str,
+        new_string: &str,
+        replace_all: bool,
+    ) -> Result<PatchResult, WorkspaceError> {
+        let path = normalize_path(path);
+        let doc = self
+            .storage
+            .get_document_by_path(&self.user_id, self.agent_id, &path)
+            .await?;
+
+        if !doc.content.contains(old_string) {
+            return Err(WorkspaceError::PatchFailed {
+                path,
+                reason: "old_string not found in document".to_string(),
+            });
+        }
+
+        let (new_content, count) = if replace_all {
+            let count = doc.content.matches(old_string).count();
+            (doc.content.replace(old_string, new_string), count)
+        } else {
+            (doc.content.replacen(old_string, new_string, 1), 1)
+        };
+
+        // Injection scan for system prompt files
+        if is_system_prompt_file(&path) && !new_content.is_empty() {
+            reject_if_injected(&path, &new_content)?;
+        }
+
+        // Auto-version before updating
+        let _ = self
+            .maybe_save_version(doc.id, &doc.content, &path, None)
+            .await;
+
+        self.storage.update_document(doc.id, &new_content).await?;
+        self.reindex_document(doc.id).await?;
+
+        let updated = self.storage.get_document_by_id(doc.id).await?;
+        Ok(PatchResult {
+            document: updated,
+            replacements: count,
+        })
+    }
+
     /// Write (create or update) a file.
     ///
     /// Creates parent directories implicitly (they're virtual in the DB).
     /// Re-indexes the document for search after writing.
+    /// Auto-versions the previous content before overwriting.
     ///
     /// # Example
     /// ```ignore
@@ -715,6 +1000,12 @@ impl Workspace {
             .storage
             .get_or_create_document_by_path(&self.user_id, self.agent_id, &path)
             .await?;
+
+        // Auto-version previous content before overwriting
+        let _ = self
+            .maybe_save_version(doc.id, &doc.content, &path, None)
+            .await;
+
         self.storage.update_document(doc.id, content).await?;
         self.reindex_document(doc.id).await?;
 
@@ -753,6 +1044,11 @@ impl Workspace {
         if is_system_prompt_file(&path) && !new_content.is_empty() {
             reject_if_injected(&path, &new_content)?;
         }
+
+        // Auto-version previous content before appending
+        let _ = self
+            .maybe_save_version(doc.id, &doc.content, &path, None)
+            .await;
 
         self.storage.update_document(doc.id, &new_content).await?;
         self.reindex_document(doc.id).await?;
@@ -1585,6 +1881,14 @@ impl Workspace {
         // Get the document
         let doc = self.storage.get_document_by_id(document_id).await?;
 
+        // Check metadata for skip_indexing flag
+        let metadata = self.resolve_metadata(&doc.path).await;
+        if metadata.skip_indexing == Some(true) {
+            // Delete any existing chunks and skip indexing
+            self.storage.delete_chunks(document_id).await?;
+            return Ok(());
+        }
+
         // Chunk the content
         let chunks = chunk_document(&doc.content, ChunkConfig::default());
 
@@ -1667,6 +1971,51 @@ impl Workspace {
                 tracing::debug!("Failed to seed {}: {}", path, e);
             } else {
                 count += 1;
+            }
+        }
+
+        // Seed folder-level .config documents for hygiene defaults.
+        let config_seeds: &[(&str, serde_json::Value)] = &[
+            (
+                "daily/.config",
+                serde_json::json!({
+                    "hygiene": {"enabled": true, "retention_days": 30},
+                    "skip_versioning": true
+                }),
+            ),
+            (
+                "conversations/.config",
+                serde_json::json!({
+                    "hygiene": {"enabled": true, "retention_days": 7},
+                    "skip_versioning": true
+                }),
+            ),
+        ];
+
+        for (config_path, metadata_value) in config_seeds {
+            match self.read_primary(config_path).await {
+                Ok(_) => continue, // Already exists, don't overwrite
+                Err(WorkspaceError::DocumentNotFound { .. }) => {}
+                Err(e) => {
+                    tracing::debug!("Failed to check {}: {}", config_path, e);
+                    continue;
+                }
+            }
+            // Create empty document with metadata
+            if let Ok(doc) = self
+                .storage
+                .get_or_create_document_by_path(&self.user_id, self.agent_id, config_path)
+                .await
+            {
+                if let Err(e) = self
+                    .storage
+                    .update_document_metadata(doc.id, metadata_value)
+                    .await
+                {
+                    tracing::debug!("Failed to set metadata on {}: {}", config_path, e);
+                } else {
+                    count += 1;
+                }
             }
         }
 
