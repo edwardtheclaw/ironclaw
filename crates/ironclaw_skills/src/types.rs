@@ -3,6 +3,7 @@
 //! Contains the data structures for skill manifests, activation criteria,
 //! trust levels, and loaded skills.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use regex::Regex;
@@ -118,6 +119,10 @@ pub struct SkillManifest {
     /// Activation criteria.
     #[serde(default)]
     pub activation: ActivationCriteria,
+    /// Credential requirements for API access.
+    /// Parsed at load time; values are never in the LLM context.
+    #[serde(default)]
+    pub credentials: Vec<SkillCredentialSpec>,
     /// Optional OpenClaw metadata.
     #[serde(default)]
     pub metadata: Option<SkillMetadata>,
@@ -155,6 +160,88 @@ pub struct GatingRequirements {
     /// Required config file paths that must exist.
     #[serde(default)]
     pub config: Vec<String>,
+}
+
+/// Where to inject a credential in HTTP requests.
+///
+/// Maps 1:1 to `CredentialLocation` in `src/secrets/types.rs` but is defined
+/// here so that `ironclaw_skills` remains independent of the main crate.
+/// Conversion happens at registration time in `src/skills/mod.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SkillCredentialLocation {
+    /// `Authorization: Bearer {secret}`
+    Bearer,
+    /// `Authorization: Basic base64(username:secret)`
+    BasicAuth { username: String },
+    /// Custom header, optionally prefixed (e.g. `X-API-Key: Token {secret}`)
+    Header {
+        name: String,
+        #[serde(default)]
+        prefix: Option<String>,
+    },
+    /// Query parameter (e.g. `?api_key={secret}`)
+    QueryParam { name: String },
+}
+
+/// How the provider handles token refresh.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "strategy", rename_all = "snake_case")]
+pub enum ProviderRefreshStrategy {
+    /// Standard OAuth2 `refresh_token` grant.
+    #[default]
+    Standard,
+    /// Provider does not support refresh — re-authorize when expired.
+    ReauthorizeOnly,
+    /// Provider-specific refresh endpoint or extra parameters.
+    Custom {
+        refresh_url: String,
+        #[serde(default)]
+        extra_params: HashMap<String, String>,
+    },
+}
+
+/// OAuth configuration for a credential declared by a skill.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillOAuthConfig {
+    pub authorization_url: String,
+    pub token_url: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub use_pkce: bool,
+    #[serde(default)]
+    pub extra_params: HashMap<String, String>,
+    /// How this provider handles token refresh (default: standard OAuth2).
+    #[serde(default)]
+    pub refresh: ProviderRefreshStrategy,
+    /// Optional endpoint to test the token after exchange (e.g. Google userinfo).
+    #[serde(default)]
+    pub test_url: Option<String>,
+}
+
+/// A credential requirement declared by a skill.
+///
+/// Skills declare credentials in YAML frontmatter so the system can register
+/// host→credential mappings and manage OAuth flows without WASM modules.
+/// Credential *values* are never in the LLM's context — only these metadata
+/// specs are parsed at skill-load time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillCredentialSpec {
+    /// Secret name in the `SecretsStore` (e.g. `google_oauth_token`).
+    pub name: String,
+    /// Provider hint (e.g. `google`, `github`, `slack`).
+    pub provider: String,
+    /// Where to inject the credential in HTTP requests.
+    pub location: SkillCredentialLocation,
+    /// Host patterns this credential applies to (glob syntax, e.g. `*.googleapis.com`).
+    pub hosts: Vec<String>,
+    /// Optional OAuth configuration for automated token exchange and refresh.
+    #[serde(default)]
+    pub oauth: Option<SkillOAuthConfig>,
+    /// Human-readable setup instructions shown when the credential is missing.
+    #[serde(default)]
+    pub setup_instructions: Option<String>,
 }
 
 /// A fully loaded skill ready for activation.
@@ -371,6 +458,7 @@ metadata:
                 version: "1.0.0".to_string(),
                 description: String::new(),
                 activation: ActivationCriteria::default(),
+                credentials: vec![],
                 metadata: None,
             },
             prompt_content: "test prompt".to_string(),
@@ -384,5 +472,228 @@ metadata:
         };
         assert_eq!(skill.name(), "test");
         assert_eq!(skill.version(), "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_credentials_frontmatter() {
+        let yaml = r#"
+name: gmail
+version: "1.0.0"
+description: Gmail API integration
+activation:
+  keywords: ["email", "gmail"]
+credentials:
+  - name: google_oauth_token
+    provider: google
+    location:
+      type: bearer
+    hosts: ["gmail.googleapis.com"]
+    oauth:
+      authorization_url: "https://accounts.google.com/o/oauth2/v2/auth"
+      token_url: "https://oauth2.googleapis.com/token"
+      scopes: ["https://www.googleapis.com/auth/gmail.modify"]
+      test_url: "https://www.googleapis.com/oauth2/v1/userinfo"
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        assert_eq!(manifest.credentials.len(), 1);
+        let cred = &manifest.credentials[0];
+        assert_eq!(cred.name, "google_oauth_token");
+        assert_eq!(cred.provider, "google");
+        assert!(matches!(cred.location, SkillCredentialLocation::Bearer));
+        assert_eq!(cred.hosts, vec!["gmail.googleapis.com"]);
+        let oauth = cred.oauth.as_ref().unwrap();
+        assert_eq!(
+            oauth.authorization_url,
+            "https://accounts.google.com/o/oauth2/v2/auth"
+        );
+        assert_eq!(oauth.scopes.len(), 1);
+        assert_eq!(
+            oauth.test_url.as_deref(),
+            Some("https://www.googleapis.com/oauth2/v1/userinfo")
+        );
+        assert!(matches!(oauth.refresh, ProviderRefreshStrategy::Standard));
+    }
+
+    #[test]
+    fn test_parse_credentials_header_location() {
+        let yaml = r#"
+name: custom-api
+credentials:
+  - name: api_key
+    provider: custom
+    location:
+      type: header
+      name: X-API-Key
+      prefix: "Token"
+    hosts: ["api.custom.com"]
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        let cred = &manifest.credentials[0];
+        match &cred.location {
+            SkillCredentialLocation::Header { name, prefix } => {
+                assert_eq!(name, "X-API-Key");
+                assert_eq!(prefix.as_deref(), Some("Token"));
+            }
+            other => panic!("expected Header, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_credentials_query_param_location() {
+        let yaml = r#"
+name: legacy-api
+credentials:
+  - name: api_key
+    provider: legacy
+    location:
+      type: query_param
+      name: access_token
+    hosts: ["api.legacy.com"]
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        let cred = &manifest.credentials[0];
+        match &cred.location {
+            SkillCredentialLocation::QueryParam { name } => {
+                assert_eq!(name, "access_token");
+            }
+            other => panic!("expected QueryParam, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_credentials_basic_auth() {
+        let yaml = r#"
+name: basic-api
+credentials:
+  - name: basic_cred
+    provider: example
+    location:
+      type: basic_auth
+      username: admin
+    hosts: ["api.example.com"]
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        let cred = &manifest.credentials[0];
+        match &cred.location {
+            SkillCredentialLocation::BasicAuth { username } => {
+                assert_eq!(username, "admin");
+            }
+            other => panic!("expected BasicAuth, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_credentials_with_custom_refresh() {
+        let yaml = r#"
+name: slack
+credentials:
+  - name: slack_token
+    provider: slack
+    location:
+      type: bearer
+    hosts: ["slack.com"]
+    oauth:
+      authorization_url: "https://slack.com/oauth/v2/authorize"
+      token_url: "https://slack.com/api/oauth.v2.access"
+      scopes: ["chat:write"]
+      refresh:
+        strategy: custom
+        refresh_url: "https://slack.com/api/oauth.v2.access"
+        extra_params:
+          grant_type: refresh_token
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        let oauth = manifest.credentials[0].oauth.as_ref().unwrap();
+        match &oauth.refresh {
+            ProviderRefreshStrategy::Custom {
+                refresh_url,
+                extra_params,
+            } => {
+                assert_eq!(refresh_url, "https://slack.com/api/oauth.v2.access");
+                assert_eq!(extra_params.get("grant_type").unwrap(), "refresh_token");
+            }
+            other => panic!("expected Custom, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_credentials_reauthorize_only() {
+        let yaml = r#"
+name: github
+credentials:
+  - name: github_token
+    provider: github
+    location:
+      type: bearer
+    hosts: ["api.github.com"]
+    oauth:
+      authorization_url: "https://github.com/login/oauth/authorize"
+      token_url: "https://github.com/login/oauth/access_token"
+      refresh:
+        strategy: reauthorize_only
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        let oauth = manifest.credentials[0].oauth.as_ref().unwrap();
+        assert!(matches!(
+            oauth.refresh,
+            ProviderRefreshStrategy::ReauthorizeOnly
+        ));
+    }
+
+    #[test]
+    fn test_parse_manifest_without_credentials_defaults_empty() {
+        let yaml = r#"
+name: simple-skill
+description: No credentials needed
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        assert!(manifest.credentials.is_empty());
+    }
+
+    #[test]
+    fn test_credential_spec_serde_roundtrip() {
+        let spec = SkillCredentialSpec {
+            name: "token".to_string(),
+            provider: "github".to_string(),
+            location: SkillCredentialLocation::Bearer,
+            hosts: vec!["api.github.com".to_string()],
+            oauth: None,
+            setup_instructions: Some("Go to Settings > Tokens".to_string()),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: SkillCredentialSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "token");
+        assert_eq!(back.provider, "github");
+        assert_eq!(back.hosts, vec!["api.github.com"]);
+        assert_eq!(
+            back.setup_instructions.as_deref(),
+            Some("Go to Settings > Tokens")
+        );
+    }
+
+    #[test]
+    fn test_parse_credentials_with_extra_params() {
+        let yaml = r#"
+name: google-drive
+credentials:
+  - name: google_oauth_token
+    provider: google
+    location:
+      type: bearer
+    hosts: ["www.googleapis.com"]
+    oauth:
+      authorization_url: "https://accounts.google.com/o/oauth2/v2/auth"
+      token_url: "https://oauth2.googleapis.com/token"
+      scopes: ["https://www.googleapis.com/auth/drive"]
+      use_pkce: true
+      extra_params:
+        access_type: offline
+        prompt: consent
+"#;
+        let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
+        let oauth = manifest.credentials[0].oauth.as_ref().unwrap();
+        assert!(oauth.use_pkce);
+        assert_eq!(oauth.extra_params.get("access_type").unwrap(), "offline");
+        assert_eq!(oauth.extra_params.get("prompt").unwrap(), "consent");
     }
 }

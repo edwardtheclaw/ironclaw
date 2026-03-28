@@ -186,6 +186,7 @@ mod tests {
                     tags: tag_vec,
                     max_context_tokens: 1000,
                 },
+                credentials: vec![],
                 metadata: None,
             },
             prompt_content: "Test prompt".to_string(),

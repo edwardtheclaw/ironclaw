@@ -118,7 +118,7 @@ fn v1_skill_to_memory_doc(skill: &LoadedSkill, project_id: ProjectId) -> MemoryD
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironclaw_skills::types::{ActivationCriteria, SkillManifest};
+    use ironclaw_skills::types::{ActivationCriteria, SkillManifest, SkillTrust};
     use std::path::PathBuf;
 
     fn make_v1_skill(name: &str, content: &str) -> LoadedSkill {
@@ -131,6 +131,7 @@ mod tests {
                     keywords: vec!["test".to_string()],
                     ..Default::default()
                 },
+                credentials: vec![],
                 metadata: None,
             },
             prompt_content: content.to_string(),

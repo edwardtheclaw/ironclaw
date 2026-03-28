@@ -175,6 +175,7 @@ fn metadata_to_loaded_skill(meta: &V2SkillMetadata, content: &str) -> LoadedSkil
             version: meta.version.to_string(),
             description: meta.description.clone(),
             activation: meta.activation.clone(),
+            credentials: vec![],
             metadata: None,
         },
         prompt_content: content.to_string(),

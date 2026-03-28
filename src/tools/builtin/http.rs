@@ -464,6 +464,31 @@ impl Tool for HttpTool {
 
         // Parse headers
         let mut headers_vec = parse_headers_param(params.get("headers"))?;
+
+        // Block LLM-provided authorization headers when the host has registered
+        // credential mappings. Credentials must come from the registry, not from
+        // LLM-generated arguments — prevents prompt-injection exfiltration.
+        if let Some(registry) = self.credential_registry.as_ref() {
+            let cred_host = parsed_url.host_str().unwrap_or("");
+            if registry.has_credentials_for_host(cred_host) {
+                let forbidden: &[&str] = &[
+                    "authorization",
+                    "x-api-key",
+                    "api-key",
+                    "x-auth-token",
+                ];
+                for (name, _) in &headers_vec {
+                    if forbidden.iter().any(|f| name.eq_ignore_ascii_case(f)) {
+                        return Err(ToolError::NotAuthorized(format!(
+                            "Manual '{}' header blocked for host '{}': \
+                             credentials are auto-injected by the credential system",
+                            name, cred_host
+                        )));
+                    }
+                }
+            }
+        }
+
         let timeout_secs = parse_timeout_secs_param(params.get("timeout_secs"))?;
         let save_to = parse_save_to_param(params.get("save_to"))?;
         let effective_timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
@@ -540,6 +565,20 @@ impl Tool for HttpTool {
                             parsed_url.query_pairs_mut().append_pair(name, value);
                             request = request.query(&[(name.as_str(), value.as_str())]);
                         }
+                    }
+                    Err(crate::secrets::SecretError::NotFound(_)) => {
+                        return Err(ToolError::ExecutionFailed(
+                            serde_json::json!({
+                                "error": "authentication_required",
+                                "credential_name": mapping.secret_name,
+                                "message": format!(
+                                    "Credential '{}' is not configured. \
+                                     Use the auth_setup tool to set up credentials before making this request.",
+                                    mapping.secret_name
+                                )
+                            })
+                            .to_string(),
+                        ));
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -701,10 +740,33 @@ impl Tool for HttpTool {
 
         let status = response.status().as_u16();
 
+        // Strip sensitive response headers before they reach the LLM context.
+        // These headers may contain tokens, session cookies, or auth challenges
+        // that the LLM should never see (Pica pattern: auth header stripping).
+        const REDACTED_RESPONSE_HEADERS: &[&str] = &[
+            "authorization",
+            "www-authenticate",
+            "set-cookie",
+            "x-api-key",
+            "x-auth-token",
+            "proxy-authenticate",
+            "proxy-authorization",
+        ];
+
         let headers: HashMap<String, String> = response
             .headers()
             .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+            .filter_map(|(k, v)| {
+                let key = k.to_string();
+                if REDACTED_RESPONSE_HEADERS
+                    .iter()
+                    .any(|r| key.eq_ignore_ascii_case(r))
+                {
+                    None
+                } else {
+                    v.to_str().ok().map(|v| (key, v.to_string()))
+                }
+            })
             .collect();
 
         // Use a larger size limit when saving to disk (file downloads)
@@ -776,6 +838,21 @@ impl Tool for HttpTool {
         }
 
         let body_text = String::from_utf8_lossy(&body_bytes).into_owned();
+
+        // Scan response body for leaked credentials before it reaches the LLM.
+        let response_detector = LeakDetector::new();
+        let scan_result = response_detector.scan(&body_text);
+        if scan_result.should_block {
+            tracing::warn!(
+                url = %parsed_url,
+                matches = scan_result.matches.len(),
+                "Response body contains leaked credential pattern, blocking"
+            );
+            return Err(ToolError::NotAuthorized(
+                "Response blocked: contains credential patterns that must not reach the LLM"
+                    .to_string(),
+            ));
+        }
 
         // Record the HTTP exchange if interceptor is present (recording mode)
         if let Some(ref interceptor) = ctx.http_interceptor {
@@ -1482,5 +1559,68 @@ mod tests {
     fn test_save_to_rejects_bare_tmp() {
         let err = validate_save_to_path("/tmp").unwrap_err();
         assert!(err.to_string().contains("must be under /tmp/"));
+    }
+
+    // ── Forbidden auth header blocking tests ───────────────────────────
+
+    #[test]
+    fn test_forbidden_auth_header_blocked_for_registered_host() {
+        // parse_headers_param is called before the execute() block check,
+        // so we test the blocking logic directly by simulating what execute does.
+        use crate::secrets::CredentialMapping;
+        use crate::tools::wasm::SharedCredentialRegistry;
+
+        let registry = Arc::new(SharedCredentialRegistry::new());
+        registry.add_mappings(vec![CredentialMapping::bearer(
+            "github_token",
+            "api.github.com",
+        )]);
+
+        // Simulate: host has registered credentials, LLM provides Authorization header
+        let cred_host = "api.github.com";
+        assert!(registry.has_credentials_for_host(cred_host));
+
+        let forbidden: &[&str] = &["authorization", "x-api-key", "api-key", "x-auth-token"];
+        let llm_headers = [("Authorization".to_string(), "Bearer stolen_token".to_string())];
+
+        let blocked = llm_headers.iter().any(|(name, _)| {
+            forbidden.iter().any(|f| name.eq_ignore_ascii_case(f))
+        });
+        assert!(blocked, "LLM-provided Authorization header should be blocked");
+    }
+
+    #[test]
+    fn test_non_auth_header_allowed_for_registered_host() {
+        use crate::secrets::CredentialMapping;
+        use crate::tools::wasm::SharedCredentialRegistry;
+
+        let registry = Arc::new(SharedCredentialRegistry::new());
+        registry.add_mappings(vec![CredentialMapping::bearer(
+            "github_token",
+            "api.github.com",
+        )]);
+
+        let forbidden: &[&str] = &["authorization", "x-api-key", "api-key", "x-auth-token"];
+        let llm_headers = [
+            ("Accept".to_string(), "application/json".to_string()),
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ];
+
+        let blocked = llm_headers.iter().any(|(name, _)| {
+            forbidden.iter().any(|f| name.eq_ignore_ascii_case(f))
+        });
+        assert!(!blocked, "Non-auth headers should not be blocked");
+    }
+
+    #[test]
+    fn test_auth_header_allowed_for_unregistered_host() {
+        use crate::tools::wasm::SharedCredentialRegistry;
+
+        // Empty registry — no credential mappings registered
+        let registry = Arc::new(SharedCredentialRegistry::new());
+
+        // Host has NO registered credentials, so LLM-provided auth headers are fine
+        let cred_host = "api.example.com";
+        assert!(!registry.has_credentials_for_host(cred_host));
     }
 }

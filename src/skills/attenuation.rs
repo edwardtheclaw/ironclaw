@@ -134,6 +134,7 @@ mod tests {
                 version: "1.0.0".to_string(),
                 description: String::new(),
                 activation: ActivationCriteria::default(),
+                credentials: vec![],
                 metadata: None,
             },
             prompt_content: "test".to_string(),

@@ -89,8 +89,7 @@ impl EffectBridgeAdapter {
         let mgr = mgr.as_ref()?;
 
         let result = match action_name {
-            // routine_create maps to mission_create in v2
-            "mission_create" | "routine_create" => {
+            "mission_create" => {
                 let name = params
                     .get("name")
                     .or_else(|| params.get("_args").and_then(|a| a.get(0)))
@@ -116,7 +115,7 @@ impl EffectBridgeAdapter {
                     Err(e) => Err(e),
                 }
             }
-            "mission_list" | "routine_list" => match mgr.list_missions(context.project_id).await {
+            "mission_list" => match mgr.list_missions(context.project_id).await {
                 Ok(missions) => {
                     let list: Vec<serde_json::Value> = missions
                         .iter()
@@ -135,7 +134,7 @@ impl EffectBridgeAdapter {
                 }
                 Err(e) => Err(e),
             },
-            "mission_fire" | "routine_fire" => {
+            "mission_fire" => {
                 let id_str = params
                     .get("id")
                     .or_else(|| params.get("_args").and_then(|a| a.get(0)))
@@ -159,8 +158,7 @@ impl EffectBridgeAdapter {
                     Err(e) => Err(e),
                 }
             }
-            "mission_pause" | "mission_resume" | "routine_pause" | "routine_resume"
-            | "routine_update" => {
+            "mission_pause" | "mission_resume" => {
                 let id_str = params
                     .get("id")
                     .or_else(|| params.get("_args").and_then(|a| a.get(0)))
@@ -174,7 +172,7 @@ impl EffectBridgeAdapter {
                 match id {
                     Ok(id) => {
                         let res =
-                            if action_name == "mission_pause" || action_name == "routine_pause" {
+                            if action_name == "mission_pause" {
                                 mgr.pause_mission(id).await
                             } else {
                                 mgr.resume_mission(id).await
@@ -187,7 +185,7 @@ impl EffectBridgeAdapter {
                     Err(e) => Err(e),
                 }
             }
-            "routine_delete" | "mission_delete" => {
+            "mission_delete" => {
                 let id_str = params
                     .get("id")
                     .or_else(|| params.get("name")) // routine_delete uses "name" param
@@ -516,6 +514,13 @@ fn is_v1_only_tool(name: &str) -> bool {
             | "cancel-job"
             | "build_software"
             | "build-software"
+            | "routine_create"
+            | "routine_list"
+            | "routine_fire"
+            | "routine_pause"
+            | "routine_resume"
+            | "routine_update"
+            | "routine_delete"
     )
 }
 

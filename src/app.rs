@@ -282,6 +282,7 @@ impl AppBuilder {
             Option<Arc<dyn EmbeddingProvider>>,
             Option<Arc<Workspace>>,
             Option<Arc<dyn crate::tools::SoftwareBuilder>>,
+            Arc<SharedCredentialRegistry>,
         ),
         anyhow::Error,
     > {
@@ -425,7 +426,7 @@ impl AppBuilder {
             None
         };
 
-        Ok((safety, tools, embeddings, workspace, builder))
+        Ok((safety, tools, embeddings, workspace, builder, credential_registry))
     }
 
     /// Phase 5: Load WASM tools, MCP servers, and create extension manager.
@@ -782,7 +783,8 @@ impl AppBuilder {
         } else {
             self.init_llm().await?
         };
-        let (safety, tools, embeddings, workspace, builder) = self.init_tools(&llm).await?;
+        let (safety, tools, embeddings, workspace, builder, credential_registry) =
+            self.init_tools(&llm).await?;
 
         // Create hook registry early so runtime extension activation can register hooks.
         let hooks = Arc::new(HookRegistry::new());
@@ -867,6 +869,14 @@ impl AppBuilder {
             if !loaded.is_empty() {
                 tracing::debug!("Loaded {} skill(s): {}", loaded.len(), loaded.join(", "));
             }
+
+            // Register credential mappings from skill frontmatter into the
+            // shared registry so the HTTP tool can auto-inject credentials.
+            crate::skills::register_skill_credentials(
+                registry.skills(),
+                &credential_registry,
+            );
+
             let registry = Arc::new(std::sync::RwLock::new(registry));
             let catalog = crate::skills::catalog::shared_catalog();
             tools.register_skill_tools(Arc::clone(&registry), Arc::clone(&catalog));

@@ -27,13 +27,17 @@ pub mod registry;
 
 // Re-export core types at crate root for convenience.
 pub use types::{
-    ActivationCriteria, GatingRequirements, LoadedSkill, OpenClawMeta, SkillManifest,
-    SkillMetadata, SkillSource, SkillTrust, MAX_PROMPT_FILE_SIZE,
+    ActivationCriteria, GatingRequirements, LoadedSkill, OpenClawMeta, ProviderRefreshStrategy,
+    SkillCredentialLocation, SkillCredentialSpec, SkillManifest, SkillMetadata, SkillOAuthConfig,
+    SkillSource, SkillTrust, MAX_PROMPT_FILE_SIZE,
 };
 
 pub use parser::{ParsedSkill, SkillParseError, parse_skill_md};
 pub use selector::{prefilter_skills, MAX_SKILL_CONTEXT_TOKENS};
-pub use validation::{escape_skill_content, escape_xml_attr, normalize_line_endings, validate_skill_name};
+pub use validation::{
+    escape_skill_content, escape_xml_attr, normalize_line_endings, validate_credential_name,
+    validate_credential_spec, validate_skill_name,
+};
 pub use gating::{GatingResult, check_requirements, check_requirements_sync};
 
 #[cfg(feature = "registry")]

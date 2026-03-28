@@ -139,6 +139,93 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         });
     }
 
+    // Register mission functions as a capability so threads receive leases.
+    // Handled by EffectBridgeAdapter::handle_mission_call() before the
+    // regular tool executor. Use "mission_*" names only — descriptions
+    // mention "routine" so the LLM maps user intent correctly.
+    capabilities.register(Capability {
+        name: "missions".into(),
+        description: "Mission and routine lifecycle management".into(),
+        actions: vec![
+            ironclaw_engine::ActionDef {
+                name: "mission_create".into(),
+                description: "Create a new mission (routine). Use when the user wants to set up a recurring task, scheduled check, or periodic routine.".into(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Short name for the mission/routine"},
+                        "goal": {"type": "string", "description": "What this mission should accomplish each run"},
+                        "cadence": {"type": "string", "description": "How often to run: 'hourly', '30m', '6h', 'daily', 'manual'"}
+                    },
+                    "required": ["name", "goal"]
+                }),
+                effects: vec![],
+                requires_approval: false,
+            },
+            ironclaw_engine::ActionDef {
+                name: "mission_list".into(),
+                description: "List all missions and routines in the current project.".into(),
+                parameters_schema: serde_json::json!({"type": "object"}),
+                effects: vec![],
+                requires_approval: false,
+            },
+            ironclaw_engine::ActionDef {
+                name: "mission_fire".into(),
+                description: "Manually trigger a mission or routine to run immediately.".into(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "Mission/routine ID to trigger"}
+                    },
+                    "required": ["id"]
+                }),
+                effects: vec![],
+                requires_approval: false,
+            },
+            ironclaw_engine::ActionDef {
+                name: "mission_pause".into(),
+                description: "Pause a running mission or routine.".into(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "Mission/routine ID to pause"}
+                    },
+                    "required": ["id"]
+                }),
+                effects: vec![],
+                requires_approval: false,
+            },
+            ironclaw_engine::ActionDef {
+                name: "mission_resume".into(),
+                description: "Resume a paused mission or routine.".into(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "Mission/routine ID to resume"}
+                    },
+                    "required": ["id"]
+                }),
+                effects: vec![],
+                requires_approval: false,
+            },
+            ironclaw_engine::ActionDef {
+                name: "mission_delete".into(),
+                description: "Delete a mission or routine permanently.".into(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "Mission/routine ID to delete"}
+                    },
+                    "required": ["id"]
+                }),
+                effects: vec![],
+                requires_approval: false,
+            },
+        ],
+        knowledge: vec![],
+        policies: vec![],
+    });
+
     let leases = Arc::new(LeaseManager::new());
     let policy = Arc::new(PolicyEngine::new());
 

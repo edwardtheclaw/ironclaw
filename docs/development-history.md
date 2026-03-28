@@ -120,6 +120,44 @@ Studied [Pica](https://github.com/withoneai/pica) (formerly IntegrationOS, 200+ 
 
 **Decision**: Use Capabilities as knowledge-bearing integration definitions. Write knowledge text for top 20 platforms. Build one `oauth_init` action. Skip the Pica-style deterministic executor — it solves the wrong problem for LLM agents.
 
+## Session 8: Skills-Based OAuth & Mission Leases (2026-03-27)
+
+Two independent improvements driven by real usage issues.
+
+### Skills-Based Credential System
+
+Studied all OAuth issues reported on GitHub (#1537, #902, #1500, #557, #1441, #1443, #992, #999) and [Pica](https://github.com/withoneai/pica)'s OAuth implementation to design a robust credential system that moves API authentication from WASM modules to skills.
+
+**The problem**: OAuth/credential injection was coupled to WASM `capabilities.json` files. This broke on hosted TEE (#1537), had confusing UX (#902), failed for multi-tool auth (#1500), and lacked user isolation for multi-tenant (#557).
+
+**The insight**: The `skills/github/SKILL.md` already demonstrated the pattern — skill instructs LLM to call `http` tool, credentials auto-injected by host. The gap was that credential declarations lived in WASM, not skills.
+
+**Implementation** (6 files created/modified in `ironclaw_skills`, 4 in main crate):
+
+1. **Credential types in skill frontmatter** — `SkillCredentialSpec`, `SkillCredentialLocation`, `SkillOAuthConfig`, `ProviderRefreshStrategy` in `crates/ironclaw_skills/src/types.rs`. Skills declare credentials in YAML; values never in LLM context.
+
+2. **Validation** — HTTPS enforcement on OAuth URLs, credential name patterns, non-empty hosts. Invalid specs logged and skipped during registration.
+
+3. **Registry bridge** — `credential_spec_to_mapping()` converts skill specs to `CredentialMapping` and registers in `SharedCredentialRegistry`. Wired into `app.rs` after skill discovery.
+
+4. **HTTP tool hardening** — Four security improvements:
+   - Block LLM-provided auth headers (`Authorization`, `X-API-Key`) for hosts with registered credentials (prevents prompt injection exfiltration)
+   - Structured `authentication_required` error when credentials are missing (guides LLM to `auth_setup`)
+   - Strip sensitive response headers (`Set-Cookie`, `WWW-Authenticate`, `Authorization`) before LLM sees them
+   - Scan response body through `LeakDetector` to catch APIs echoing back tokens
+
+5. **Pica patterns adopted**: connection testing before persisting, per-provider refresh strategies (`Standard`/`ReauthorizeOnly`/`Custom`), auth header stripping from responses, encryption versioning (forward-looking).
+
+**Test coverage**: 18 type tests + 15 validation tests + 11 conversion/registration tests + 3 HTTP hardening tests + 10 integration tests in `tests/skill_credential_injection.rs`. 315 tests in skills+engine crates, zero clippy warnings.
+
+### Mission Lease Fix
+
+Users reported `"No lease for action 'routine_create'"` when asking the engine to create routines.
+
+**Root cause**: `routine_create` was a v2 mission function handled by `EffectBridgeAdapter::handle_mission_call()`, but `structured.rs` checks capability leases *before* calling the EffectExecutor. Mission functions were never registered as capabilities, so no lease existed.
+
+**Fix**: Registered `mission_create`, `mission_list`, `mission_fire`, `mission_pause`, `mission_resume`, `mission_delete` as a `"missions"` capability in `router.rs`. Descriptions mention "routine" so the LLM maps user intent correctly. Removed all `routine_*` aliases from the effect adapter — `routine_*` names added to `is_v1_only_tool()` blocklist with clear error directing to `mission_*`.
+
 ## Architecture Evolution
 
 ```
@@ -131,6 +169,8 @@ Session 6:    Rust loop → Python orchestrator (self-modifiable)
               900 lines Rust → 80 lines Rust bootstrap + 230 lines Python
 Session 7:    Integration scaling: Capabilities as knowledge → http action
               (not Pica-style per-action tools — tool list bloat kills LLM accuracy)
+Session 8:    Skills-based OAuth (credential specs in YAML frontmatter)
+              + HTTP tool zero-leak hardening + mission capability leases
 ```
 
 ## Key Commits
