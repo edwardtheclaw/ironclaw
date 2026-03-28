@@ -85,13 +85,37 @@ impl SensitiveChatCredential {
     }
 }
 
-static TELEGRAM_BOT_TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\d{6,}:[A-Za-z0-9_-]{20,}$").expect("TELEGRAM_BOT_TOKEN_RE")); // safety: hardcoded literal
+/// Tighter Telegram bot-token regex: numeric bot-ID (8–15 digits, matching
+/// real tokens), followed by `:`, followed by the secret part (30+
+/// alphanumeric / `_` / `-` characters).  Unanchored so it can find tokens
+/// embedded in longer messages.
+static TELEGRAM_BOT_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\d{8,15}:[A-Za-z0-9_-]{30,}").expect("TELEGRAM_BOT_TOKEN_RE") // safety: hardcoded literal
+});
 
+/// Scan a user message for sensitive credentials that should never flow
+/// through normal chat. The fast path scans the raw message for embedded
+/// token-shaped substrings. If that misses, a fallback pass normalizes
+/// whitespace-delimited words by trimming common wrapping punctuation
+/// before testing them again.
 fn detect_sensitive_chat_credential(content: &str) -> Option<SensitiveChatCredential> {
-    let trimmed = content.trim();
-    if TELEGRAM_BOT_TOKEN_RE.is_match(trimmed) {
+    // Fast path: if the regex matches anywhere in the raw text we have a candidate.
+    if TELEGRAM_BOT_TOKEN_RE.is_match(content) {
         return Some(SensitiveChatCredential::TelegramBotToken);
+    }
+
+    // Slower path: strip common wrapping characters per word so that
+    // pastes like `` `123456789:AABBcc…` `` are still detected.
+    for word in content.split_whitespace() {
+        let stripped = word.trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ','
+            )
+        });
+        if TELEGRAM_BOT_TOKEN_RE.is_match(stripped) {
+            return Some(SensitiveChatCredential::TelegramBotToken);
+        }
     }
     None
 }
@@ -245,7 +269,7 @@ impl Agent {
         credential: SensitiveChatCredential,
     ) -> String {
         let instructions = credential.redirect_message().to_string();
-        let _ = self
+        if let Err(error) = self
             .channels
             .send_status(
                 &message.channel,
@@ -257,7 +281,10 @@ impl Agent {
                 },
                 &message.metadata,
             )
-            .await;
+            .await
+        {
+            tracing::warn!(error = %error, "Failed to send auth-required status");
+        }
         instructions
     }
 
@@ -1144,6 +1171,23 @@ impl Agent {
             std::any::type_name_of_val(&submission)
         );
 
+        // Sensitive credential interception — runs BEFORE hooks so that
+        // BeforeInbound hooks never receive raw secrets.  Skipped when the
+        // thread is in auth mode (`pending_auth`) so the legitimate
+        // secure-setup token-submission flow still works.
+        if let Submission::UserInput { ref content } = submission
+            && !self
+                .session_manager
+                .has_pending_auth(&message.user_id)
+                .await
+            && let Some(credential) = detect_sensitive_chat_credential(content)
+        {
+            return Ok(Some(
+                self.intercept_sensitive_chat_credential(message, credential)
+                    .await,
+            ));
+        }
+
         // Hook: BeforeInbound — allow hooks to modify or reject user input
         if let Submission::UserInput { ref content } = submission {
             let event = crate::hooks::HookEvent::Inbound {
@@ -1290,15 +1334,6 @@ impl Agent {
                         // Fall through to normal handling
                     }
                 }
-            }
-        }
-
-        if let Submission::UserInput { ref content } = submission {
-            if let Some(credential) = detect_sensitive_chat_credential(content) {
-                return Ok(Some(
-                    self.intercept_sensitive_chat_credential(message, credential)
-                        .await,
-                ));
             }
         }
 
@@ -1971,6 +2006,7 @@ mod tests {
         );
     }
 
+    // ── Comprehensive credential detection tests (review feedback) ──
     #[test]
     fn detects_telegram_token_with_surrounding_whitespace() {
         let token = "  1234567890:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw  ";
@@ -2027,7 +2063,9 @@ mod tests {
 
     #[test]
     fn ignores_short_digit_colon_strings() {
+        // Too few digits for a real bot ID
         assert_eq!(detect_sensitive_chat_credential("123:abc"), None);
+        // Secret part too short
         assert_eq!(detect_sensitive_chat_credential("12345678:short"), None);
     }
 
