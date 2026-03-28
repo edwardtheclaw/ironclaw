@@ -34,8 +34,6 @@ pub enum DocType {
     Summary,
     /// Durable learning from experience.
     Lesson,
-    /// Reusable multi-step procedure.
-    Playbook,
     /// Detected problem for follow-up.
     Issue,
     /// Missing capability request.

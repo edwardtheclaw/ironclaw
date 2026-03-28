@@ -128,7 +128,6 @@ For trace debugging: `ENGINE_V2_TRACE=1` writes full JSON traces to `engine_trac
 |------|---------|-------------|
 | `Summary` | What a thread accomplished | Conversation insights mission |
 | `Lesson` | Durable learning from experience | Self-improvement mission |
-| `Playbook` | Reusable multi-step procedure | Legacy (superseded by Skill) |
 | `Skill` | Reusable skill with activation metadata and code snippets | Skill extraction mission, v1 migration |
 | `Issue` | Detected problem for follow-up | Self-improvement mission |
 | `Spec` | Missing capability request | Self-improvement mission |
@@ -154,7 +153,7 @@ On each LLM call, two knowledge sources are injected into the system prompt:
 
 ## Skills System
 
-Skills are the v2 replacement for both v1 SKILL.md prompt extensions and v1 playbooks. They provide deterministic, keyword-driven knowledge injection with optional executable code snippets for the CodeAct runtime.
+Skills are the v2 evolution of SKILL.md prompt extensions. They provide deterministic, keyword-driven knowledge injection with optional executable code snippets for the CodeAct runtime.
 
 ### Architecture
 

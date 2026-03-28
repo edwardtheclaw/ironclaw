@@ -274,7 +274,7 @@ impl MissionManager {
     /// for `StateChanged { to: Done }`. For each completed non-Mission thread:
     ///
     /// 1. **Error diagnosis** — if trace has issues, fires `thread_completed_with_issues`
-    /// 2. **Playbook extraction** — if thread succeeded with many steps/actions,
+    /// 2. **Skill extraction** — if thread succeeded with many steps/actions,
     ///    fires `thread_completed_with_learnings`
     /// 3. **Conversation insights** — after every N threads in a conversation,
     ///    fires `conversation_insights_due`
@@ -374,7 +374,7 @@ impl MissionManager {
                             }
                         }
 
-                        // ── Trigger 2: Playbook extraction ──────────────
+                        // ── Trigger 2: Skill extraction ──────────────────
                         let action_count = thread
                             .events
                             .iter()
@@ -564,7 +564,7 @@ impl MissionManager {
 
     /// Ensure all three learning missions exist for the given project.
     ///
-    /// Creates (if missing) the self-improvement, playbook extraction, and
+    /// Creates (if missing) the self-improvement, skill extraction, and
     /// conversation insights missions. This is the preferred entry point —
     /// call once at project bootstrap.
     pub async fn ensure_learning_missions(
@@ -1099,7 +1099,7 @@ pub const FIX_PATTERN_DB_TITLE: &str = "fix_pattern_database";
 /// Well-known tag for the fix pattern database.
 pub const FIX_PATTERN_DB_TAG: &str = "fix_patterns";
 
-/// The goal for the skill extraction mission (replaces playbook extraction).
+/// The goal for the skill extraction mission.
 const SKILL_EXTRACTION_GOAL: &str = "\
 You extract reusable skills from successfully completed multi-step threads.
 

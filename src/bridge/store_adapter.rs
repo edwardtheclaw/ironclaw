@@ -202,7 +202,6 @@ fn doc_workspace_path(doc: &MemoryDoc) -> String {
     let type_dir = match doc.doc_type {
         DocType::Summary => "summaries",
         DocType::Lesson => "lessons",
-        DocType::Playbook => "playbooks",
         DocType::Issue => "issues",
         DocType::Spec => "specs",
         DocType::Note => "notes",

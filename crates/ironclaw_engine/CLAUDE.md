@@ -13,7 +13,7 @@ See `docs/plans/2026-03-20-engine-v2-architecture.md` for the 8-phase roadmap.
 | **Thread** | Unit of work with lifecycle, parent-child tree, capability leases | Session + Job + Routine + Sub-agent |
 | **Step** | Unit of execution (one LLM call + its action executions) | Agentic loop iteration + tool calls |
 | **Capability** | Unit of effect (actions + knowledge + policies) | Tool + Skill + Hook + Extension |
-| **MemoryDoc** | Unit of durable knowledge (summaries, lessons, playbooks) | Workspace memory blobs |
+| **MemoryDoc** | Unit of durable knowledge (summaries, lessons, skills) | Workspace memory blobs |
 | **Project** | Unit of context (scopes memory, threads, missions) | Flat workspace namespace |
 
 ## Build & Test
@@ -33,7 +33,7 @@ src/
 │   ├── thread.rs         # Thread, ThreadId, ThreadState (state machine), ThreadType, ThreadConfig
 │   ├── step.rs           # Step, StepId, LlmResponse, ActionCall, ActionResult, TokenUsage
 │   ├── capability.rs     # Capability, ActionDef, EffectType, CapabilityLease, PolicyRule
-│   ├── memory.rs         # MemoryDoc, DocId, DocType (Summary/Lesson/Playbook[legacy]/Skill/Issue/Spec/Note)
+│   ├── memory.rs         # MemoryDoc, DocId, DocType (Summary/Lesson/Skill/Issue/Spec/Note)
 │   ├── project.rs        # Project, ProjectId
 │   ├── event.rs          # ThreadEvent, EventKind (18 variants for event sourcing)
 │   ├── message.rs        # ThreadMessage, MessageRole

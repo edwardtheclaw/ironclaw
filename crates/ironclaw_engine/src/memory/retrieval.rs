@@ -119,7 +119,6 @@ fn doc_type_weight(doc_type: DocType) -> f64 {
         DocType::Spec => 0.5,     // Missing capability info is highest priority
         DocType::Skill => 0.45,   // Skills with activation metadata and code snippets
         DocType::Lesson => 0.4,   // Lessons prevent repeating mistakes
-        DocType::Playbook => 0.3, // Reusable procedures
         DocType::Issue => 0.2,    // Known problems
         DocType::Summary => 0.1,  // Background context
         DocType::Note => 0.05,    // Scratch notes, lowest priority
@@ -285,8 +284,7 @@ mod tests {
     #[test]
     fn doc_type_weight_ordering() {
         assert!(doc_type_weight(DocType::Spec) > doc_type_weight(DocType::Lesson));
-        assert!(doc_type_weight(DocType::Lesson) > doc_type_weight(DocType::Playbook));
-        assert!(doc_type_weight(DocType::Playbook) > doc_type_weight(DocType::Issue));
+        assert!(doc_type_weight(DocType::Lesson) > doc_type_weight(DocType::Issue));
         assert!(doc_type_weight(DocType::Issue) > doc_type_weight(DocType::Summary));
         assert!(doc_type_weight(DocType::Summary) > doc_type_weight(DocType::Note));
     }

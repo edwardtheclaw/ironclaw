@@ -151,7 +151,7 @@ For Rust bugs in the engine or bridge, the self-improvement thread describes the
 
 ## Fix Pattern Database
 
-A Playbook MemoryDoc maps known trace symptoms to fix strategies:
+A Note MemoryDoc maps known trace symptoms to fix strategies:
 
 | Trace Pattern | Fix Strategy | Location |
 |---|---|---|

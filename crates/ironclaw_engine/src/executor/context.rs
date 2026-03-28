@@ -20,7 +20,7 @@ const MAX_CONTEXT_DOCS: usize = 5;
 ///
 /// Retrieves relevant memory docs from the project and injects them as a
 /// system message after the main system prompt. This gives the LLM access
-/// to lessons learned, playbooks, and known issues from prior threads.
+/// to lessons learned, skills, and known issues from prior threads.
 pub async fn build_step_context(
     messages: &[ThreadMessage],
     leases: &[CapabilityLease],
@@ -67,7 +67,6 @@ fn format_docs_as_context(docs: &[MemoryDoc]) -> String {
         let type_label = match doc.doc_type {
             crate::types::memory::DocType::Lesson => "LESSON",
             crate::types::memory::DocType::Spec => "MISSING CAPABILITY",
-            crate::types::memory::DocType::Playbook => "PLAYBOOK",
             crate::types::memory::DocType::Issue => "KNOWN ISSUE",
             crate::types::memory::DocType::Summary => "CONTEXT",
             crate::types::memory::DocType::Note => "NOTE",
