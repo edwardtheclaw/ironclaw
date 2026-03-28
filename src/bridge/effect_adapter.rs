@@ -326,13 +326,27 @@ impl EffectExecutor for EffectBridgeAdapter {
                 ApprovalRequirement::UnlessAutoApproved => {
                     let is_approved = self.auto_approved.read().await.contains(lookup_name);
                     if !is_approved {
-                        return Err(EngineError::LeaseDenied {
-                            reason: format!(
-                                "Tool '{}' requires approval. \
-                                 Use a read-only tool instead, or ask the user to approve this action.",
-                                action_name
-                            ),
-                        });
+                        // In v2, credential-backed HTTP calls are auto-approved.
+                        // The user authorized by storing the credential — the v1
+                        // interactive approval flow doesn't exist in v2.
+                        let has_credential_backing = lookup_name == "http"
+                            && self
+                                .tools
+                                .credential_registry()
+                                .is_some_and(|reg| {
+                                    crate::tools::builtin::extract_host_from_params(&parameters)
+                                        .is_some_and(|host| reg.has_credentials_for_host(&host))
+                                });
+
+                        if !has_credential_backing {
+                            return Err(EngineError::LeaseDenied {
+                                reason: format!(
+                                    "Tool '{}' requires approval. \
+                                     Use a read-only tool instead, or ask the user to approve this action.",
+                                    action_name
+                                ),
+                            });
+                        }
                     }
                 }
                 ApprovalRequirement::Never => {}

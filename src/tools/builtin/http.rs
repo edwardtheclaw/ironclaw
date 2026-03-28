@@ -366,7 +366,8 @@ fn parse_save_to_param(save_to: Option<&serde_json::Value>) -> Result<Option<Str
 }
 
 /// Extract host from URL in params (for approval checks).
-fn extract_host_from_params(params: &serde_json::Value) -> Option<String> {
+/// Extract the host from an HTTP tool's params (for credential registry lookup).
+pub fn extract_host_from_params(params: &serde_json::Value) -> Option<String> {
     params
         .get("url")
         .and_then(|u| u.as_str())
