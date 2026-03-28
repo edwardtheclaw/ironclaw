@@ -1223,6 +1223,32 @@ async fn forward_event_to_channel(
                     metadata,
                 )
                 .await;
+
+            // When the HTTP tool fails with authentication_required, show the
+            // auth prompt in the CLI/REPL so the user can authenticate.
+            if error.contains("authentication_required") {
+                let cred_name = error
+                    .split("credential '")
+                    .nth(1)
+                    .and_then(|s| s.split('\'').next())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let _ = channels
+                    .send_status(
+                        channel_name,
+                        StatusUpdate::AuthRequired {
+                            extension_name: cred_name,
+                            instructions: Some(
+                                "Store the credential with: ironclaw secret set <name> <value>"
+                                    .into(),
+                            ),
+                            auth_url: None,
+                            setup_url: None,
+                        },
+                        metadata,
+                    )
+                    .await;
+            }
         }
         EventKind::StepCompleted { tokens, .. } => {
             let tok_msg = format!(
