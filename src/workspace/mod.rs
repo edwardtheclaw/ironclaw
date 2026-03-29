@@ -974,7 +974,7 @@ impl Workspace {
 
         // Auto-version before updating
         let _ = self
-            .maybe_save_version(doc.id, &doc.content, &metadata, None)
+            .maybe_save_version(doc.id, &doc.content, &metadata, Some(&self.user_id))
             .await;
 
         self.storage.update_document(doc.id, &new_content).await?;
@@ -1014,7 +1014,7 @@ impl Workspace {
 
         // Auto-version previous content before overwriting
         let _ = self
-            .maybe_save_version(doc.id, &doc.content, &metadata, None)
+            .maybe_save_version(doc.id, &doc.content, &metadata, Some(&self.user_id))
             .await;
 
         self.storage.update_document(doc.id, content).await?;
@@ -1062,7 +1062,7 @@ impl Workspace {
 
         // Auto-version previous content before appending
         let _ = self
-            .maybe_save_version(doc.id, &doc.content, &metadata, None)
+            .maybe_save_version(doc.id, &doc.content, &metadata, Some(&self.user_id))
             .await;
 
         self.storage.update_document(doc.id, &new_content).await?;
@@ -1152,8 +1152,16 @@ impl Workspace {
             .storage
             .get_or_create_document_by_path(&scope, self.agent_id, &path)
             .await?;
+
+        // Resolve metadata once — shared by versioning and indexing.
+        let metadata = self.resolve_metadata(&path).await;
+        let _ = self
+            .maybe_save_version(doc.id, &doc.content, &metadata, Some(&self.user_id))
+            .await;
+
         self.storage.update_document(doc.id, content).await?;
-        self.reindex_document(doc.id).await?;
+        self.reindex_document_with_metadata(doc.id, Some(&metadata))
+            .await?;
         let document = self.storage.get_document_by_id(doc.id).await?;
         Ok(WriteResult {
             document,
@@ -1196,8 +1204,16 @@ impl Workspace {
         } else {
             format!("{}\n\n{}", doc.content, content)
         };
+
+        // Resolve metadata once — shared by versioning and indexing.
+        let metadata = self.resolve_metadata(&path).await;
+        let _ = self
+            .maybe_save_version(doc.id, &doc.content, &metadata, Some(&self.user_id))
+            .await;
+
         self.storage.update_document(doc.id, &new_content).await?;
-        self.reindex_document(doc.id).await?;
+        self.reindex_document_with_metadata(doc.id, Some(&metadata))
+            .await?;
         let document = self.storage.get_document_by_id(doc.id).await?;
         Ok(WriteResult {
             document,
@@ -1402,8 +1418,16 @@ impl Workspace {
         } else {
             format!("{}\n\n{}", doc.content, entry)
         };
+
+        // Resolve metadata once — shared by versioning and indexing.
+        let metadata = self.resolve_metadata(paths::MEMORY).await;
+        let _ = self
+            .maybe_save_version(doc.id, &doc.content, &metadata, Some(&self.user_id))
+            .await;
+
         self.storage.update_document(doc.id, &new_content).await?;
-        self.reindex_document(doc.id).await?;
+        self.reindex_document_with_metadata(doc.id, Some(&metadata))
+            .await?;
         Ok(())
     }
 
@@ -1947,13 +1971,6 @@ impl Workspace {
         }
 
         Ok(())
-    }
-
-    /// Re-index a document, resolving metadata from the database.
-    ///
-    /// Convenience wrapper for callers that don't have pre-resolved metadata.
-    async fn reindex_document(&self, document_id: Uuid) -> Result<(), WorkspaceError> {
-        self.reindex_document_with_metadata(document_id, None).await
     }
 
     // ==================== Seeding ====================
