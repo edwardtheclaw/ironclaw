@@ -937,11 +937,7 @@ pub async fn handle_with_engine(
     // Check for pending auth — if the user is responding to an auth prompt,
     // treat the message as a token value and store it as a secret.
     {
-        let pending = state
-            .pending_auth
-            .write()
-            .await
-            .remove(&message.user_id);
+        let pending = state.pending_auth.write().await.remove(&message.user_id);
         if let Some(pending) = pending {
             let token = content.trim().to_string();
             if token.is_empty() || token.eq_ignore_ascii_case("cancel") {
@@ -949,10 +945,8 @@ pub async fn handle_with_engine(
             }
 
             if let Some(ref ss) = state.secrets_store {
-                let params = crate::secrets::CreateSecretParams::new(
-                    &pending.credential_name,
-                    &token,
-                );
+                let params =
+                    crate::secrets::CreateSecretParams::new(&pending.credential_name, &token);
                 match ss.create(&message.user_id, params).await {
                     Ok(_) => {
                         let _ = agent
@@ -982,12 +976,8 @@ pub async fn handle_with_engine(
                         };
                         let retry_content = pending.original_message;
                         drop(guard);
-                        return Box::pin(handle_with_engine(
-                            agent,
-                            &retry_msg,
-                            &retry_content,
-                        ))
-                        .await;
+                        return Box::pin(handle_with_engine(agent, &retry_msg, &retry_content))
+                            .await;
                     }
                     Err(e) => {
                         return Ok(Some(format!(
@@ -1210,9 +1200,7 @@ async fn await_thread_outcome(
                             })
                         })
                     })
-                    .unwrap_or_else(|| {
-                        format!("Provide your {} token", cred_name)
-                    });
+                    .unwrap_or_else(|| format!("Provide your {} token", cred_name));
 
                 // Store pending auth for this user
                 state.pending_auth.write().await.insert(
