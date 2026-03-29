@@ -739,30 +739,138 @@ pub async fn start_server(
     Ok(bound_addr)
 }
 
+// --- Frontend bundle assembly ---
+
+use ironclaw_frontend::assets;
+use ironclaw_frontend::{FrontendBundle, LayoutConfig, ResolvedWidget, WidgetManifest};
+
+/// Build customized HTML from workspace frontend config.
+///
+/// Returns `None` if workspace is unavailable or has no customizations,
+/// signaling the caller to serve the embedded default.
+async fn build_frontend_html(state: &GatewayState) -> Option<String> {
+    let ws = state.workspace.as_ref()?;
+
+    // Read layout config
+    let layout: LayoutConfig = match ws.read("frontend/layout.json").await {
+        Ok(doc) => serde_json::from_str(&doc.content).unwrap_or_default(),
+        Err(_) => LayoutConfig::default(),
+    };
+
+    // Read custom CSS
+    let custom_css = ws
+        .read("frontend/custom.css")
+        .await
+        .ok()
+        .map(|doc| doc.content)
+        .filter(|c| !c.trim().is_empty());
+
+    // Discover widgets
+    let mut widgets = Vec::new();
+    if let Ok(entries) = ws.list("frontend/widgets/").await {
+        for entry in entries {
+            if !entry.is_directory {
+                continue;
+            }
+            let name = entry.name().to_string();
+            let manifest_path = format!("frontend/widgets/{}/manifest.json", name);
+            let js_path = format!("frontend/widgets/{}/index.js", name);
+
+            let manifest: WidgetManifest = match ws.read(&manifest_path).await {
+                Ok(doc) => match serde_json::from_str(&doc.content) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+
+            let js = match ws.read(&js_path).await {
+                Ok(doc) => doc.content,
+                Err(_) => continue,
+            };
+
+            let css = ws
+                .read(&format!("frontend/widgets/{}/style.css", name))
+                .await
+                .ok()
+                .map(|doc| doc.content)
+                .filter(|c| !c.trim().is_empty());
+
+            // Check if widget is enabled in layout config (default: enabled)
+            let enabled = layout
+                .widgets
+                .get(&manifest.id)
+                .map(|w| w.enabled)
+                .unwrap_or(true);
+
+            if enabled {
+                widgets.push(ResolvedWidget { manifest, js, css });
+            }
+        }
+    }
+
+    // Skip assembly if there's nothing to customize
+    if layout.branding.title.is_none()
+        && layout.branding.colors.is_none()
+        && layout.tabs.order.is_none()
+        && layout.tabs.hidden.is_none()
+        && layout.chat.suggestions.is_none()
+        && layout.widgets.is_empty()
+        && custom_css.is_none()
+        && widgets.is_empty()
+    {
+        return None;
+    }
+
+    let bundle = FrontendBundle {
+        layout,
+        widgets,
+        custom_css,
+    };
+
+    Some(ironclaw_frontend::assemble_index(assets::INDEX_HTML, &bundle))
+}
+
 // --- Static file handlers ---
 //
 // All frontend assets are embedded in the `ironclaw_frontend` crate.
 // These handlers serve them with appropriate MIME types and cache headers.
 
-use ironclaw_frontend::assets;
-
-async fn index_handler() -> impl IntoResponse {
+async fn index_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> impl IntoResponse {
+    // Try to assemble customized HTML from workspace frontend config.
+    // Falls back to embedded HTML if workspace is unavailable or has no customizations.
+    let html = match build_frontend_html(&state).await {
+        Some(assembled) => assembled,
+        None => assets::INDEX_HTML.to_string(),
+    };
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        assets::INDEX_HTML,
+        html,
     )
 }
 
-async fn css_handler() -> impl IntoResponse {
+async fn css_handler(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
+    // Append custom CSS from workspace if it exists
+    let css = match &state.workspace {
+        Some(ws) => match ws.read("frontend/custom.css").await {
+            Ok(doc) if !doc.content.trim().is_empty() => {
+                format!("{}\n/* --- custom overrides --- */\n{}", assets::STYLE_CSS, doc.content)
+            }
+            _ => assets::STYLE_CSS.to_string(),
+        },
+        None => assets::STYLE_CSS.to_string(),
+    };
     (
         [
             (header::CONTENT_TYPE, "text/css"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        assets::STYLE_CSS,
+        css,
     )
 }
 
