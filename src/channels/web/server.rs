@@ -828,7 +828,10 @@ async fn build_frontend_html(state: &GatewayState) -> Option<String> {
         custom_css,
     };
 
-    Some(ironclaw_frontend::assemble_index(assets::INDEX_HTML, &bundle))
+    Some(ironclaw_frontend::assemble_index(
+        assets::INDEX_HTML,
+        &bundle,
+    ))
 }
 
 // --- Static file handlers ---
@@ -836,9 +839,7 @@ async fn build_frontend_html(state: &GatewayState) -> Option<String> {
 // All frontend assets are embedded in the `ironclaw_frontend` crate.
 // These handlers serve them with appropriate MIME types and cache headers.
 
-async fn index_handler(
-    State(state): State<Arc<GatewayState>>,
-) -> impl IntoResponse {
+async fn index_handler(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
     // Try to assemble customized HTML from workspace frontend config.
     // Falls back to embedded HTML if workspace is unavailable or has no customizations.
     let html = match build_frontend_html(&state).await {
@@ -859,7 +860,11 @@ async fn css_handler(State(state): State<Arc<GatewayState>>) -> impl IntoRespons
     let css = match &state.workspace {
         Some(ws) => match ws.read("frontend/custom.css").await {
             Ok(doc) if !doc.content.trim().is_empty() => {
-                format!("{}\n/* --- custom overrides --- */\n{}", assets::STYLE_CSS, doc.content)
+                format!(
+                    "{}\n/* --- custom overrides --- */\n{}",
+                    assets::STYLE_CSS,
+                    doc.content
+                )
             }
             _ => assets::STYLE_CSS.to_string(),
         },

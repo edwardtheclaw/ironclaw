@@ -1203,6 +1203,8 @@ function upgradeInlineJson(contentEl) {
     if (p.closest('pre') || p.closest('code')) return;
 
     var html = p.innerHTML;
+    if (!html.includes('{')) return; // Fast path: no braces at all
+
     // Match JSON-like objects: {...} (including Python-style single quotes)
     var jsonRegex = /(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})/g;
     var match;
@@ -1210,6 +1212,11 @@ function upgradeInlineJson(contentEl) {
 
     while ((match = jsonRegex.exec(html)) !== null) {
       var raw = match[1];
+      // Skip matches inside <code> tags by checking surrounding HTML
+      var before = html.substring(0, match.index);
+      var openCodes = (before.match(/<code/gi) || []).length;
+      var closeCodes = (before.match(/<\/code/gi) || []).length;
+      if (openCodes > closeCodes) continue; // Inside a <code> tag
       // Normalize Python-style single quotes to double quotes for parsing
       var normalized = raw.replace(/'/g, '"');
       try {
@@ -6841,4 +6848,13 @@ if (window.__IRONCLAW_LAYOUT__) {
       }
     }
   })();
+}
+
+// Drain any widgets that were registered before the DOM was ready.
+// _addWidgetTab queues them in _widgetInitQueue when tab-bar doesn't exist yet.
+if (IronClaw._widgetInitQueue && IronClaw._widgetInitQueue.length > 0) {
+  IronClaw._widgetInitQueue.forEach(function(def) {
+    _addWidgetTab(def);
+  });
+  IronClaw._widgetInitQueue = [];
 }

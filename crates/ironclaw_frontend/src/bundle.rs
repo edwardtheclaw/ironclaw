@@ -6,6 +6,21 @@
 use crate::layout::LayoutConfig;
 use crate::widget::{WidgetManifest, scope_css};
 
+/// Escape HTML special characters to prevent XSS in text content.
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Escape HTML attribute value (includes quotes).
+fn escape_html_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 /// A resolved frontend bundle ready for serving.
 ///
 /// Contains the layout configuration, resolved widgets (with their JS/CSS
@@ -77,15 +92,19 @@ pub fn assemble_index(base_html: &str, bundle: &FrontendBundle) -> String {
             if !scoped.trim().is_empty() {
                 body_injections.push(format!(
                     "<style data-widget=\"{}\">{}</style>",
-                    widget.manifest.id, scoped
+                    escape_html_attr(&widget.manifest.id),
+                    scoped
                 ));
             }
         }
 
-        // Widget JS inlined (avoids auth issues with <script src> on protected endpoints)
+        // Widget JS inlined (avoids auth issues with <script src> on protected endpoints).
+        // Escape </script> in widget JS to prevent script tag breakout (XSS).
+        let safe_js = widget.js.replace("</script>", "<\\/script>");
         body_injections.push(format!(
             "<script type=\"module\" data-widget=\"{}\">\n{}\n</script>",
-            widget.manifest.id, widget.js
+            escape_html_attr(&widget.manifest.id),
+            safe_js
         ));
     }
 
@@ -108,12 +127,15 @@ pub fn assemble_index(base_html: &str, bundle: &FrontendBundle) -> String {
         }
     }
 
-    // Override <title> if branding title is set
+    // Override <title> if branding title is set (HTML-escaped to prevent XSS)
     if let Some(ref title) = bundle.layout.branding.title {
         if let Some(start) = result.find("<title>") {
             if let Some(end) = result[start..].find("</title>") {
                 let end = start + end + "</title>".len();
-                result.replace_range(start..end, &format!("<title>{}</title>", title));
+                result.replace_range(
+                    start..end,
+                    &format!("<title>{}</title>", escape_html(title)),
+                );
             }
         }
     }
@@ -234,5 +256,138 @@ mod tests {
         let result = assemble_index(MINIMAL_HTML, &bundle);
         assert!(result.contains("data-custom-css"));
         assert!(result.contains("background: #111;"));
+    }
+
+    // ==================== Security Tests ====================
+
+    #[test]
+    fn test_assemble_index_title_xss_escaped() {
+        let bundle = FrontendBundle {
+            layout: LayoutConfig {
+                branding: BrandingConfig {
+                    title: Some("<script>alert(1)</script>".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = assemble_index(MINIMAL_HTML, &bundle);
+        // Title should be HTML-escaped, not rendered as a script tag
+        assert!(result.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!result.contains("<title><script>"));
+    }
+
+    #[test]
+    fn test_assemble_index_widget_js_script_breakout_escaped() {
+        let bundle = FrontendBundle {
+            widgets: vec![ResolvedWidget {
+                manifest: WidgetManifest {
+                    id: "evil".to_string(),
+                    name: "Evil Widget".to_string(),
+                    slot: WidgetSlot::Tab,
+                    icon: None,
+                    position: None,
+                },
+                js: "var x = '</script><script>alert(1)</script>';".to_string(),
+                css: None,
+            }],
+            ..Default::default()
+        };
+        let result = assemble_index(MINIMAL_HTML, &bundle);
+        // </script> in widget JS should be escaped to prevent tag breakout
+        assert!(!result.contains("</script><script>alert(1)"));
+        assert!(result.contains("<\\/script>"));
+    }
+
+    #[test]
+    fn test_assemble_index_widget_id_xss_escaped() {
+        let bundle = FrontendBundle {
+            widgets: vec![ResolvedWidget {
+                manifest: WidgetManifest {
+                    id: "x\" onload=\"alert(1)".to_string(),
+                    name: "XSS Widget".to_string(),
+                    slot: WidgetSlot::Tab,
+                    icon: None,
+                    position: None,
+                },
+                js: "// safe".to_string(),
+                css: None,
+            }],
+            ..Default::default()
+        };
+        let result = assemble_index(MINIMAL_HTML, &bundle);
+        // Widget ID in attributes should be escaped
+        assert!(result.contains("&quot;"));
+        assert!(!result.contains("onload=\"alert(1)\""));
+    }
+
+    // ==================== Edge Case Tests ====================
+
+    #[test]
+    fn test_escape_html_basic() {
+        assert_eq!(escape_html("<b>bold</b>"), "&lt;b&gt;bold&lt;/b&gt;");
+        assert_eq!(escape_html("a & b"), "a &amp; b");
+        assert_eq!(escape_html("safe text"), "safe text");
+        assert_eq!(escape_html(""), "");
+    }
+
+    #[test]
+    fn test_escape_html_attr_quotes() {
+        assert_eq!(
+            escape_html_attr("value\"with\"quotes"),
+            "value&quot;with&quot;quotes"
+        );
+    }
+
+    #[test]
+    fn test_assemble_index_missing_head_body_tags() {
+        // Gracefully handles malformed HTML (no </head> or </body>)
+        let html = "<html><body>content</body></html>";
+        let bundle = FrontendBundle {
+            layout: LayoutConfig {
+                branding: BrandingConfig {
+                    title: Some("Test".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = assemble_index(html, &bundle);
+        // Should still contain layout config (injected before </body>)
+        assert!(result.contains("window.__IRONCLAW_LAYOUT__"));
+    }
+
+    #[test]
+    fn test_assemble_index_empty_widget_js() {
+        let bundle = FrontendBundle {
+            widgets: vec![ResolvedWidget {
+                manifest: WidgetManifest {
+                    id: "empty".to_string(),
+                    name: "Empty Widget".to_string(),
+                    slot: WidgetSlot::Tab,
+                    icon: None,
+                    position: None,
+                },
+                js: String::new(),
+                css: None,
+            }],
+            ..Default::default()
+        };
+        let result = assemble_index(MINIMAL_HTML, &bundle);
+        // Empty JS should still produce a script tag (widget registers itself)
+        assert!(result.contains("data-widget=\"empty\""));
+    }
+
+    #[test]
+    fn test_assemble_index_empty_custom_css_skipped() {
+        let bundle = FrontendBundle {
+            custom_css: Some("   \n  ".to_string()),
+            ..Default::default()
+        };
+        let result = assemble_index(MINIMAL_HTML, &bundle);
+        // Whitespace-only custom CSS should be skipped
+        assert!(!result.contains("data-custom-css"));
     }
 }

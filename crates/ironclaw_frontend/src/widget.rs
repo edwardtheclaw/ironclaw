@@ -59,6 +59,14 @@ pub enum WidgetSlot {
 /// This prevents widget styles from bleeding into the main app or other widgets.
 /// The widget container element gets `data-widget="{id}"` set by the runtime.
 ///
+/// # Limitations
+///
+/// This is a simple single-pass parser that does not handle nested at-rules
+/// (e.g., `@media { .foo { ... } }`). At-rules with a `@` prefix are passed
+/// through unmodified, but their inner selectors are not scoped. For complex
+/// widget CSS with media queries, use the `data-widget` attribute selector
+/// manually in the widget's CSS.
+///
 /// # Example
 ///
 /// ```
@@ -174,5 +182,63 @@ mod tests {
     #[test]
     fn test_scope_css_empty() {
         assert_eq!(scope_css("", "w"), "");
+    }
+
+    #[test]
+    fn test_scope_css_at_rule_not_prefixed() {
+        // At-rules should not get the widget prefix
+        let input = "@media (max-width: 768px) { .mobile { display: block; } }";
+        let result = scope_css(input, "w");
+        // The @media rule itself should not be prefixed
+        assert!(!result.contains("[data-widget=\"w\"] @media"));
+    }
+
+    #[test]
+    fn test_scope_css_preserves_declarations() {
+        let input = ".box { padding: 10px; margin: 5px; }";
+        let result = scope_css(input, "w");
+        assert!(result.contains("padding: 10px;"));
+        assert!(result.contains("margin: 5px;"));
+    }
+
+    #[test]
+    fn test_scope_css_widget_id_with_special_chars() {
+        let result = scope_css(".x { color: red; }", "my-widget_v2");
+        assert!(result.contains("[data-widget=\"my-widget_v2\"] .x"));
+    }
+
+    #[test]
+    fn test_widget_slot_all_variants_serialize() {
+        // Ensure all slot variants round-trip through serde
+        let slots = vec![
+            WidgetSlot::Tab,
+            WidgetSlot::ChatHeader,
+            WidgetSlot::ChatFooter,
+            WidgetSlot::ChatActions,
+            WidgetSlot::Sidebar,
+            WidgetSlot::StatusLeft,
+            WidgetSlot::StatusRight,
+            WidgetSlot::SettingsSection,
+            WidgetSlot::ChatRenderer,
+        ];
+        for slot in slots {
+            let json = serde_json::to_string(&slot).unwrap();
+            let back: WidgetSlot = serde_json::from_str(&json).unwrap();
+            assert_eq!(slot, back);
+        }
+    }
+
+    #[test]
+    fn test_widget_manifest_minimal() {
+        // Manifest with only required fields
+        let json = serde_json::json!({
+            "id": "test",
+            "name": "Test Widget",
+            "slot": "tab"
+        });
+        let manifest: WidgetManifest = serde_json::from_value(json).unwrap();
+        assert_eq!(manifest.id, "test");
+        assert!(manifest.icon.is_none());
+        assert!(manifest.position.is_none());
     }
 }
