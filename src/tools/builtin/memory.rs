@@ -253,7 +253,7 @@ impl Tool for MemoryWriteTool {
                 },
                 "old_string": {
                     "type": "string",
-                    "description": "When present, switches to patch mode: finds and replaces this exact string in the document. Requires target to be a path (not 'memory' or 'daily_log')."
+                    "description": "When present, switches to patch mode: finds and replaces this exact string in the document. Works with any target including 'memory' and custom paths."
                 },
                 "new_string": {
                     "type": "string",

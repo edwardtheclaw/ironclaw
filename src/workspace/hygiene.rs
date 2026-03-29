@@ -42,10 +42,7 @@ pub struct HygieneConfig {
     /// Whether hygiene is enabled at all.
     pub enabled: bool,
     /// Maximum number of versions to keep per document.
-    ///
-    /// TODO: Wire up global version pruning once per-document iteration
-    /// is efficient (e.g., via a dedicated DB query). For now this field
-    /// is stored in config but not actively enforced during hygiene passes.
+    /// Enforced during hygiene passes for documents in cleaned directories.
     pub version_keep_count: u32,
     /// Minimum hours between hygiene passes.
     pub cadence_hours: u32,
@@ -180,6 +177,37 @@ pub async fn run_if_due(workspace: &Workspace, config: &HygieneConfig) -> Hygien
             }
             Err(e) => {
                 tracing::warn!(directory, "memory hygiene: failed to clean directory: {e}");
+            }
+        }
+    }
+
+    // Prune old document versions if configured.
+    if config.version_keep_count > 0 {
+        // Prune versions for documents in directories that were just cleaned.
+        // This avoids iterating ALL documents — we only prune where hygiene ran.
+        for (directory, _) in &report.directories_cleaned {
+            if let Ok(entries) = workspace.list(directory).await {
+                for entry in entries {
+                    if entry.is_directory || is_config_path(&entry.path) {
+                        continue;
+                    }
+                    let path = if entry.path.starts_with(directory.as_str()) {
+                        entry.path.clone()
+                    } else {
+                        format!("{}{}", directory, entry.path)
+                    };
+                    if let Ok(doc) = workspace.read(&path).await {
+                        match workspace
+                            .prune_versions(doc.id, config.version_keep_count as i32)
+                            .await
+                        {
+                            Ok(pruned) => report.versions_pruned += pruned,
+                            Err(e) => {
+                                tracing::debug!(path, "version prune failed: {e}");
+                            }
+                        }
+                    }
+                }
             }
         }
     }

@@ -440,6 +440,7 @@ impl WorkspaceStorage {
         }
     }
 
+    #[allow(dead_code)] // Part of WorkspaceStore trait; used by DB backends directly
     async fn get_latest_version_number(
         &self,
         document_id: Uuid,
@@ -891,11 +892,14 @@ impl Workspace {
     ///
     /// Returns the new version number, or `None` if skipped (empty content,
     /// identical hash, or versioning disabled via metadata).
+    ///
+    /// Accepts pre-resolved metadata to avoid redundant DB queries when the
+    /// caller (e.g., `write()`) will also pass metadata to `reindex_document()`.
     async fn maybe_save_version(
         &self,
         document_id: Uuid,
         current_content: &str,
-        path: &str,
+        metadata: &DocumentMetadata,
         changed_by: Option<&str>,
     ) -> Result<Option<i32>, WorkspaceError> {
         // Don't version empty documents
@@ -904,17 +908,17 @@ impl Workspace {
         }
 
         // Check metadata for skip_versioning flag
-        let metadata = self.resolve_metadata(path).await;
         if metadata.skip_versioning == Some(true) {
             return Ok(None);
         }
 
         let hash = content_sha256(current_content);
 
-        // Check if latest version already has this hash (skip duplicate saves)
-        if let Ok(Some(latest)) = self.storage.get_latest_version_number(document_id).await
-            && let Ok(ver) = self.storage.get_version(document_id, latest).await
-            && ver.content_hash == hash
+        // Check if latest version already has this hash (skip duplicate saves).
+        // Uses a single query instead of get_version + get_latest_version_number.
+        if let Ok(versions) = self.storage.list_versions(document_id, 1).await
+            && let Some(latest) = versions.first()
+            && latest.content_hash == hash
         {
             return Ok(None);
         }
@@ -965,13 +969,17 @@ impl Workspace {
             reject_if_injected(&path, &new_content)?;
         }
 
+        // Resolve metadata once — shared by versioning and indexing.
+        let metadata = self.resolve_metadata(&path).await;
+
         // Auto-version before updating
         let _ = self
-            .maybe_save_version(doc.id, &doc.content, &path, None)
+            .maybe_save_version(doc.id, &doc.content, &metadata, None)
             .await;
 
         self.storage.update_document(doc.id, &new_content).await?;
-        self.reindex_document(doc.id).await?;
+        self.reindex_document_with_metadata(doc.id, Some(&metadata))
+            .await?;
 
         let updated = self.storage.get_document_by_id(doc.id).await?;
         Ok(PatchResult {
@@ -1001,13 +1009,17 @@ impl Workspace {
             .get_or_create_document_by_path(&self.user_id, self.agent_id, &path)
             .await?;
 
+        // Resolve metadata once — shared by versioning and indexing.
+        let metadata = self.resolve_metadata(&path).await;
+
         // Auto-version previous content before overwriting
         let _ = self
-            .maybe_save_version(doc.id, &doc.content, &path, None)
+            .maybe_save_version(doc.id, &doc.content, &metadata, None)
             .await;
 
         self.storage.update_document(doc.id, content).await?;
-        self.reindex_document(doc.id).await?;
+        self.reindex_document_with_metadata(doc.id, Some(&metadata))
+            .await?;
 
         // Return updated doc
         self.storage.get_document_by_id(doc.id).await
@@ -1045,13 +1057,17 @@ impl Workspace {
             reject_if_injected(&path, &new_content)?;
         }
 
+        // Resolve metadata once — shared by versioning and indexing.
+        let metadata = self.resolve_metadata(&path).await;
+
         // Auto-version previous content before appending
         let _ = self
-            .maybe_save_version(doc.id, &doc.content, &path, None)
+            .maybe_save_version(doc.id, &doc.content, &metadata, None)
             .await;
 
         self.storage.update_document(doc.id, &new_content).await?;
-        self.reindex_document(doc.id).await?;
+        self.reindex_document_with_metadata(doc.id, Some(&metadata))
+            .await?;
         Ok(())
     }
 
@@ -1877,12 +1893,27 @@ impl Workspace {
     // ==================== Indexing ====================
 
     /// Re-index a document (chunk and generate embeddings).
-    async fn reindex_document(&self, document_id: Uuid) -> Result<(), WorkspaceError> {
+    /// Re-index a document (chunk and generate embeddings).
+    ///
+    /// Accepts optional pre-resolved metadata to skip a redundant `resolve_metadata`
+    /// call when the caller already has it (e.g., the `write()` path).
+    async fn reindex_document_with_metadata(
+        &self,
+        document_id: Uuid,
+        metadata: Option<&DocumentMetadata>,
+    ) -> Result<(), WorkspaceError> {
         // Get the document
         let doc = self.storage.get_document_by_id(document_id).await?;
 
         // Check metadata for skip_indexing flag
-        let metadata = self.resolve_metadata(&doc.path).await;
+        let resolved;
+        let metadata = match metadata {
+            Some(m) => m,
+            None => {
+                resolved = self.resolve_metadata(&doc.path).await;
+                &resolved
+            }
+        };
         if metadata.skip_indexing == Some(true) {
             // Delete any existing chunks and skip indexing
             self.storage.delete_chunks(document_id).await?;
@@ -1916,6 +1947,13 @@ impl Workspace {
         }
 
         Ok(())
+    }
+
+    /// Re-index a document, resolving metadata from the database.
+    ///
+    /// Convenience wrapper for callers that don't have pre-resolved metadata.
+    async fn reindex_document(&self, document_id: Uuid) -> Result<(), WorkspaceError> {
+        self.reindex_document_with_metadata(document_id, None).await
     }
 
     // ==================== Seeding ====================
