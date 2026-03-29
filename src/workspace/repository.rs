@@ -758,28 +758,60 @@ impl Repository {
         content_hash: &str,
         changed_by: Option<&str>,
     ) -> Result<i32, WorkspaceError> {
-        let conn = self.conn().await?;
-        let row = conn
+        let mut conn = self.conn().await?;
+
+        // Use a transaction to prevent concurrent writers from allocating
+        // the same version number. The SELECT FOR UPDATE locks the existing
+        // version rows for this document, serializing concurrent inserts.
+        let tx = conn
+            .transaction()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Failed to start transaction: {e}"),
+            })?;
+
+        let row = tx
             .query_one(
                 r#"
-                INSERT INTO memory_document_versions
-                    (id, document_id, version, content, content_hash, changed_by)
-                VALUES (
-                    gen_random_uuid(),
-                    $1,
-                    (SELECT COALESCE(MAX(version), 0) + 1
-                     FROM memory_document_versions WHERE document_id = $1),
-                    $2, $3, $4
-                )
-                RETURNING version
+                SELECT COALESCE(MAX(version), 0) + 1 AS next_version
+                FROM memory_document_versions
+                WHERE document_id = $1
+                FOR UPDATE
                 "#,
-                &[&document_id, &content, &content_hash, &changed_by],
+                &[&document_id],
             )
             .await
             .map_err(|e| WorkspaceError::SearchFailed {
-                reason: format!("Failed to save version: {e}"),
+                reason: format!("Failed to get next version number: {e}"),
             })?;
-        Ok(row.get(0))
+        let next_version: i32 = row.get(0);
+
+        tx.execute(
+            r#"
+            INSERT INTO memory_document_versions
+                (id, document_id, version, content, content_hash, changed_by)
+            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)
+            "#,
+            &[
+                &document_id,
+                &next_version,
+                &content,
+                &content_hash,
+                &changed_by,
+            ],
+        )
+        .await
+        .map_err(|e| WorkspaceError::SearchFailed {
+            reason: format!("Failed to save version: {e}"),
+        })?;
+
+        tx.commit()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Failed to commit version: {e}"),
+            })?;
+
+        Ok(next_version)
     }
 
     pub async fn get_version(

@@ -276,8 +276,17 @@ impl Tool for MemoryWriteTool {
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
-        // In patch mode (old_string present), content is not required.
+        // At least one mode must be provided: content for write/append, or old_string for patch.
         let is_patch_mode = params.get("old_string").and_then(|v| v.as_str()).is_some();
+        let has_content = params
+            .get("content")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty());
+        if !is_patch_mode && !has_content {
+            return Err(ToolError::InvalidParameters(
+                "Either 'content' (for write/append) or 'old_string'+'new_string' (for patch) is required".to_string(),
+            ));
+        }
         let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
         let target = params
@@ -316,12 +325,6 @@ impl Tool for MemoryWriteTool {
             });
 
             return Ok(ToolOutput::success(output, start.elapsed()));
-        }
-
-        if !is_patch_mode && content.trim().is_empty() {
-            return Err(ToolError::InvalidParameters(
-                "content cannot be empty (use old_string/new_string for patch mode)".to_string(),
-            ));
         }
 
         let append = params

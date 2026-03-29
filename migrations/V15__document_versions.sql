@@ -16,8 +16,9 @@ CREATE TABLE memory_document_versions (
 CREATE INDEX idx_doc_versions_lookup
     ON memory_document_versions(document_id, version DESC);
 
--- GIN index on metadata for JSON path queries (used by hygiene to find
--- .config documents with hygiene.enabled). The metadata column already
--- exists (V1) but was never indexed.
+-- GIN index on metadata for future JSON containment queries
+-- (e.g., WHERE metadata @> '{"hygiene": {"enabled": true}}').
+-- Not used by current queries (which use path LIKE) but enables
+-- efficient metadata-based filtering without a full table scan.
 CREATE INDEX idx_memory_documents_metadata
     ON memory_documents USING GIN (metadata jsonb_path_ops);

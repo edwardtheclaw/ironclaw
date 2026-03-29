@@ -825,6 +825,10 @@ impl Workspace {
     /// Resolve effective metadata for a document path.
     ///
     /// Resolution chain: document's own metadata → nearest ancestor `.config` → defaults.
+    ///
+    /// Uses a single `find_config_documents` query to fetch all `.config` docs,
+    /// then finds the nearest ancestor in-memory — O(1) DB queries instead of
+    /// O(depth) serial queries walking up the directory tree.
     pub async fn resolve_metadata(&self, path: &str) -> DocumentMetadata {
         // 1. Document's own metadata
         let doc_meta = self
@@ -834,32 +838,16 @@ impl Workspace {
             .ok()
             .map(|d| d.metadata);
 
-        // 2. Walk up parent directories looking for .config
-        let mut config_meta = None;
-        let normalized = normalize_path(path);
-        let mut current = normalized.as_str();
-        while let Some(slash_pos) = current.rfind('/') {
-            let parent = &current[..slash_pos];
-            let config_path = format!("{}/{CONFIG_FILE_NAME}", parent);
-            if let Ok(doc) = self
-                .storage
-                .get_document_by_path(&self.user_id, self.agent_id, &config_path)
-                .await
-            {
-                config_meta = Some(doc.metadata);
-                break;
-            }
-            current = parent;
-        }
-        // Also check root-level .config
-        if config_meta.is_none()
-            && let Ok(doc) = self
-                .storage
-                .get_document_by_path(&self.user_id, self.agent_id, CONFIG_FILE_NAME)
-                .await
-        {
-            config_meta = Some(doc.metadata);
-        }
+        // 2. Find nearest ancestor .config using a single query + in-memory match
+        let config_meta = self
+            .storage
+            .find_config_documents(&self.user_id, self.agent_id)
+            .await
+            .ok()
+            .and_then(|configs| {
+                let normalized = normalize_path(path);
+                find_nearest_config(&normalized, &configs)
+            });
 
         // 3. Merge: config as base, document metadata as overlay
         let base = config_meta.unwrap_or(serde_json::json!({}));
@@ -972,7 +960,8 @@ impl Workspace {
         // Resolve metadata once — shared by versioning and indexing.
         let metadata = self.resolve_metadata(&path).await;
 
-        // Auto-version before updating
+        // Auto-version before updating.
+        // Fail-open: versioning failures must not block writes.
         let _ = self
             .maybe_save_version(doc.id, &doc.content, &metadata, Some(&self.user_id))
             .await;
@@ -1012,7 +1001,8 @@ impl Workspace {
         // Resolve metadata once — shared by versioning and indexing.
         let metadata = self.resolve_metadata(&path).await;
 
-        // Auto-version previous content before overwriting
+        // Auto-version previous content before overwriting.
+        // Fail-open: versioning failures must not block writes.
         let _ = self
             .maybe_save_version(doc.id, &doc.content, &metadata, Some(&self.user_id))
             .await;
@@ -1060,7 +1050,8 @@ impl Workspace {
         // Resolve metadata once — shared by versioning and indexing.
         let metadata = self.resolve_metadata(&path).await;
 
-        // Auto-version previous content before appending
+        // Auto-version previous content before appending.
+        // Fail-open: versioning failures must not block writes.
         let _ = self
             .maybe_save_version(doc.id, &doc.content, &metadata, Some(&self.user_id))
             .await;
@@ -2225,6 +2216,33 @@ impl Workspace {
     }
 }
 
+/// Find the nearest ancestor `.config` document for a given path.
+///
+/// Given a pre-fetched list of all `.config` documents (from `find_config_documents`),
+/// walks up the path components to find the most specific (nearest parent) config.
+/// Returns the metadata of the matching `.config`, or `None` if no ancestor has one.
+fn find_nearest_config(path: &str, configs: &[MemoryDocument]) -> Option<serde_json::Value> {
+    // Build a set of config paths → metadata for O(1) lookup
+    let config_map: std::collections::HashMap<&str, &serde_json::Value> = configs
+        .iter()
+        .map(|doc| (doc.path.as_str(), &doc.metadata))
+        .collect();
+
+    // Walk up the path looking for the nearest ancestor .config
+    let mut current = path;
+    while let Some(slash_pos) = current.rfind('/') {
+        let parent = &current[..slash_pos];
+        let config_path = format!("{}/{CONFIG_FILE_NAME}", parent);
+        if let Some(meta) = config_map.get(config_path.as_str()) {
+            return Some((*meta).clone());
+        }
+        current = parent;
+    }
+
+    // Check root-level .config
+    config_map.get(CONFIG_FILE_NAME).map(|m| (*m).clone())
+}
+
 /// Normalize a file path (remove leading/trailing slashes, collapse //).
 fn normalize_path(path: &str) -> String {
     let path = path.trim().trim_matches('/');
@@ -2603,7 +2621,11 @@ mod versioning_tests {
         ws.write("test.md", "v2").await.unwrap();
 
         let versions = ws.list_versions(doc.id, 50).await.unwrap();
-        assert_eq!(versions.len(), 1, "should have 1 version (the pre-v2 content)");
+        assert_eq!(
+            versions.len(),
+            1,
+            "should have 1 version (the pre-v2 content)"
+        );
         assert!(versions[0].content_hash.starts_with("sha256:"));
 
         let v = ws.get_version(doc.id, versions[0].version).await.unwrap();
@@ -2620,7 +2642,10 @@ mod versioning_tests {
         let versions = ws.list_versions(doc.id, 50).await.unwrap();
         // First write creates the doc (empty → "same"), second write is "same" → "same"
         // The hash check should deduplicate the second write
-        assert!(versions.len() <= 1, "identical writes should not create duplicate versions");
+        assert!(
+            versions.len() <= 1,
+            "identical writes should not create duplicate versions"
+        );
     }
 
     #[tokio::test]
@@ -2633,7 +2658,10 @@ mod versioning_tests {
         assert!(!versions.is_empty(), "append should create a version");
 
         let v = ws.get_version(doc.id, versions[0].version).await.unwrap();
-        assert_eq!(v.content, "line1", "version should contain pre-append content");
+        assert_eq!(
+            v.content, "line1",
+            "version should contain pre-append content"
+        );
     }
 
     #[tokio::test]
@@ -2682,7 +2710,10 @@ mod versioning_tests {
         let versions = ws.list_versions(doc.id, 50).await.unwrap();
         assert!(!versions.is_empty(), "patch should create a version");
         let v = ws.get_version(doc.id, versions[0].version).await.unwrap();
-        assert_eq!(v.content, "original", "version should contain pre-patch content");
+        assert_eq!(
+            v.content, "original",
+            "version should contain pre-patch content"
+        );
     }
 
     #[tokio::test]
@@ -2728,7 +2759,11 @@ mod versioning_tests {
             .unwrap();
 
         let meta = ws.resolve_metadata("projects/important.md").await;
-        assert_eq!(meta.skip_indexing, Some(false), "document metadata should override .config");
+        assert_eq!(
+            meta.skip_indexing,
+            Some(false),
+            "document metadata should override .config"
+        );
     }
 
     #[tokio::test]
@@ -2749,7 +2784,11 @@ mod versioning_tests {
 
         // Nearest parent (projects/.config) wins over root
         let meta = ws.resolve_metadata("projects/alpha/notes.md").await;
-        assert_eq!(meta.skip_indexing, Some(false), "nearest ancestor .config should win");
+        assert_eq!(
+            meta.skip_indexing,
+            Some(false),
+            "nearest ancestor .config should win"
+        );
     }
 
     #[tokio::test]
@@ -2758,12 +2797,9 @@ mod versioning_tests {
 
         // Set skip_versioning on ephemeral/ directory
         let config_doc = ws.write("ephemeral/.config", "").await.unwrap();
-        ws.update_metadata(
-            config_doc.id,
-            &serde_json::json!({"skip_versioning": true}),
-        )
-        .await
-        .unwrap();
+        ws.update_metadata(config_doc.id, &serde_json::json!({"skip_versioning": true}))
+            .await
+            .unwrap();
 
         // Write multiple times — no versions should be created
         let doc = ws.write("ephemeral/data.md", "v1").await.unwrap();
@@ -2771,7 +2807,11 @@ mod versioning_tests {
         ws.write("ephemeral/data.md", "v3").await.unwrap();
 
         let versions = ws.list_versions(doc.id, 50).await.unwrap();
-        assert_eq!(versions.len(), 0, "skip_versioning should prevent version creation");
+        assert_eq!(
+            versions.len(),
+            0,
+            "skip_versioning should prevent version creation"
+        );
     }
 
     #[tokio::test]
