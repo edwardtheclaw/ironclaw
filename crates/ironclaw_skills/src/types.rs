@@ -124,75 +124,12 @@ pub struct SkillManifest {
     #[serde(default)]
     pub credentials: Vec<SkillCredentialSpec>,
     /// Gating requirements (binaries, env vars, config files, companion skills).
-    /// Top-level field — preferred over the legacy `metadata.openclaw.requires` path.
     #[serde(default)]
     pub requires: GatingRequirements,
-    /// Optional metadata (legacy; new skills should use top-level `requires` instead).
-    #[serde(default)]
-    pub metadata: Option<SkillMetadata>,
 }
 
 fn default_version() -> String {
     "0.0.0".to_string()
-}
-
-impl SkillManifest {
-    /// Return the effective gating requirements, merging the top-level `requires`
-    /// field with the legacy `metadata.openclaw.requires` path.
-    ///
-    /// Top-level fields take precedence when both are populated; legacy fields
-    /// are appended for any category that is empty at the top level.
-    pub fn effective_requires(&self) -> GatingRequirements {
-        let legacy = self
-            .metadata
-            .as_ref()
-            .and_then(|m| m.openclaw.as_ref())
-            .map(|oc| &oc.requires);
-
-        let Some(legacy) = legacy else {
-            return self.requires.clone();
-        };
-
-        // Merge: use top-level if non-empty, otherwise fall back to legacy.
-        GatingRequirements {
-            bins: if self.requires.bins.is_empty() {
-                legacy.bins.clone()
-            } else {
-                self.requires.bins.clone()
-            },
-            env: if self.requires.env.is_empty() {
-                legacy.env.clone()
-            } else {
-                self.requires.env.clone()
-            },
-            config: if self.requires.config.is_empty() {
-                legacy.config.clone()
-            } else {
-                self.requires.config.clone()
-            },
-            skills: if self.requires.skills.is_empty() {
-                legacy.skills.clone()
-            } else {
-                self.requires.skills.clone()
-            },
-        }
-    }
-}
-
-/// Optional metadata section in SKILL.md frontmatter.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SkillMetadata {
-    /// OpenClaw-specific metadata.
-    #[serde(default)]
-    pub openclaw: Option<OpenClawMeta>,
-}
-
-/// OpenClaw-specific metadata.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct OpenClawMeta {
-    /// Gating requirements that must be met for the skill to load.
-    #[serde(default)]
-    pub requires: GatingRequirements,
 }
 
 /// Requirements that must be satisfied for a skill to load.
@@ -491,22 +428,23 @@ activation:
     }
 
     #[test]
-    fn test_parse_openclaw_metadata() {
+    fn test_parse_requires() {
         let yaml = r#"
 name: test-skill
-metadata:
-  openclaw:
-    requires:
-      bins: ["vale"]
-      env: ["VALE_CONFIG"]
-      config: ["/etc/vale.ini"]
+requires:
+  bins: ["vale"]
+  env: ["VALE_CONFIG"]
+  config: ["/etc/vale.ini"]
+  skills: ["commitment-triage", "commitment-digest"]
 "#;
         let manifest: SkillManifest = serde_yml::from_str(yaml).expect("parse failed");
-        let meta = manifest.metadata.unwrap();
-        let openclaw = meta.openclaw.unwrap();
-        assert_eq!(openclaw.requires.bins, vec!["vale"]);
-        assert_eq!(openclaw.requires.env, vec!["VALE_CONFIG"]);
-        assert_eq!(openclaw.requires.config, vec!["/etc/vale.ini"]);
+        assert_eq!(manifest.requires.bins, vec!["vale"]);
+        assert_eq!(manifest.requires.env, vec!["VALE_CONFIG"]);
+        assert_eq!(manifest.requires.config, vec!["/etc/vale.ini"]);
+        assert_eq!(
+            manifest.requires.skills,
+            vec!["commitment-triage", "commitment-digest"]
+        );
     }
 
     #[test]
@@ -519,7 +457,6 @@ metadata:
                 activation: ActivationCriteria::default(),
                 credentials: vec![],
                 requires: GatingRequirements::default(),
-                metadata: None,
             },
             prompt_content: "test prompt".to_string(),
             trust: SkillTrust::Trusted,

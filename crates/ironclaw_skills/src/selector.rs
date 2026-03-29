@@ -190,7 +190,6 @@ mod tests {
                 },
                 credentials: vec![],
                 requires: GatingRequirements::default(),
-                metadata: None,
             },
             prompt_content: "Test prompt".to_string(),
             trust: SkillTrust::Trusted,

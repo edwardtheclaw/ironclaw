@@ -611,11 +611,9 @@ async fn load_and_validate_skill(
     let manifest = parsed.manifest;
     let prompt_content = parsed.prompt_content;
 
-    // Check gating requirements (merged from top-level `requires` and legacy
-    // `metadata.openclaw.requires`)
+    // Check gating requirements
     {
-        let effective = manifest.effective_requires();
-        let result = gating::check_requirements(&effective).await;
+        let result = gating::check_requirements(&manifest.requires).await;
         if !result.passed {
             return Err(SkillRegistryError::GatingFailed {
                 name: manifest.name.clone(),
@@ -698,10 +696,9 @@ async fn load_from_content(
     let manifest = parsed.manifest;
     let prompt_content = parsed.prompt_content;
 
-    // Check gating requirements (merged from top-level and legacy path)
+    // Check gating requirements
     {
-        let effective = manifest.effective_requires();
-        let result = gating::check_requirements(&effective).await;
+        let result = gating::check_requirements(&manifest.requires).await;
         if !result.passed {
             return Err(SkillRegistryError::GatingFailed {
                 name: manifest.name.clone(),
@@ -842,7 +839,7 @@ mod tests {
 
         fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: gated-skill\nmetadata:\n  openclaw:\n    requires:\n      bins: [\"__nonexistent_bin__\"]\n---\n\nGated prompt.\n",
+            "---\nname: gated-skill\nrequires:\n  bins: [\"__nonexistent_bin__\"]\n---\n\nGated prompt.\n",
         ).unwrap();
 
         let mut registry = SkillRegistry::new(dir.path().to_path_buf());
@@ -1292,7 +1289,8 @@ mod tests {
 
         let bundled: &'static [(String, String)] = Box::leak(Box::new(vec![(
             "gated".to_string(),
-            "---\nname: gated\nmetadata:\n  openclaw:\n    requires:\n      bins: [\"__nonexistent__\"]\n---\n\nGated.\n".to_string(),
+            "---\nname: gated\nrequires:\n  bins: [\"__nonexistent__\"]\n---\n\nGated.\n"
+                .to_string(),
         )]));
 
         let mut registry =

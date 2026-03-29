@@ -354,7 +354,7 @@ impl Tool for SkillInstallTool {
                 .registry
                 .write()
                 .map_err(|e| ToolError::ExecutionFailed(format!("Lock poisoned: {}", e)))?;
-            let reqs = loaded_skill.manifest.effective_requires();
+            let reqs = loaded_skill.manifest.requires.clone();
             guard
                 .commit_install(&skill_name, loaded_skill)
                 .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
@@ -362,43 +362,37 @@ impl Tool for SkillInstallTool {
         };
 
         // Chain-install missing skill dependencies.
+        // Cap at 10 to bound total fetch time from malicious/large manifests.
+        const MAX_CHAIN_DEPS: usize = 10;
         let mut chain_installed: Vec<String> = Vec::new();
         let mut chain_failed: Vec<String> = Vec::new();
         let mut chain_need_approval: Vec<String> = Vec::new();
 
         if !required_skills.is_empty() {
-            for dep_name in &required_skills {
-                // Check if already present (read lock)
-                let already_present = {
-                    let guard = self
-                        .registry
-                        .read()
-                        .map_err(|e| ToolError::ExecutionFailed(format!("Lock poisoned: {}", e)))?;
-                    guard.has(dep_name)
-                };
-                if already_present {
-                    continue;
-                }
+            // Batch lookups under a single read lock to avoid per-iteration
+            // lock thrashing: filter missing deps and grab install dir once.
+            let (missing_deps, user_dir) = {
+                let guard = self
+                    .registry
+                    .read()
+                    .map_err(|e| ToolError::ExecutionFailed(format!("Lock poisoned: {}", e)))?;
+                let missing: Vec<String> = required_skills
+                    .iter()
+                    .filter(|name| !guard.has(name))
+                    .take(MAX_CHAIN_DEPS)
+                    .cloned()
+                    .collect();
+                (missing, guard.install_target_dir().to_path_buf())
+            };
 
-                // Check if the dependency exists as a local workspace/user skill
-                // that just hasn't been loaded yet — not applicable since discover_all
-                // already loaded everything. So we fetch from catalog.
+            for dep_name in &missing_deps {
                 let download_url = ironclaw_skills::catalog::skill_download_url(
                     self.catalog.registry_url(),
                     dep_name,
                 );
                 match fetch_skill_content(&download_url).await {
                     Ok(dep_content) => {
-                        // Hub skills are installed as "Installed" trust (read-only
-                        // tools). We auto-install without approval since the parent
-                        // skill was already approved by the user.
                         let normalized = ironclaw_skills::normalize_line_endings(&dep_content);
-                        let user_dir = {
-                            let guard = self.registry.read().map_err(|e| {
-                                ToolError::ExecutionFailed(format!("Lock poisoned: {}", e))
-                            })?;
-                            guard.install_target_dir().to_path_buf()
-                        };
                         match ironclaw_skills::registry::SkillRegistry::prepare_install_to_disk(
                             &user_dir,
                             dep_name,
@@ -407,9 +401,14 @@ impl Tool for SkillInstallTool {
                         .await
                         {
                             Ok((name, skill)) => {
+                                // Re-check under write lock to handle TOCTOU race
+                                // with concurrent installs.
                                 let mut guard = self.registry.write().map_err(|e| {
                                     ToolError::ExecutionFailed(format!("Lock poisoned: {}", e))
                                 })?;
+                                if guard.has(&name) {
+                                    continue;
+                                }
                                 match guard.commit_install(&name, skill) {
                                     Ok(()) => chain_installed.push(name),
                                     Err(e) => chain_failed.push(format!("{}: {}", dep_name, e)),
@@ -419,7 +418,6 @@ impl Tool for SkillInstallTool {
                         }
                     }
                     Err(_) => {
-                        // Could not fetch from catalog — report as needing manual install
                         chain_need_approval.push(dep_name.clone());
                     }
                 }

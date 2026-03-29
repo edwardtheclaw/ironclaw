@@ -310,7 +310,7 @@ async fn cmd_info(config: &SkillsConfig, name: &str, json: bool) -> anyhow::Resu
     println!("  Max tokens:  {}", act.max_context_tokens);
 
     {
-        let reqs = skill.manifest.effective_requires();
+        let reqs = &skill.manifest.requires;
         if !reqs.bins.is_empty() {
             println!("  Requires bins:    {}", reqs.bins.join(", "));
         }
