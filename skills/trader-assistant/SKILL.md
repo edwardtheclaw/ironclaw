@@ -20,7 +20,7 @@ activation:
     - trading
     - finance
     - setup
-  max_context_tokens: 2000
+  max_context_tokens: 2500
 ---
 
 # Financial Trader — Commitment System Setup
@@ -30,6 +30,19 @@ You are configuring the commitments system for a financial trader. Their day inv
 - Market hours: intense, real-time. Speed matters — seconds count for some signals
 - Post-market: journaling, reviewing positions, reading research, planning next day
 - Information velocity is extreme; contradictory signals are common
+
+## Companion skills
+
+This bundle relies on these skills activating during conversation (they are keyword-triggered, no manual install needed):
+
+| Skill | Activates when | What it does |
+|---|---|---|
+| `commitment-triage` | User mentions obligations, deadlines | Extracts signals, creates/resolves commitments |
+| `commitment-digest` | User asks "show commitments" | Composes formatted summary |
+| `decision-capture` | User makes a trade decision ("sold half my AAPL") | Records decision with rationale for journaling |
+| `delegation-tracker` | User delegates research tasks | Tracks delegation follow-ups |
+
+If any of these skills are missing from the `skills/` directory, tell the user which ones are needed.
 
 ## Step 1: Ask configuration questions
 
@@ -42,7 +55,18 @@ You are configuring the commitments system for a financial trader. Their day inv
 
 ## Step 2: Create workspace structure
 
-Create the full commitments workspace if it doesn't exist, plus trader-specific files:
+Run the `commitment-setup` skill's workspace creation procedure. Specifically:
+
+1. Check if `commitments/README.md` exists via `memory_read`. If it does, skip to creating trader-specific files.
+2. Write `commitments/README.md` with the full schema — it must document the frontmatter schemas for signals, commitments, decisions, and parked ideas (see `commitment-setup` skill for the complete content).
+3. Create placeholder READMEs in each subdirectory to establish the structure:
+   - `commitments/open/README.md` — "Active commitments."
+   - `commitments/resolved/README.md` — "Completed commitments archive."
+   - `commitments/signals/pending/README.md` — "Signals awaiting triage."
+   - `commitments/signals/expired/README.md` — "Expired signals."
+   - `commitments/decisions/README.md` — "Captured decisions."
+   - `commitments/parked-ideas/README.md` — "Ideas for later."
+4. Create trader-specific files:
 
 ```
 memory_write(target="commitments/positions.md", content="# Current Positions\n\nMaintain your positions here. The agent reads this to score signal relevance.\n\n## Format\n\n- TICKER: SIZE, entry PRICE, thesis: BRIEF_THESIS\n\nExample:\n- AAPL: 500 shares, entry $175, thesis: AI integration undervalued\n- SPY Apr 520P: 10 contracts, thesis: hedging macro risk\n\n## Positions\n\n(Add your positions here)", append=false)

@@ -30,6 +30,20 @@ You are configuring the commitments system for an executive or manager. Their da
 - Constant delegation — most commitments are "make sure someone else does X"
 - Information flowing in both directions: team → executive (synthesis needed) and executive → team (tracking needed)
 
+## Companion skills
+
+This bundle relies on these skills activating during conversation (they are keyword-triggered, no manual install needed):
+
+| Skill | Activates when | What it does |
+|---|---|---|
+| `commitment-triage` | User mentions obligations, deadlines, promises | Extracts signals, creates/resolves commitments |
+| `commitment-digest` | User asks "show commitments" or similar | Composes formatted summary |
+| `decision-capture` | User makes a decision ("let's go with X") | Records decision with rationale |
+| `delegation-tracker` | User delegates ("tell Sarah to...", "waiting on...") | Tracks delegation, flags stale follow-ups |
+| `idea-parking` | User says "park this idea", "save for later" | Parks ideas for periodic resurfacing |
+
+If any of these skills are missing from the `skills/` directory, tell the user which ones are needed and where to find them.
+
 ## Step 1: Ask configuration questions
 
 Before creating anything, ask the user:
@@ -44,12 +58,17 @@ Use reasonable defaults if the user says "just set it up."
 
 ## Step 2: Create workspace structure
 
-Check if `commitments/README.md` exists. If not, create the full commitments workspace structure:
+Run the `commitment-setup` skill's workspace creation procedure. Specifically:
 
-1. Write `commitments/README.md` with the standard schema (same as commitment-setup skill)
-2. Create placeholder READMEs in subdirectories: `open/`, `resolved/`, `signals/pending/`, `signals/expired/`, `decisions/`, `parked-ideas/`
-
-If it already exists, skip this step and move to configuring routines.
+1. Check if `commitments/README.md` exists via `memory_read`. If it does, skip to Step 3.
+2. Write `commitments/README.md` with the full schema. Use `memory_read("commitments/README.md")` from the `commitment-setup` skill output, or write it fresh — it must document the frontmatter schemas for signals, commitments, decisions, and parked ideas (see `commitment-setup` skill for the complete content).
+3. Create placeholder READMEs in each subdirectory to establish the structure:
+   - `commitments/open/README.md` — "Active commitments."
+   - `commitments/resolved/README.md` — "Completed commitments archive."
+   - `commitments/signals/pending/README.md` — "Signals awaiting triage."
+   - `commitments/signals/expired/README.md` — "Expired signals."
+   - `commitments/decisions/README.md` — "Captured decisions."
+   - `commitments/parked-ideas/README.md` — "Ideas for later."
 
 ## Step 3: Create tuned routines
 

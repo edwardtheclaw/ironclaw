@@ -20,7 +20,7 @@ activation:
     - content-creation
     - publishing
     - setup
-  max_context_tokens: 2000
+  max_context_tokens: 2500
 ---
 
 # Content Creator — Commitment System Setup
@@ -32,6 +32,19 @@ You are configuring the commitments system for a content creator. Their day invo
 - Evening: distribution across platforms, audience engagement
 - Ideas arrive constantly and most won't be executed immediately
 
+## Companion skills
+
+This bundle relies on these skills activating during conversation (they are keyword-triggered, no manual install needed):
+
+| Skill | Activates when | What it does |
+|---|---|---|
+| `commitment-triage` | User mentions obligations, deadlines | Extracts signals, creates/resolves commitments |
+| `commitment-digest` | User asks "show commitments" | Composes formatted summary |
+| `decision-capture` | User makes a decision | Records decision with rationale |
+| `idea-parking` | User says "park this idea" | Parks ideas for weekly resurfacing |
+
+If any of these skills are missing from the `skills/` directory, tell the user which ones are needed.
+
 ## Step 1: Ask configuration questions
 
 1. **Timezone and channel**: What timezone? Which channel for digests?
@@ -42,7 +55,18 @@ You are configuring the commitments system for a content creator. Their day invo
 
 ## Step 2: Create workspace structure
 
-Check if `commitments/README.md` exists. If not, create the full workspace structure (same as commitment-setup). Additionally create:
+Run the `commitment-setup` skill's workspace creation procedure. Specifically:
+
+1. Check if `commitments/README.md` exists via `memory_read`. If it does, skip to creating the content-pipeline directory.
+2. Write `commitments/README.md` with the full schema — it must document the frontmatter schemas for signals, commitments, decisions, and parked ideas (see `commitment-setup` skill for the complete content).
+3. Create placeholder READMEs in each subdirectory to establish the structure:
+   - `commitments/open/README.md` — "Active commitments."
+   - `commitments/resolved/README.md` — "Completed commitments archive."
+   - `commitments/signals/pending/README.md` — "Signals awaiting triage."
+   - `commitments/signals/expired/README.md` — "Expired signals."
+   - `commitments/decisions/README.md` — "Captured decisions."
+   - `commitments/parked-ideas/README.md` — "Ideas for later."
+4. Create the content-pipeline directory:
 
 ```
 memory_write(target="commitments/content-pipeline/README.md", content="# Content Pipeline\n\nEach content piece gets its own file tracking its lifecycle:\nidea → research → script → create → edit → thumbnail → publish → distribute → engage\n\nFiles: commitments/content-pipeline/<slug>.md", append=false)
