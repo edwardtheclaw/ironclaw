@@ -194,12 +194,14 @@ def select_skills(skills, goal, max_candidates=3, max_tokens=4000):
 def format_skills(skills):
     """Format selected skills for system prompt injection."""
     parts = ["\n## Active Skills\n"]
+    skill_names = []
     for skill in skills:
         meta = skill.get("metadata", {})
         name = meta.get("name", "unknown")
         version = meta.get("version", "?")
         trust = meta.get("trust", "trusted").upper()
         content = skill.get("content", "")
+        skill_names.append(str(name))
 
         parts.append('<skill name="' + str(name) + '" version="' +
                       str(version) + '" trust="' + trust + '">')
@@ -215,6 +217,14 @@ def format_skills(skills):
             for sn in snippets:
                 parts.append("- `" + sn.get("name", "?") + "()` — " +
                               sn.get("description", "") + "\n")
+
+    if skill_names:
+        names_str = ", ".join(skill_names)
+        parts.append("\n**Important:** The following skills are already active and " +
+                     "provide API access with automatic credential injection: " +
+                     names_str + ". Do NOT use tool_search or tool_install for " +
+                     "these domains — use the http tool instead, which will " +
+                     "automatically inject the required credentials.\n")
 
     return "\n".join(parts)
 

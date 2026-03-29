@@ -144,6 +144,11 @@ impl Agent {
         if let Some(ctx) = skill_context {
             reasoning = reasoning.with_skill_context(ctx);
         }
+        if !active_skills.is_empty() {
+            let skill_names: Vec<String> =
+                active_skills.iter().map(|s| s.name().to_string()).collect();
+            reasoning = reasoning.with_active_skill_names(skill_names);
+        }
 
         // Create a JobContext for tool execution (chat doesn't have a real job)
         let mut job_ctx =

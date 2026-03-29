@@ -194,6 +194,63 @@ Three fixes driven by analyzing a live engine trace (`engine_trace_20260328T0305
 
 **Test coverage**: 2 new tests (platform info injection + absence). 195 engine tests pass, zero clippy warnings.
 
+## Session 10: Workspace Restructure, /expected Command, Cleanup (2026-03-28)
+
+Large quality-of-life session focused on making the engine's internal state inspectable and the self-improvement loop actionable.
+
+### Workspace Storage Overhaul
+
+The engine stores all v2 state (threads, missions, knowledge, orchestrator code) in the workspace `memory_documents` table. Previously: 227 files with opaque UUID filenames, JSON-wrapped content, no cleanup, no index.
+
+**New layout** (`src/bridge/store_adapter.rs` — full rewrite):
+
+```
+engine/
+├── README.md                              (auto-generated index)
+├── knowledge/                             (frontmatter+markdown, human-readable)
+│   ├── lessons/{slug}--{id8}.md
+│   ├── skills/{slug}--{id8}.md
+│   └── summaries/{slug}--{id8}.md
+├── orchestrator/
+│   ├── v0.py                              (compiled-in default, auto-synced)
+│   ├── codeact-preamble-overlay.md        (runtime prompt patches)
+│   └── failures.json
+├── projects/{slug}/
+│   ├── project.json
+│   └── missions/{slug}/
+│       └── mission.json                   (working files can go alongside)
+└── .runtime/                              (internal, hidden from browsing)
+    ├── threads/active/, threads/archive/
+    ├── leases/, events/, steps/, conversations/
+```
+
+Key design decisions:
+- **Slugified filenames** from titles — `validate-tool-names-before-call--65c9f5cd.md` instead of UUID.json
+- **Frontmatter+markdown** for knowledge docs — YAML metadata header + raw content body. `memory_read` returns human-readable markdown, not wrapped JSON
+- **Orchestrator + prompts together** — both are self-modifiable runtime code; prompt overlays sit alongside Python versions
+- **Missions under projects** — each mission gets a named folder where the self-improvement agent can store working files
+- **`.runtime/` prefix** for internal state — threads, leases, events hidden from casual `memory_tree` browsing
+- **Terminal state cleanup** — completed/failed threads archived to compact JSON summaries, dead leases deleted. Runs at startup and periodically
+- **Auto-generated README** at `engine/README.md` with knowledge doc counts, mission status, active thread count
+
+### /expected Command (User Feedback Loop)
+
+New submission command: `/expected <what should have happened>`. Captures recent conversation turns (last 5: user input, tool calls, responses, errors) and fires a `user_feedback:expected_behavior` system event into the self-improvement pipeline.
+
+**Flow**: User → `/expected should have logged in via GitHub OAuth` → handler packages recent context → fires via both v2 MissionManager and v1 RoutineEngine → expected-behavior learning mission investigates gap, classifies root cause (MISSING_CAPABILITY / WRONG_TOOL_CHOICE / PROMPT_GAP / CONFIG_ISSUE / BUG), applies fix.
+
+Files: `src/agent/submission.rs` (parser), `src/agent/commands.rs` (handler), `src/agent/agent_loop.rs` (mission_manager slot + dispatch), `src/bridge/router.rs` (wiring), `crates/ironclaw_engine/src/runtime/mission.rs` (4th learning mission), `crates/ironclaw_engine/prompts/mission_expected_behavior.md` (goal prompt).
+
+### Other Fixes
+
+- **NeedApproval state transition** — orchestrator Python now calls `__transition_to__("waiting")` before returning approval outcomes. Rust safety net in loop_engine.rs. Previously: denying a tool use errored with "thread not resumable from Running".
+- **Monty runtime limitations documented** in CodeAct preamble — no stdlib, single imports, no classes/with/match. Agent no longer tries `import csv, io, math`.
+- **`MONTY.md` tracking file** — pin version, all limitations, upgrade process.
+- **Gateway new-thread fix** — `createNewThread()` now eagerly resets read-only state.
+- **Glob re-exports removed** — `pub use ironclaw_safety::*` and `pub use ironclaw_skills::*` deleted; ~35 files migrated to direct imports.
+- **Clippy cleanup** — collapsible ifs, shadow imports, missing SkillActivated match arm, duplicate repl.rs arms. Zero warnings across all crates.
+- **Mission prompt templates extracted** to `crates/ironclaw_engine/prompts/mission_*.md` from inline Rust strings.
+
 ## Architecture Evolution
 
 ```
@@ -209,6 +266,8 @@ Session 8:    Skills-based OAuth (credential specs in YAML frontmatter)
               + HTTP tool zero-leak hardening + mission capability leases
 Session 9:    CodeAct event pipeline fix (ActionExecuted events were lost)
               + Monty globals() builtin + platform self-awareness injection
+Session 10:   Workspace restructure (human-readable paths, frontmatter,
+              cleanup, README) + /expected feedback loop + approval fix
 ```
 
 ## Key Commits

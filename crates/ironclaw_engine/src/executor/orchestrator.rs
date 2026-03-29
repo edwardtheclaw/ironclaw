@@ -45,7 +45,7 @@ use crate::types::thread::Thread;
 use super::scripting::{execute_code, json_to_monty, monty_to_json, monty_to_string};
 
 /// The compiled-in default orchestrator (v0).
-const DEFAULT_ORCHESTRATOR: &str = include_str!("../../orchestrator/default.py");
+pub(crate) const DEFAULT_ORCHESTRATOR: &str = include_str!("../../orchestrator/default.py");
 
 /// Well-known title for orchestrator code in the Store.
 pub const ORCHESTRATOR_TITLE: &str = "orchestrator:main";
@@ -765,6 +765,18 @@ async fn handle_execute_action(
                 return ExtFunctionResult::Return(json_to_monty(&result));
             }
             crate::capability::policy::PolicyDecision::RequireApproval { .. } => {
+                let output = serde_json::json!({"status": "awaiting_approval"});
+                emit_and_record(
+                    thread,
+                    event_tx,
+                    EventKind::ApprovalRequested {
+                        action_name: name.clone(),
+                        call_id: call_id.clone(),
+                    },
+                    &call_id,
+                    &name,
+                    &output,
+                );
                 let result = serde_json::json!({
                     "need_approval": true,
                     "action_name": name,
