@@ -117,6 +117,7 @@ let _suppressHashChange = false;
 
 /** Update the URL hash to reflect current navigation state. */
 function updateHash() {
+  if (_suppressHashChange) return;
   var parts = [currentTab];
 
   switch (currentTab) {
@@ -148,11 +149,9 @@ function updateHash() {
   }
 
   var hash = '#/' + parts.join('/');
-  _suppressHashChange = true;
   if (window.location.hash !== hash) {
     window.history.replaceState(null, '', hash);
   }
-  _suppressHashChange = false;
 }
 
 /** Parse the current URL hash into navigation state. */
@@ -174,7 +173,12 @@ function restoreFromHash() {
   var state = parseHash();
   if (!state) return;
 
-  // Switch tab (without recursively updating hash)
+  // Suppress hash updates while restoring — switchTab/readMemoryFile/etc.
+  // each call updateHash(), which would overwrite the full hash before
+  // the detail part is restored.
+  _suppressHashChange = true;
+
+  // Switch tab
   if (state.tab && state.tab !== currentTab) {
     switchTab(state.tab);
   }
@@ -200,6 +204,8 @@ function restoreFromHash() {
         break;
     }
   }
+
+  _suppressHashChange = false;
 }
 
 window.addEventListener('hashchange', function() {
@@ -294,7 +300,7 @@ function authenticate() {
       const urlLogLevel = cleaned.searchParams.get('log_level');
       cleaned.searchParams.delete('token');
       cleaned.searchParams.delete('log_level');
-      window.history.replaceState({}, '', cleaned.pathname + cleaned.search);
+      window.history.replaceState({}, '', cleaned.pathname + cleaned.search + cleaned.hash);
       connectSSE();
       connectLogSSE();
       startGatewayStatusPolling();
