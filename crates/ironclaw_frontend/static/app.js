@@ -2471,7 +2471,11 @@ function switchTab(tab) {
   });
   applyAriaAttributes();
 
-  if (tab === 'memory') loadMemoryTree();
+  if (tab === 'memory') {
+    loadMemoryTree();
+    // Auto-open README.md on first visit (no file selected yet)
+    if (!currentMemoryPath) readMemoryFile('README.md');
+  }
   if (tab === 'jobs') loadJobs();
   if (tab === 'routines') loadRoutines();
   if (tab === 'logs') applyLogFilters();
