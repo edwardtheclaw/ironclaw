@@ -210,10 +210,17 @@ pub async fn chat_auth_token_handler(
             // and the v2 engine's skill-based credential system.
             if msg.contains("not installed") || msg.contains("not found") {
                 // Try storing directly in the secrets store (skill credential path).
-                let ss = state
+                // Check tool_registry first, then fall back to extension_manager's secrets.
+                let ss: Option<Arc<dyn crate::secrets::SecretsStore + Send + Sync>> = state
                     .tool_registry
                     .as_ref()
-                    .and_then(|tr| tr.secrets_store().cloned());
+                    .and_then(|tr| tr.secrets_store().cloned())
+                    .or_else(|| {
+                        state
+                            .extension_manager
+                            .as_ref()
+                            .map(|em| Arc::clone(em.secrets()))
+                    });
 
                 if let Some(ref ss) = ss {
                     let params =
@@ -249,10 +256,17 @@ pub async fn chat_auth_token_handler(
                         }
                     }
                 } else {
-                    tracing::warn!(
+                    tracing::error!(
                         credential = %req.extension_name,
-                        "Cannot store skill credential: no secrets store available"
+                        has_tool_registry = state.tool_registry.is_some(),
+                        has_extension_manager = state.extension_manager.is_some(),
+                        "Cannot store skill credential: no secrets store available from any source"
                     );
+                    return Ok(Json(ActionResponse::fail(format!(
+                        "Cannot store credential '{}': no secrets store configured. \
+                         Set SECRETS_MASTER_KEY to enable credential storage.",
+                        req.extension_name
+                    ))));
                 }
             }
 
