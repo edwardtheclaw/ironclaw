@@ -525,17 +525,31 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             .unwrap_or(false);
 
         // Check worker-level approval context (set by scheduler for autonomous jobs)
-        let worker_level_blocked = ApprovalContext::is_blocked_or_default(
-            &deps.approval_context,
-            tool_name,
-            requirement,
-        );
+        let worker_level_blocked =
+            ApprovalContext::is_blocked_or_default(&deps.approval_context, tool_name, requirement);
 
         // Tool is blocked if EITHER level blocks it (additive/intersection semantics)
         // This maintains defense in depth: job-level cannot bypass worker-level restrictions
         if job_level_blocked || worker_level_blocked {
-            return Err(crate::error::ToolError::AuthRequired {
+            let reason = if job_level_blocked && worker_level_blocked {
+                format!(
+                    "Tool '{}' is blocked by both job-level and worker-level approval context",
+                    tool_name
+                )
+            } else if job_level_blocked {
+                format!(
+                    "Tool '{}' is not in the job-level allowed tools list",
+                    tool_name
+                )
+            } else {
+                format!(
+                    "Tool '{}' is not available for autonomous execution",
+                    tool_name
+                )
+            };
+            return Err(crate::error::ToolError::AutonomousUnavailable {
                 name: tool_name.to_string(),
+                reason,
             }
             .into());
         }
@@ -2246,11 +2260,10 @@ mod tests {
         worker
             .context_manager()
             .update_context(worker.job_id, |ctx| {
-                ctx.approval_context = Some(
-                    crate::tools::ApprovalContext::autonomous_with_tools([
+                ctx.approval_context =
+                    Some(crate::tools::ApprovalContext::autonomous_with_tools([
                         "always_approval".to_string(),
-                    ]),
-                );
+                    ]));
             })
             .await
             .unwrap();
@@ -2281,11 +2294,10 @@ mod tests {
         worker
             .context_manager()
             .update_context(worker.job_id, |ctx| {
-                ctx.approval_context = Some(
-                    crate::tools::ApprovalContext::autonomous_with_tools([
+                ctx.approval_context =
+                    Some(crate::tools::ApprovalContext::autonomous_with_tools([
                         "always_approval".to_string(),
-                    ]),
-                );
+                    ]));
             })
             .await
             .unwrap();

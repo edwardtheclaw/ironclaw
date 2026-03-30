@@ -197,25 +197,17 @@ impl Scheduler {
             })
             .unwrap_or(self.config.max_tokens_per_job);
 
-        // Apply both metadata and token budget in one closure (Issue #813: atomic update).
-        // Use update_context_and_get to ensure atomicity: no gap where concurrent workers
-        // can modify the context between update and DB persist (Issue #807).
-        let ctx = if let Some(meta) = metadata {
+        // Apply metadata, token budget, and approval context in one closure
+        // (Issue #813: atomic update). Use update_context_and_get to ensure atomicity:
+        // no gap where concurrent workers can modify the context between update and
+        // DB persist (Issue #807).
+        let needs_update = metadata.is_some() || max_tokens > 0 || approval_context.is_some();
+        let ctx = if needs_update {
             self.context_manager
                 .update_context_and_get(job_id, |ctx| {
-                    ctx.metadata = meta;
-                    if max_tokens > 0 {
-                        ctx.max_tokens = max_tokens;
+                    if let Some(meta) = metadata {
+                        ctx.metadata = meta;
                     }
-                    // Store approval context in JobContext so tools can access it
-                    if let Some(ref approval) = approval_context {
-                        ctx.approval_context = Some(approval.clone());
-                    }
-                })
-                .await?
-        } else if max_tokens > 0 || approval_context.is_some() {
-            self.context_manager
-                .update_context_and_get(job_id, |ctx| {
                     if max_tokens > 0 {
                         ctx.max_tokens = max_tokens;
                     }
@@ -225,7 +217,6 @@ impl Scheduler {
                 })
                 .await?
         } else {
-            // No metadata or token budget to set; get the initial context
             self.context_manager.get_context(job_id).await?
         };
 

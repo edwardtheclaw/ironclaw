@@ -44,7 +44,7 @@ use crate::llm::{
     ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult, ToolDefinition,
 };
 use crate::tools::tool::{
-    check_approval_in_context, ApprovalContext, ApprovalRequirement, Tool, ToolError, ToolOutput,
+    ApprovalContext, ApprovalRequirement, Tool, ToolError, ToolOutput, check_approval_in_context,
 };
 use crate::tools::{ToolRegistry, prepare_tool_params};
 
@@ -798,15 +798,14 @@ Create alongside the .wasm file to grant capabilities:
         // Create context with build-specific approval permissions.
         // Note: shell commands (cargo, npm, pip, etc.) handle network access
         // for dependency fetching, so we don't need to grant direct http tool access.
-        let ctx = JobContext::default().with_approval_context(
-            ApprovalContext::autonomous_with_tools([
+        let ctx =
+            JobContext::default().with_approval_context(ApprovalContext::autonomous_with_tools([
                 "shell".into(),
                 "read_file".into(),
                 "write_file".into(),
                 "list_dir".into(),
                 "apply_patch".into(),
-            ]),
-        );
+            ]));
 
         // Check approval before executing (bypasses worker check, so we do it here)
         let requirement = tool.requires_approval(&normalized_params);
