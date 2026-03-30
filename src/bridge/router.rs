@@ -995,6 +995,25 @@ pub async fn has_pending_auth(user_id: &str) -> bool {
     state.pending_auth.read().await.contains_key(user_id)
 }
 
+/// Get pending auth info for a user (credential name + instructions).
+///
+/// Used by the history endpoint to include auth state in the response,
+/// so SSE reconnects can re-show the auth card.
+pub async fn get_engine_pending_auth(user_id: &str) -> Option<(String, Option<String>)> {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return None;
+    };
+    let guard = lock.read().await;
+    let state = guard.as_ref()?;
+    let pending = state.pending_auth.read().await;
+    let entry = pending.get(user_id)?;
+    let instructions = state
+        .auth_manager
+        .as_ref()
+        .and_then(|mgr| mgr.get_setup_instructions(&entry.credential_name));
+    Some((entry.credential_name.clone(), instructions))
+}
+
 /// Clear pending auth state for a user in the v2 engine.
 ///
 /// Called from the gateway's `/api/chat/auth-token` and `/api/chat/auth-cancel`

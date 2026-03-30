@@ -98,6 +98,20 @@ pub struct HistoryResponse {
     /// durable engine metadata so approval cards survive thread switches and restarts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_approval: Option<PendingApprovalInfo>,
+    /// Pending auth flow that needs user action (re-rendered on SSE reconnect).
+    ///
+    /// When present, the frontend should show the auth card so the user can
+    /// submit credentials. Without this, SSE disconnects lose the auth card
+    /// and the user is stuck with a blocked chat input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_auth: Option<PendingAuthInfo>,
+}
+
+/// Lightweight DTO for pending auth state (credential name + instructions).
+#[derive(Debug, Serialize)]
+pub struct PendingAuthInfo {
+    pub extension_name: String,
+    pub instructions: Option<String>,
 }
 
 /// Lightweight DTO for a pending tool approval (excludes context_messages).

@@ -23,6 +23,7 @@ pub use router::{
     // Query functions
     fire_engine_mission,
     get_engine_mission,
+    get_engine_pending_auth,
     get_engine_project,
     get_engine_thread,
     // Action handlers

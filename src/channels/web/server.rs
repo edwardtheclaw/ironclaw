@@ -1764,6 +1764,7 @@ async fn chat_history_handler(
             has_more,
             oldest_timestamp,
             pending_approval: None,
+            pending_auth: None,
         }));
     }
 
@@ -1819,6 +1820,7 @@ async fn chat_history_handler(
             has_more: false,
             oldest_timestamp: None,
             pending_approval,
+            pending_auth: None,
         }));
     }
 
@@ -1838,6 +1840,7 @@ async fn chat_history_handler(
                 has_more,
                 oldest_timestamp,
                 pending_approval: None,
+                pending_auth: None,
             }));
         }
     }
@@ -1849,6 +1852,7 @@ async fn chat_history_handler(
         has_more: false,
         oldest_timestamp: None,
         pending_approval: None,
+        pending_auth: None,
     }))
 }
 

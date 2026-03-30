@@ -1885,6 +1885,17 @@ function loadHistory(before) {
       if (data.pending_approval) {
         showApproval(data.pending_approval);
       }
+      // Re-show auth card if auth flow is pending (survives SSE reconnect)
+      if (data.pending_auth) {
+        handleAuthRequired({
+          extension_name: data.pending_auth.extension_name,
+          instructions: data.pending_auth.instructions,
+          auth_url: null,
+        });
+      } else {
+        // No pending auth — ensure stale auth UI is cleaned up
+        setAuthFlowPending(false);
+      }
     } else {
       // Pagination: prepend older messages
       const savedHeight = container.scrollHeight;

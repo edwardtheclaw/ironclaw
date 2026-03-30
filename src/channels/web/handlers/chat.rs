@@ -369,6 +369,18 @@ async fn engine_pending_approval(user_id: &str, thread_id: Uuid) -> Option<Pendi
         })
 }
 
+async fn engine_pending_auth(user_id: &str) -> Option<PendingAuthInfo> {
+    if !crate::bridge::is_engine_v2_enabled() {
+        return None;
+    }
+    crate::bridge::get_engine_pending_auth(user_id)
+        .await
+        .map(|(name, instructions)| PendingAuthInfo {
+            extension_name: name,
+            instructions,
+        })
+}
+
 pub async fn chat_history_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(identity): AuthenticatedUser,
@@ -437,12 +449,14 @@ pub async fn chat_history_handler(
         let oldest_timestamp = messages.first().map(|m| m.created_at.to_rfc3339());
         let turns = build_turns_from_db_messages(&messages);
         let pending_approval = engine_pending_approval(&identity.user_id, thread_id).await;
+        let pending_auth = engine_pending_auth(&identity.user_id).await;
         return Ok(Json(HistoryResponse {
             thread_id,
             turns,
             has_more,
             oldest_timestamp,
             pending_approval,
+            pending_auth,
         }));
     }
 
@@ -505,6 +519,7 @@ pub async fn chat_history_handler(
                 has_more: false,
                 oldest_timestamp: None,
                 pending_approval,
+                pending_auth: engine_pending_auth(&identity.user_id).await,
             }));
         }
     }
@@ -526,6 +541,7 @@ pub async fn chat_history_handler(
                 has_more,
                 oldest_timestamp,
                 pending_approval,
+                pending_auth: engine_pending_auth(&identity.user_id).await,
             }));
         }
     }
@@ -538,6 +554,7 @@ pub async fn chat_history_handler(
         has_more: false,
         oldest_timestamp: None,
         pending_approval,
+        pending_auth: engine_pending_auth(&identity.user_id).await,
     }))
 }
 
