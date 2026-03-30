@@ -120,50 +120,39 @@ async def _start_mock_google_api():
 # Skill writer
 # ---------------------------------------------------------------------------
 
-def _write_fake_wasm_extension(wasm_dir: str, name: str, mock_api_host: str, oauth_exchange_url: str):
-    """Create a minimal fake WASM extension with OAuth config.
+def _install_google_drive_wasm(wasm_dir: str):
+    """Copy the real google-drive WASM tool binary + capabilities into the test dir.
 
-    The .wasm file is an empty placeholder (the tool won't actually run),
-    but the .capabilities.json gives the extension manager enough info to
-    handle the setup/activate/OAuth flow.
+    Requires: `cd tools-src/google-drive && cargo build --target wasm32-wasip2 --release`
     """
-    # Empty WASM file — enough to pass determine_installed_kind()
-    wasm_path = os.path.join(wasm_dir, f"{name}.wasm")
-    with open(wasm_path, "wb") as f:
-        f.write(b"")
+    import shutil
 
-    # Capabilities with OAuth config pointing to mock server
-    cap = {
-        "name": name,
-        "description": f"Test {name} extension for OAuth e2e",
-        "auth": {
-            "secret_name": f"{name}_token",
-            "display_name": name.replace("_", " ").title(),
-            "oauth": {
-                "authorization_url": f"https://accounts.example.com/o/oauth2/auth",
-                "token_url": f"{oauth_exchange_url}/oauth/exchange",
-                "scopes": ["read"],
-                "client_id_env": "GOOGLE_OAUTH_CLIENT_ID",
-            },
-            "instructions": f"Authenticate with {name}",
-        },
-        "capabilities": {
-            "http": {
-                "allowed_hosts": [mock_api_host],
-                "credentials": {
-                    f"{name}_cred": {
-                        "secret_name": f"{name}_token",
-                        "location": {"type": "bearer"},
-                        "host_patterns": [mock_api_host],
-                    }
-                },
-            }
-        },
-    }
-    cap_path = os.path.join(wasm_dir, f"{name}.capabilities.json")
-    import json
-    with open(cap_path, "w") as f:
-        json.dump(cap, f, indent=2)
+    # Find the built WASM binary (shared-target or local target)
+    wasm_src = None
+    candidates = [
+        ROOT / ".cargo" / "shared-target" / "wasm32-wasip2" / "release" / "google_drive_tool.wasm",
+        Path.home() / ".cargo" / "shared-target" / "wasm32-wasip2" / "release" / "google_drive_tool.wasm",
+        ROOT / "tools-src" / "google-drive" / "target" / "wasm32-wasip2" / "release" / "google_drive_tool.wasm",
+    ]
+    for c in candidates:
+        if c.exists():
+            wasm_src = c
+            break
+
+    if wasm_src is None:
+        return False  # caller should skip
+
+    # Copy WASM binary as google_drive.wasm (extension name format)
+    shutil.copy2(str(wasm_src), os.path.join(wasm_dir, "google_drive.wasm"))
+
+    # Copy real capabilities.json
+    cap_src = ROOT / "tools-src" / "google-drive" / "google-drive-tool.capabilities.json"
+    if cap_src.exists():
+        shutil.copy2(str(cap_src), os.path.join(wasm_dir, "google_drive.capabilities.json"))
+    else:
+        return False
+
+    return True
 
 
 def _write_google_skill(skills_dir: str, mock_api_host: str):
@@ -353,12 +342,10 @@ async def v2_google_server(ironclaw_binary, mock_llm_server, mock_google_api):
     os.makedirs(skills_dir, exist_ok=True)
     _write_google_skill(skills_dir, mock_api_host)
 
-    # Create fake WASM extension for OAuth redirect test
+    # Install real google-drive WASM tool for OAuth redirect test
     wasm_tools_dir = os.path.join(home_dir, ".ironclaw", "wasm_tools")
     os.makedirs(wasm_tools_dir, exist_ok=True)
-    _write_fake_wasm_extension(
-        wasm_tools_dir, "google_drive", mock_api_host, mock_llm_server
-    )
+    _install_google_drive_wasm(wasm_tools_dir)
 
     # Find two free ports
     socks = []
@@ -470,12 +457,11 @@ async def test_oauth_redirect_flow(v2_google_server):
     )
     assert setup_response.status_code == 200, setup_response.text
     setup_data = setup_response.json()
-    # The fake WASM binary can't be loaded by wasmtime, so activation fails
-    # and no auth_url is generated. Skip until we have a real test WASM binary.
+    # If WASM binary wasn't built, activation fails and no auth_url is generated.
     if not setup_data.get("auth_url"):
         pytest.skip(
-            "OAuth redirect requires a valid WASM binary for activation. "
-            "Fake binary not loadable by wasmtime."
+            "OAuth redirect requires google-drive WASM binary. "
+            "Build with: cd tools-src/google-drive && cargo build --target wasm32-wasip2 --release"
         )
     auth_url = setup_data.get("auth_url")
     assert auth_url, f"Expected auth_url in setup response: {setup_data}"
