@@ -184,6 +184,9 @@ pub async fn chat_auth_token_handler(
                 );
             } else {
                 clear_auth_mode(&state, &user.user_id).await;
+                // Also clear v2 engine pending_auth so the next chat message
+                // isn't intercepted as a token retry.
+                crate::bridge::clear_engine_pending_auth(&user.user_id).await;
 
                 state.sse.broadcast_for_user(
                     &user.user_id,
@@ -222,6 +225,7 @@ pub async fn chat_auth_token_handler(
                                 "Stored skill credential via auth-token fallback"
                             );
                             clear_auth_mode(&state, &user.user_id).await;
+                            crate::bridge::clear_engine_pending_auth(&user.user_id).await;
                             state.sse.broadcast_for_user(
                                 &user.user_id,
                                 AppEvent::AuthCompleted {

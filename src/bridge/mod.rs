@@ -19,6 +19,7 @@ pub use router::{
     EngineStepInfo,
     EngineThreadDetail,
     EngineThreadInfo,
+    clear_engine_pending_auth,
     // Query functions
     fire_engine_mission,
     get_engine_mission,

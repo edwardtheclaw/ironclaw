@@ -995,6 +995,22 @@ pub async fn has_pending_auth(user_id: &str) -> bool {
     state.pending_auth.read().await.contains_key(user_id)
 }
 
+/// Clear pending auth state for a user in the v2 engine.
+///
+/// Called from the gateway's `/api/chat/auth-token` and `/api/chat/auth-cancel`
+/// endpoints to ensure the v2 engine's pending_auth is cleared when the frontend
+/// handles auth directly (not through the chat message path).
+pub async fn clear_engine_pending_auth(user_id: &str) {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return;
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return;
+    };
+    state.pending_auth.write().await.remove(user_id);
+}
+
 /// Handle a user message through the engine v2 pipeline.
 pub async fn handle_with_engine(
     agent: &Agent,
@@ -1071,6 +1087,22 @@ pub async fn handle_with_engine(
                                 &message.metadata,
                             )
                             .await;
+
+                        // Also broadcast AuthCompleted via SSE so the frontend
+                        // dismisses the auth card and re-enables input.
+                        if let Some(ref sse) = state.sse {
+                            sse.broadcast_for_user(
+                                &message.user_id,
+                                AppEvent::AuthCompleted {
+                                    extension_name: pending.credential_name.clone(),
+                                    success: true,
+                                    message: format!(
+                                        "Credential '{}' stored.",
+                                        pending.credential_name
+                                    ),
+                                },
+                            );
+                        }
 
                         // Retry the original request — drop the read guard first,
                         // then re-enter handle_with_engine with the original message.
