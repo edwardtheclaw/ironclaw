@@ -535,12 +535,17 @@ async fn resolve_pending_approval_for_thread(
     user_id: &str,
     thread_id_hint: Option<&str>,
 ) -> Result<PendingApprovalResolution, Error> {
-    let hinted_thread_id = thread_id_hint.and_then(|id| uuid::Uuid::parse_str(id).ok());
+    // The hint can be either:
+    // 1. An engine thread UUID (direct match against thread_id)
+    // 2. A v1 session UUID that scopes the engine conversation via channel key "web:{v1_uuid}"
+    let hinted_engine_thread = thread_id_hint.and_then(|id| uuid::Uuid::parse_str(id).ok());
 
+    // Check in-memory cache first.
     if let Some(cached) = pending_approvals.read().await.get(user_id).cloned() {
-        let hint_matches = hinted_thread_id
-            .map(|id| cached.thread_id.0 == id)
-            .unwrap_or(true);
+        let hint_matches = match hinted_engine_thread {
+            Some(id) => cached.thread_id.0 == id,
+            None => true,
+        };
         if hint_matches {
             if let Some(pending) =
                 load_pending_approval_from_thread(store, cached.conversation_id, cached.thread_id)
@@ -559,6 +564,7 @@ async fn resolve_pending_approval_for_thread(
         }
     }
 
+    // Scan persisted conversations for pending approvals.
     let conversations = store
         .list_conversations(user_id)
         .await
@@ -566,13 +572,30 @@ async fn resolve_pending_approval_for_thread(
 
     let mut candidates = Vec::new();
     for conversation in conversations {
-        for thread_id in conversation.active_threads {
-            if hinted_thread_id.is_some_and(|hint| thread_id.0 != hint) {
+        // Filter by thread hint: match either engine thread UUID
+        // or v1 session UUID embedded in the channel key ("web:{v1_uuid}").
+        let conv_matches_hint = |tid: &ironclaw_engine::ThreadId| -> bool {
+            match hinted_engine_thread {
+                Some(hint) => tid.0 == hint,
+                None => {
+                    // No engine thread match — check if the v1 session UUID
+                    // is embedded in the conversation's channel key.
+                    if let Some(hint_str) = thread_id_hint {
+                        conversation.channel.contains(hint_str)
+                    } else {
+                        true // No hint → accept all
+                    }
+                }
+            }
+        };
+
+        for thread_id in &conversation.active_threads {
+            if !conv_matches_hint(thread_id) {
                 continue;
             }
 
             let Some(thread) = store
-                .load_thread(thread_id)
+                .load_thread(*thread_id)
                 .await
                 .map_err(|e| engine_err("store error", e))?
             else {
@@ -580,7 +603,7 @@ async fn resolve_pending_approval_for_thread(
             };
 
             let Some(pending) =
-                load_pending_approval_from_thread(store, conversation.id, thread_id).await?
+                load_pending_approval_from_thread(store, conversation.id, *thread_id).await?
             else {
                 continue;
             };
@@ -589,7 +612,7 @@ async fn resolve_pending_approval_for_thread(
         }
     }
 
-    if hinted_thread_id.is_none() && candidates.len() > 1 {
+    if thread_id_hint.is_none() && candidates.len() > 1 {
         return Ok(PendingApprovalResolution::Ambiguous);
     }
 
