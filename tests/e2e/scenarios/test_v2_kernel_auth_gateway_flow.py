@@ -312,8 +312,12 @@ class TestGatewayAuthCard:
             timeout=15,
         )
         assert token_r.status_code == 200, (
-            f"Auth token endpoint should accept the token. "
-            f"Response: {token_r.text}"
+            f"Auth token endpoint HTTP error: {token_r.text}"
+        )
+        token_data = token_r.json()
+        assert token_data.get("success") is True, (
+            f"Auth token endpoint must return success:true when storing "
+            f"a skill credential. Got: {token_data}"
         )
 
         # Step 4: Verify the auth flow completes — send another message

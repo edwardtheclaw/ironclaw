@@ -203,12 +203,11 @@ pub async fn chat_auth_token_handler(
         Err(e) => {
             let msg = e.to_string();
 
-            // If the extension manager doesn't recognize the name (e.g., it's a
-            // skill credential like "github_token", not an installed extension),
-            // fall back to storing directly in the secrets store. This bridges
-            // the gap between the frontend auth card (which calls this endpoint)
-            // and the v2 engine's skill-based credential system.
-            if msg.contains("not installed") || msg.contains("not found") {
+            // Skill credential fallback: if the extension manager doesn't
+            // recognize the name, store directly in the secrets store.
+            if matches!(&e, crate::extensions::ExtensionError::NotInstalled(_))
+                || msg.contains("not found")
+            {
                 // Try storing directly in the secrets store (skill credential path).
                 // Check tool_registry first, then fall back to extension_manager's secrets.
                 let ss: Option<Arc<dyn crate::secrets::SecretsStore + Send + Sync>> = state

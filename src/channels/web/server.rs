@@ -1576,6 +1576,61 @@ async fn chat_auth_token_handler(
         }
         Err(e) => {
             let msg = e.to_string();
+
+            // Skill credential fallback: if the extension manager doesn't
+            // recognize the name (skill credential like "github_token"),
+            // store directly in the secrets store.
+            if matches!(&e, crate::extensions::ExtensionError::NotInstalled(_))
+                || msg.contains("not found")
+            {
+                let ss = state
+                    .tool_registry
+                    .as_ref()
+                    .and_then(|tr| tr.secrets_store().cloned())
+                    .or_else(|| {
+                        state
+                            .extension_manager
+                            .as_ref()
+                            .map(|em| std::sync::Arc::clone(em.secrets()))
+                    });
+
+                if let Some(ss) = ss {
+                    let params =
+                        crate::secrets::CreateSecretParams::new(&req.extension_name, &req.token);
+                    match ss.create(&user.user_id, params).await {
+                        Ok(_) => {
+                            clear_auth_mode(&state, &user.user_id).await;
+                            crate::bridge::clear_engine_pending_auth(&user.user_id).await;
+                            state.sse.broadcast_for_user(
+                                &user.user_id,
+                                AppEvent::AuthCompleted {
+                                    extension_name: req.extension_name.clone(),
+                                    success: true,
+                                    message: format!(
+                                        "Credential '{}' stored successfully.",
+                                        req.extension_name
+                                    ),
+                                },
+                            );
+                            return Ok(Json(ActionResponse::ok(format!(
+                                "Credential '{}' stored.",
+                                req.extension_name
+                            ))));
+                        }
+                        Err(se) => {
+                            return Ok(Json(ActionResponse::fail(format!(
+                                "Failed to store credential: {se}"
+                            ))));
+                        }
+                    }
+                } else {
+                    return Ok(Json(ActionResponse::fail(format!(
+                        "Cannot store credential '{}': no secrets store configured.",
+                        req.extension_name
+                    ))));
+                }
+            }
+
             // Re-emit auth_required for retry on validation errors
             if matches!(e, crate::extensions::ExtensionError::ValidationFailed(_)) {
                 state.sse.broadcast_for_user(
