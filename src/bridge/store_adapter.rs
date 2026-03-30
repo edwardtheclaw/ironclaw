@@ -447,16 +447,15 @@ impl HybridStore {
                     continue;
                 }
                 let mission_file = format!("{}/mission.json", mission_entry.path);
-                match ws.read(&mission_file).await {
-                    Ok(doc) => match serde_json::from_str::<Mission>(&doc.content) {
+                if let Ok(doc) = ws.read(&mission_file).await {
+                    match serde_json::from_str::<Mission>(&doc.content) {
                         Ok(mission) => {
                             self.missions.write().await.insert(mission.id, mission);
                         }
                         Err(e) => {
                             debug!(path = %mission_file, "failed to parse mission: {e}")
                         }
-                    },
-                    Err(_) => {} // mission.json might not exist in every subdir
+                    }
                 }
             }
         }

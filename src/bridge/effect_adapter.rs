@@ -395,31 +395,31 @@ impl EffectExecutor for EffectBridgeAdapter {
         // interception point; post-execution 401 detection and text-based
         // fallback remain as defense-in-depth.
 
-        if let Some(auth_mgr) = self.auth_manager.read().await.as_ref() {
-            if let Some(registry) = self.tools.credential_registry() {
-                match auth_mgr
-                    .check_action_auth(lookup_name, &parameters, &context.user_id, registry)
-                    .await
-                {
-                    AuthCheckResult::MissingCredentials(missing) => {
-                        let cred = &missing[0];
-                        debug!(
-                            credential = %cred.credential_name,
-                            tool = %lookup_name,
-                            user = %context.user_id,
-                            "Pre-flight auth: credential missing"
-                        );
-                        self.emit_auth_required(&cred.credential_name, action_name)
-                            .await;
-                        return Err(EngineError::NeedAuthentication {
-                            credential_name: cred.credential_name.clone(),
-                            action_name: action_name.to_string(),
-                            call_id: String::new(),
-                            parameters,
-                        });
-                    }
-                    AuthCheckResult::Ready | AuthCheckResult::NoAuthRequired => {}
+        if let Some(auth_mgr) = self.auth_manager.read().await.as_ref()
+            && let Some(registry) = self.tools.credential_registry()
+        {
+            match auth_mgr
+                .check_action_auth(lookup_name, &parameters, &context.user_id, registry)
+                .await
+            {
+                AuthCheckResult::MissingCredentials(missing) => {
+                    let cred = &missing[0];
+                    debug!(
+                        credential = %cred.credential_name,
+                        tool = %lookup_name,
+                        user = %context.user_id,
+                        "Pre-flight auth: credential missing"
+                    );
+                    self.emit_auth_required(&cred.credential_name, action_name)
+                        .await;
+                    return Err(EngineError::NeedAuthentication {
+                        credential_name: cred.credential_name.clone(),
+                        action_name: action_name.to_string(),
+                        call_id: String::new(),
+                        parameters,
+                    });
                 }
+                AuthCheckResult::Ready | AuthCheckResult::NoAuthRequired => {}
             }
         }
 

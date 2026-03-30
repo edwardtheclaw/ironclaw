@@ -777,21 +777,21 @@ impl Tool for HttpTool {
 
         // If the server returned 401/403 and we had a missing credential,
         // surface the authentication_required error so the auth flow triggers.
-        if matches!(status, 401 | 403) {
-            if let Some(ref cred_name) = missing_credential {
-                return Err(ToolError::ExecutionFailed(
-                    serde_json::json!({
-                        "error": "authentication_required",
-                        "credential_name": cred_name,
-                        "message": format!(
-                            "Credential '{}' is not configured. \
-                             The server returned HTTP {}. Set up credentials to access this endpoint.",
-                            cred_name, status
-                        )
-                    })
-                    .to_string(),
-                ));
-            }
+        if matches!(status, 401 | 403)
+            && let Some(ref cred_name) = missing_credential
+        {
+            return Err(ToolError::ExecutionFailed(
+                serde_json::json!({
+                    "error": "authentication_required",
+                    "credential_name": cred_name,
+                    "message": format!(
+                        "Credential '{}' is not configured. \
+                         The server returned HTTP {}. Set up credentials to access this endpoint.",
+                        cred_name, status
+                    )
+                })
+                .to_string(),
+            ));
         }
 
         // Strip sensitive response headers before they reach the LLM context.
