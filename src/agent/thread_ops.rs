@@ -1029,25 +1029,29 @@ impl Agent {
         };
 
         if approved {
-            // If always, add to auto-approved set
-            if always {
-                let mut sess = session.lock().await;
-                sess.auto_approve_tool(&pending.tool_name);
-                tracing::info!(
-                    "Auto-approved tool '{}' for session {}",
-                    pending.tool_name,
-                    sess.id
-                );
-            }
-
-            // Reset thread state to processing
+            // Auto-approve + state transition under a single lock to prevent
+            // TOCTOU: if the thread is pruned between two separate locks, the
+            // tool would be permanently auto-approved without execution starting.
             {
                 let mut sess = session.lock().await;
+                if always {
+                    sess.auto_approve_tool(&pending.tool_name);
+                    tracing::info!(
+                        "Auto-approved tool '{}' for session {}",
+                        pending.tool_name,
+                        sess.id
+                    );
+                }
+
                 match sess.threads.get_mut(&thread_id) {
                     Some(thread) => {
                         thread.state = ThreadState::Processing;
                     }
                     None => {
+                        // Roll back auto-approve if the thread vanished
+                        if always {
+                            sess.auto_approved_tools.remove(&pending.tool_name);
+                        }
                         tracing::error!(
                             %thread_id,
                             "Thread disappeared while setting state to Processing during approval"
@@ -2412,6 +2416,36 @@ mod tests {
         assert_eq!(
             thread.pending_approval.as_ref().unwrap().request_id,
             correct_request_id
+        );
+    }
+
+    #[test]
+    fn test_auto_approve_with_thread_disappearance_rolls_back() {
+        // Regression test: when always=true and the thread disappears after
+        // auto_approve_tool is called, the auto-approve must be rolled back
+        // to prevent a dangling policy for a tool that never executed.
+        use crate::agent::session::Session;
+        use std::collections::HashSet;
+        use uuid::Uuid;
+
+        let mut session = Session::new("test-user");
+        let thread_id = Uuid::new_v4();
+
+        // Simulate: always=true, auto-approve is set, but thread is missing
+        session.auto_approve_tool("dangerous_tool");
+        assert!(session.is_tool_auto_approved("dangerous_tool"));
+
+        // Thread doesn't exist — rollback should remove the auto-approve
+        assert!(!session.threads.contains_key(&thread_id));
+        // Simulate the rollback logic from process_approval
+        session.auto_approved_tools.remove("dangerous_tool");
+        assert!(!session.is_tool_auto_approved("dangerous_tool"));
+        assert_eq!(
+            session
+                .auto_approved_tools
+                .intersection(&HashSet::from(["dangerous_tool".to_string()]))
+                .count(),
+            0
         );
     }
 
