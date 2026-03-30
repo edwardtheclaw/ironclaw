@@ -114,4 +114,5 @@ Tell the user:
 > - I'll capture decisions from our conversations and track delegations automatically
 > - For items I can handle (PR reviews, drafts, research), I'll ask your permission first
 > - Say **"show commitments"** anytime, or **"who owes me what?"** for delegation status
+> - Use **`/plan <description>`** to create a structured execution plan for complex initiatives
 > - I start conservative — I'll learn your preferences over time as you confirm or override my suggestions

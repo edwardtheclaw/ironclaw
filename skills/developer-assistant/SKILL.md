@@ -125,7 +125,7 @@ mission_create(
 ```
 mission_create(
   name: "dev-weekly-retro",
-  goal: "Weekly developer retrospective. Gather: (1) All commitments resolved this week from commitments/resolved/. (2) All decisions captured this week from commitments/decisions/. (3) All tech debt items added this week from commitments/tech-debt/ — include items from PR review scans. (4) Per-repo: count of merged PRs this week via GitHub API. (5) Open items carried forward. Compose retro: SHIPPED, DECISIONS MADE (with rationale), SLIPPED/CARRIED FORWARD, TECH DEBT ACCUMULATED (new items + total count + top 3 chronic), PATTERNS (recurring CI failures, slow review cycles). For complex action items, suggest plan mode. Write retro to context/intel/weekly-retro-<date>.md. Send via message tool.",
+  goal: "Weekly developer retrospective. Gather: (1) All commitments resolved this week from commitments/resolved/. (2) All decisions captured this week from commitments/decisions/. (3) All tech debt items added this week from commitments/tech-debt/ — include items from PR review scans. (4) Per-repo: count of merged PRs this week via GitHub API. (5) Open items carried forward. Compose retro: SHIPPED, DECISIONS MADE (with rationale), SLIPPED/CARRIED FORWARD, TECH DEBT ACCUMULATED (new items + total count + top 3 chronic), PATTERNS (recurring CI failures, slow review cycles). For complex action items, suggest using /plan to create a structured execution plan. Write retro to context/intel/weekly-retro-<date>.md. Send via message tool.",
   cadence: "0 10 * * 5"
 )
 ```
@@ -145,7 +145,7 @@ mission_create(
 ```
 mission_create(
   name: "dev-tech-debt-resurface",
-  goal: "Weekly tech debt review. Read all files in commitments/tech-debt/ via memory_tree and memory_read. Sort by age. Flag items older than 30 days as chronic. For items tagged with a repo, check if related issues exist. If backlog exceeds 10 items, suggest a prioritization session. For high-severity chronic items, suggest plan mode for structured breakdown. Send list via message tool. Skip silently if no tech debt.",
+  goal: "Weekly tech debt review. Read all files in commitments/tech-debt/ via memory_tree and memory_read. Sort by age. Flag items older than 30 days as chronic. For items tagged with a repo, check if related issues exist. If backlog exceeds 10 items, suggest a prioritization session. For high-severity chronic items, suggest using /plan to create a structured breakdown and fix strategy. Send list via message tool. Skip silently if no tech debt.",
   cadence: "0 10 * * 1"
 )
 ```
@@ -178,4 +178,10 @@ Tell the user:
 >
 > Per-repo workflow: issue planning, maintainer gate, PR monitor, CI fix loop, staging review, post-merge learning
 >
-> Say **"show commitments"** for current status, **"show tech debt"** for the backlog, or **"add repo owner/repo"** to add another project.
+> **Quick commands:**
+> - **"show commitments"** — current status
+> - **"show tech debt"** — debt backlog
+> - **"add repo owner/repo"** — add another project
+> - **`/plan <description>`** — create a structured execution plan for complex tasks
+> - **`/commitment-digest`** — force a digest now
+> - **`/tech-debt-tracker`** — force tech debt review

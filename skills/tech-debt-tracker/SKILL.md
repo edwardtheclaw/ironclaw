@@ -112,7 +112,7 @@ User says: "show tech debt" or "debt backlog"
 ---
 <count> total. <count> chronic (30+ days).
 Say "resolve <title>" to mark fixed, or "promote <title>" to create a commitment.
-For large items, consider using plan mode to break down the fix.
+For large items, use `/plan <description>` to create a structured fix plan.
 ```
 
 ## Mode E: Resolution
@@ -125,7 +125,7 @@ Move to `commitments/resolved/` with original type preserved. Confirm.
 
 User says: "let's fix the auth refactor" or "promote the caching debt"
 
-Create commitment in `commitments/open/` with `tags: [tech-debt]` and `resolution_path: agent_can_handle` if it's a code task. For complex items, suggest plan mode: "This looks like a multi-step refactor. Want me to create a plan?"
+Create commitment in `commitments/open/` with `tags: [tech-debt]` and `resolution_path: agent_can_handle` if it's a code task. For complex items, suggest: "This looks like a multi-step refactor. Use `/plan <description>` to create a structured fix plan."
 
 ## Filename conventions
 
