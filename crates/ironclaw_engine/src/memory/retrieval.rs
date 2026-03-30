@@ -5,7 +5,10 @@
 //! with priority scoring by doc type (Lessons and Specs rank higher
 //! than Summaries for context injection).
 
+use std::collections::HashMap;
 use std::sync::Arc;
+
+use chrono::Utc;
 
 use crate::traits::store::Store;
 use crate::types::error::EngineError;
@@ -24,8 +27,9 @@ impl RetrievalEngine {
 
     /// Retrieve relevant memory docs for the given query within a project.
     ///
-    /// Loads all docs for the project, scores them by keyword relevance and
-    /// doc-type priority, and returns the top `max_docs` results.
+    /// Loads all docs for the project, deduplicates by title (latest wins),
+    /// scores them by keyword relevance, doc-type priority, and recency
+    /// (older docs decay), and returns the top `max_docs` results.
     pub async fn retrieve_context(
         &self,
         project_id: ProjectId,
@@ -41,25 +45,33 @@ impl RetrievalEngine {
             return Ok(Vec::new());
         }
 
+        // Dedup by title: when multiple docs share the same title (e.g.,
+        // corrected learnings), keep only the most recently updated one.
+        let deduped = dedup_by_title(all_docs);
+
         let keywords = extract_keywords(query);
         if keywords.is_empty() {
-            // No meaningful keywords — return by doc-type priority alone
-            let mut scored: Vec<(f64, MemoryDoc)> = all_docs
+            // No meaningful keywords — return by doc-type priority + recency
+            let mut scored: Vec<(f64, MemoryDoc)> = deduped
                 .into_iter()
-                .map(|doc| (doc_type_weight(doc.doc_type), doc))
+                .map(|doc| {
+                    let score = doc_type_weight(doc.doc_type) * recency_factor(&doc);
+                    (score, doc)
+                })
                 .collect();
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
             scored.truncate(max_docs);
             return Ok(scored.into_iter().map(|(_, doc)| doc).collect());
         }
 
-        let mut scored: Vec<(f64, MemoryDoc)> = all_docs
+        let mut scored: Vec<(f64, MemoryDoc)> = deduped
             .into_iter()
             .map(|doc| {
                 let keyword_score = keyword_match_score(&doc, &keywords);
                 let type_weight = doc_type_weight(doc.doc_type);
-                // Combined score: keyword relevance (0.0-1.0) + type priority bonus
-                let score = keyword_score + type_weight;
+                let decay = recency_factor(&doc);
+                // Combined score: (keyword relevance + type priority) × recency decay
+                let score = (keyword_score + type_weight) * decay;
                 (score, doc)
             })
             .filter(|(score, _)| *score > 0.0)
@@ -111,6 +123,57 @@ fn keyword_match_score(doc: &MemoryDoc, keywords: &[String]) -> f64 {
     // Normalize: max possible score is keywords.len() * 2 (all in title)
     let max_score = keywords.len() * 2;
     matched as f64 / max_score as f64
+}
+
+/// Deduplicate docs by title, keeping the most recently updated for each title.
+///
+/// When multiple docs share a title (e.g., a corrected learning superseding an
+/// older one), only the latest survives. This provides read-time dedup without
+/// requiring write-time coordination — corrections are appended as new docs
+/// with the same title, and stale versions are filtered here.
+fn dedup_by_title(docs: Vec<MemoryDoc>) -> Vec<MemoryDoc> {
+    let mut by_title: HashMap<String, MemoryDoc> = HashMap::new();
+    for doc in docs {
+        match by_title.entry(doc.title.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if e.get().updated_at < doc.updated_at {
+                    e.insert(doc);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(doc);
+            }
+        }
+    }
+    by_title.into_values().collect()
+}
+
+/// Compute a recency decay factor for a doc (0.0 to 1.0).
+///
+/// Docs decay at ~3% per 30-day period (half-life ≈ 2 years). This means:
+/// - Fresh docs (< 30 days): ~1.0 (no meaningful decay)
+/// - 3 months old: ~0.91
+/// - 6 months old: ~0.83
+/// - 1 year old: ~0.69
+/// - 2 years old: ~0.48
+///
+/// Specs and Lessons never fully decay — they retain a floor of 0.3 because
+/// missing capability info and hard-won lessons remain valuable indefinitely.
+fn recency_factor(doc: &MemoryDoc) -> f64 {
+    let age_days = (Utc::now() - doc.updated_at).num_days().max(0) as f64;
+    // Exponential decay: e^(-λt) where λ = ln(2)/half_life_days
+    // Half-life of ~700 days (≈2 years) → λ ≈ 0.001
+    let decay = (-0.001 * age_days).exp();
+
+    // Floor by doc type: lessons and specs never fully fade
+    let floor = match doc.doc_type {
+        DocType::Spec | DocType::Lesson => 0.3,
+        DocType::Skill => 0.2,
+        DocType::Plan => 0.1,
+        _ => 0.0,
+    };
+
+    decay.max(floor)
 }
 
 /// Priority weight by doc type. Higher = more useful for context injection.
@@ -385,6 +448,63 @@ mod tests {
             .await
             .unwrap();
         assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn recency_factor_recent_is_near_one() {
+        let doc = MemoryDoc::new(ProjectId::new(), DocType::Note, "recent", "content");
+        // Just created — should be very close to 1.0
+        let factor = recency_factor(&doc);
+        assert!(
+            factor > 0.99,
+            "recent doc factor should be ~1.0, got {factor}"
+        );
+    }
+
+    #[test]
+    fn recency_factor_old_note_decays_to_zero() {
+        let mut doc = MemoryDoc::new(ProjectId::new(), DocType::Note, "old", "content");
+        doc.updated_at = Utc::now() - chrono::Duration::days(3000);
+        let factor = recency_factor(&doc);
+        // Notes have floor 0.0 and 3000 days → e^(-3) ≈ 0.05
+        assert!(
+            factor < 0.1,
+            "old note should decay significantly, got {factor}"
+        );
+    }
+
+    #[test]
+    fn recency_factor_old_lesson_has_floor() {
+        let mut doc = MemoryDoc::new(ProjectId::new(), DocType::Lesson, "old lesson", "content");
+        doc.updated_at = Utc::now() - chrono::Duration::days(5000);
+        let factor = recency_factor(&doc);
+        // Lessons have floor 0.3
+        assert!(
+            factor >= 0.3,
+            "old lesson should not decay below 0.3, got {factor}"
+        );
+    }
+
+    #[test]
+    fn dedup_by_title_keeps_latest() {
+        let project = ProjectId::new();
+        let mut old = MemoryDoc::new(project, DocType::Lesson, "same title", "old content");
+        old.updated_at = Utc::now() - chrono::Duration::days(30);
+        let new = MemoryDoc::new(project, DocType::Lesson, "same title", "new content");
+
+        let result = dedup_by_title(vec![old, new]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].content, "new content");
+    }
+
+    #[test]
+    fn dedup_by_title_keeps_different_titles() {
+        let project = ProjectId::new();
+        let a = MemoryDoc::new(project, DocType::Lesson, "title A", "content A");
+        let b = MemoryDoc::new(project, DocType::Lesson, "title B", "content B");
+
+        let result = dedup_by_title(vec![a, b]);
+        assert_eq!(result.len(), 2);
     }
 
     #[tokio::test]
