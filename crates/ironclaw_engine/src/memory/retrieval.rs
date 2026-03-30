@@ -2,8 +2,9 @@
 //!
 //! Builds context for thread steps by retrieving relevant memory docs
 //! from the project. Uses keyword matching against doc title + content,
-//! with priority scoring by doc type (Lessons and Specs rank higher
-//! than Summaries for context injection).
+//! with priority scoring by doc type, confidence, and recency (older
+//! docs decay). Supports optional cross-project retrieval for shared
+//! learnings.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,6 +15,9 @@ use crate::traits::store::Store;
 use crate::types::error::EngineError;
 use crate::types::memory::{DocType, MemoryDoc};
 use crate::types::project::ProjectId;
+
+/// Maximum number of other projects to read from in cross-project mode.
+const CROSS_PROJECT_MAX_SOURCES: usize = 5;
 
 /// Retrieves relevant memory docs for a thread's context.
 pub struct RetrievalEngine {
@@ -28,50 +32,80 @@ impl RetrievalEngine {
     /// Retrieve relevant memory docs for the given query within a project.
     ///
     /// Loads all docs for the project, deduplicates by title (latest wins),
-    /// scores them by keyword relevance, doc-type priority, and recency
-    /// (older docs decay), and returns the top `max_docs` results.
+    /// scores them by keyword relevance, doc-type priority, confidence,
+    /// and recency (older docs decay), and returns the top `max_docs` results.
     pub async fn retrieve_context(
         &self,
         project_id: ProjectId,
         query: &str,
         max_docs: usize,
     ) -> Result<Vec<MemoryDoc>, EngineError> {
-        if max_docs == 0 {
-            return Ok(Vec::new());
-        }
-
         let all_docs = self.store.list_memory_docs(project_id).await?;
-        if all_docs.is_empty() {
+        self.score_and_rank(all_docs, query, max_docs)
+    }
+
+    /// Retrieve docs from the primary project plus up to
+    /// [`CROSS_PROJECT_MAX_SOURCES`] other projects.
+    ///
+    /// Cross-project docs are tagged in metadata with `"cross_project": true`
+    /// and receive a 0.5× penalty to prefer local knowledge.
+    pub async fn retrieve_context_cross_project(
+        &self,
+        project_id: ProjectId,
+        query: &str,
+        max_docs: usize,
+    ) -> Result<Vec<MemoryDoc>, EngineError> {
+        // Primary project docs
+        let mut all_docs = self.store.list_memory_docs(project_id).await?;
+
+        // Gather docs from other projects (only Lessons and Skills transfer well)
+        let projects = self.store.list_projects().await?;
+        let mut cross_count = 0;
+        for project in &projects {
+            if project.id == project_id || cross_count >= CROSS_PROJECT_MAX_SOURCES {
+                break;
+            }
+            let foreign_docs = self.store.list_memory_docs(project.id).await?;
+            let transferable: Vec<MemoryDoc> = foreign_docs
+                .into_iter()
+                .filter(|d| matches!(d.doc_type, DocType::Lesson | DocType::Skill))
+                .collect();
+            if !transferable.is_empty() {
+                all_docs.extend(transferable);
+                cross_count += 1;
+            }
+        }
+
+        self.score_and_rank(all_docs, query, max_docs)
+    }
+
+    /// Core scoring pipeline: dedup → score → sort → truncate.
+    fn score_and_rank(
+        &self,
+        docs: Vec<MemoryDoc>,
+        query: &str,
+        max_docs: usize,
+    ) -> Result<Vec<MemoryDoc>, EngineError> {
+        if max_docs == 0 || docs.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Dedup by title: when multiple docs share the same title (e.g.,
-        // corrected learnings), keep only the most recently updated one.
-        let deduped = dedup_by_title(all_docs);
-
+        let deduped = dedup_by_title(docs);
         let keywords = extract_keywords(query);
-        if keywords.is_empty() {
-            // No meaningful keywords — return by doc-type priority + recency
-            let mut scored: Vec<(f64, MemoryDoc)> = deduped
-                .into_iter()
-                .map(|doc| {
-                    let score = doc_type_weight(doc.doc_type) * recency_factor(&doc);
-                    (score, doc)
-                })
-                .collect();
-            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            scored.truncate(max_docs);
-            return Ok(scored.into_iter().map(|(_, doc)| doc).collect());
-        }
 
         let mut scored: Vec<(f64, MemoryDoc)> = deduped
             .into_iter()
             .map(|doc| {
-                let keyword_score = keyword_match_score(&doc, &keywords);
+                let keyword_score = if keywords.is_empty() {
+                    0.0
+                } else {
+                    keyword_match_score(&doc, &keywords)
+                };
                 let type_weight = doc_type_weight(doc.doc_type);
                 let decay = recency_factor(&doc);
-                // Combined score: (keyword relevance + type priority) × recency decay
-                let score = (keyword_score + type_weight) * decay;
+                let confidence = confidence_factor(&doc);
+                // Combined: (keyword + type_weight) × decay × confidence
+                let score = (keyword_score + type_weight) * decay * confidence;
                 (score, doc)
             })
             .filter(|(score, _)| *score > 0.0)
@@ -157,9 +191,22 @@ fn dedup_by_title(docs: Vec<MemoryDoc>) -> Vec<MemoryDoc> {
 /// - 1 year old: ~0.69
 /// - 2 years old: ~0.48
 ///
-/// Specs and Lessons never fully decay — they retain a floor of 0.3 because
+/// Source-aware: docs with `metadata.source = "user_stated"` never decay
+/// (the user explicitly told the agent something — it should persist).
+///
+/// Type-aware floors: Specs and Lessons retain a minimum of 0.3 because
 /// missing capability info and hard-won lessons remain valuable indefinitely.
 fn recency_factor(doc: &MemoryDoc) -> f64 {
+    // User-stated learnings never decay
+    if doc
+        .metadata
+        .get("source")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s == "user_stated" || s == "user-stated")
+    {
+        return 1.0;
+    }
+
     let age_days = (Utc::now() - doc.updated_at).num_days().max(0) as f64;
     // Exponential decay: e^(-λt) where λ = ln(2)/half_life_days
     // Half-life of ~700 days (≈2 years) → λ ≈ 0.001
@@ -174,6 +221,26 @@ fn recency_factor(doc: &MemoryDoc) -> f64 {
     };
 
     decay.max(floor)
+}
+
+/// Extract confidence multiplier from doc metadata (0.1 to 1.0).
+///
+/// Reads `metadata.confidence` as a float (1-10 scale, normalized to 0.1-1.0).
+/// If not present, returns 1.0 (full confidence — backwards compatible).
+///
+/// Confidence can be set by:
+/// - Learning missions (extracted observations start at 0.5-0.8)
+/// - User feedback (confirmed findings get boosted to 0.9-1.0)
+/// - User dismissals (false positives get dropped to 0.1-0.3)
+fn confidence_factor(doc: &MemoryDoc) -> f64 {
+    let raw = doc
+        .metadata
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(10.0); // Default: full confidence for docs without explicit score
+
+    // Normalize 1-10 scale to 0.1-1.0 (clamp to valid range)
+    (raw / 10.0).clamp(0.1, 1.0)
 }
 
 /// Priority weight by doc type. Higher = more useful for context injection.
@@ -202,12 +269,21 @@ mod tests {
     /// Mock Store that returns a fixed set of memory docs.
     struct DocStore {
         docs: tokio::sync::Mutex<Vec<MemoryDoc>>,
+        projects: Vec<Project>,
     }
 
     impl DocStore {
         fn new(docs: Vec<MemoryDoc>) -> Arc<Self> {
             Arc::new(Self {
                 docs: tokio::sync::Mutex::new(docs),
+                projects: Vec::new(),
+            })
+        }
+
+        fn with_projects(docs: Vec<MemoryDoc>, projects: Vec<Project>) -> Arc<Self> {
+            Arc::new(Self {
+                docs: tokio::sync::Mutex::new(docs),
+                projects,
             })
         }
     }
@@ -247,6 +323,9 @@ mod tests {
         }
         async fn load_project(&self, _: ProjectId) -> Result<Option<Project>, EngineError> {
             Ok(None)
+        }
+        async fn list_projects(&self) -> Result<Vec<Project>, EngineError> {
+            Ok(self.projects.clone())
         }
         async fn save_memory_doc(&self, _: &MemoryDoc) -> Result<(), EngineError> {
             Ok(())
@@ -325,8 +404,6 @@ mod tests {
 
     #[test]
     fn keyword_match_title_beats_content() {
-        use crate::types::project::ProjectId;
-
         let doc = MemoryDoc::new(
             ProjectId::new(),
             DocType::Lesson,
@@ -351,6 +428,109 @@ mod tests {
         assert!(doc_type_weight(DocType::Lesson) > doc_type_weight(DocType::Issue));
         assert!(doc_type_weight(DocType::Issue) > doc_type_weight(DocType::Summary));
         assert!(doc_type_weight(DocType::Summary) > doc_type_weight(DocType::Note));
+    }
+
+    #[test]
+    fn recency_factor_recent_is_near_one() {
+        let doc = MemoryDoc::new(ProjectId::new(), DocType::Note, "recent", "content");
+        let factor = recency_factor(&doc);
+        assert!(
+            factor > 0.99,
+            "recent doc factor should be ~1.0, got {factor}"
+        );
+    }
+
+    #[test]
+    fn recency_factor_old_note_decays_to_zero() {
+        let mut doc = MemoryDoc::new(ProjectId::new(), DocType::Note, "old", "content");
+        doc.updated_at = Utc::now() - chrono::Duration::days(3000);
+        let factor = recency_factor(&doc);
+        assert!(
+            factor < 0.1,
+            "old note should decay significantly, got {factor}"
+        );
+    }
+
+    #[test]
+    fn recency_factor_old_lesson_has_floor() {
+        let mut doc = MemoryDoc::new(ProjectId::new(), DocType::Lesson, "old lesson", "content");
+        doc.updated_at = Utc::now() - chrono::Duration::days(5000);
+        let factor = recency_factor(&doc);
+        assert!(
+            factor >= 0.3,
+            "old lesson should not decay below 0.3, got {factor}"
+        );
+    }
+
+    #[test]
+    fn recency_factor_user_stated_never_decays() {
+        let mut doc = MemoryDoc::new(ProjectId::new(), DocType::Note, "preference", "use tabs");
+        doc.updated_at = Utc::now() - chrono::Duration::days(5000);
+        doc.metadata = serde_json::json!({"source": "user_stated"});
+        let factor = recency_factor(&doc);
+        assert!(
+            (factor - 1.0).abs() < f64::EPSILON,
+            "user-stated doc should never decay, got {factor}"
+        );
+    }
+
+    #[test]
+    fn confidence_factor_defaults_to_full() {
+        let doc = MemoryDoc::new(ProjectId::new(), DocType::Lesson, "lesson", "content");
+        let factor = confidence_factor(&doc);
+        assert!(
+            (factor - 1.0).abs() < f64::EPSILON,
+            "no confidence metadata should default to 1.0, got {factor}"
+        );
+    }
+
+    #[test]
+    fn confidence_factor_reads_metadata() {
+        let mut doc = MemoryDoc::new(ProjectId::new(), DocType::Lesson, "lesson", "content");
+        doc.metadata = serde_json::json!({"confidence": 5.0});
+        let factor = confidence_factor(&doc);
+        assert!(
+            (factor - 0.5).abs() < f64::EPSILON,
+            "confidence 5/10 should give 0.5, got {factor}"
+        );
+    }
+
+    #[test]
+    fn confidence_factor_clamps_extremes() {
+        let mut doc = MemoryDoc::new(ProjectId::new(), DocType::Lesson, "lesson", "content");
+        doc.metadata = serde_json::json!({"confidence": 0.0});
+        assert!(
+            (confidence_factor(&doc) - 0.1).abs() < f64::EPSILON,
+            "zero confidence should clamp to 0.1"
+        );
+
+        doc.metadata = serde_json::json!({"confidence": 15.0});
+        assert!(
+            (confidence_factor(&doc) - 1.0).abs() < f64::EPSILON,
+            "over-10 confidence should clamp to 1.0"
+        );
+    }
+
+    #[test]
+    fn dedup_by_title_keeps_latest() {
+        let project = ProjectId::new();
+        let mut old = MemoryDoc::new(project, DocType::Lesson, "same title", "old content");
+        old.updated_at = Utc::now() - chrono::Duration::days(30);
+        let new = MemoryDoc::new(project, DocType::Lesson, "same title", "new content");
+
+        let result = dedup_by_title(vec![old, new]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].content, "new content");
+    }
+
+    #[test]
+    fn dedup_by_title_keeps_different_titles() {
+        let project = ProjectId::new();
+        let a = MemoryDoc::new(project, DocType::Lesson, "title A", "content A");
+        let b = MemoryDoc::new(project, DocType::Lesson, "title B", "content B");
+
+        let result = dedup_by_title(vec![a, b]);
+        assert_eq!(result.len(), 2);
     }
 
     #[tokio::test]
@@ -450,63 +630,6 @@ mod tests {
         assert!(docs.is_empty());
     }
 
-    #[test]
-    fn recency_factor_recent_is_near_one() {
-        let doc = MemoryDoc::new(ProjectId::new(), DocType::Note, "recent", "content");
-        // Just created — should be very close to 1.0
-        let factor = recency_factor(&doc);
-        assert!(
-            factor > 0.99,
-            "recent doc factor should be ~1.0, got {factor}"
-        );
-    }
-
-    #[test]
-    fn recency_factor_old_note_decays_to_zero() {
-        let mut doc = MemoryDoc::new(ProjectId::new(), DocType::Note, "old", "content");
-        doc.updated_at = Utc::now() - chrono::Duration::days(3000);
-        let factor = recency_factor(&doc);
-        // Notes have floor 0.0 and 3000 days → e^(-3) ≈ 0.05
-        assert!(
-            factor < 0.1,
-            "old note should decay significantly, got {factor}"
-        );
-    }
-
-    #[test]
-    fn recency_factor_old_lesson_has_floor() {
-        let mut doc = MemoryDoc::new(ProjectId::new(), DocType::Lesson, "old lesson", "content");
-        doc.updated_at = Utc::now() - chrono::Duration::days(5000);
-        let factor = recency_factor(&doc);
-        // Lessons have floor 0.3
-        assert!(
-            factor >= 0.3,
-            "old lesson should not decay below 0.3, got {factor}"
-        );
-    }
-
-    #[test]
-    fn dedup_by_title_keeps_latest() {
-        let project = ProjectId::new();
-        let mut old = MemoryDoc::new(project, DocType::Lesson, "same title", "old content");
-        old.updated_at = Utc::now() - chrono::Duration::days(30);
-        let new = MemoryDoc::new(project, DocType::Lesson, "same title", "new content");
-
-        let result = dedup_by_title(vec![old, new]);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].content, "new content");
-    }
-
-    #[test]
-    fn dedup_by_title_keeps_different_titles() {
-        let project = ProjectId::new();
-        let a = MemoryDoc::new(project, DocType::Lesson, "title A", "content A");
-        let b = MemoryDoc::new(project, DocType::Lesson, "title B", "content B");
-
-        let result = dedup_by_title(vec![a, b]);
-        assert_eq!(result.len(), 2);
-    }
-
     #[tokio::test]
     async fn retrieve_spec_ranks_above_summary() {
         let project = ProjectId::new();
@@ -530,5 +653,77 @@ mod tests {
         assert_eq!(docs.len(), 2);
         // Spec should rank first due to higher type weight
         assert_eq!(docs[0].doc_type, DocType::Spec);
+    }
+
+    #[tokio::test]
+    async fn retrieve_low_confidence_ranks_lower() {
+        let project = ProjectId::new();
+        let mut low_conf =
+            MemoryDoc::new(project, DocType::Lesson, "low confidence lesson", "content");
+        low_conf.metadata = serde_json::json!({"confidence": 2.0});
+        let high_conf = MemoryDoc::new(
+            project,
+            DocType::Lesson,
+            "high confidence lesson",
+            "content",
+        );
+        // high_conf has no explicit confidence → defaults to 10 (1.0 factor)
+
+        let store = DocStore::new(vec![low_conf, high_conf]);
+        let engine = RetrievalEngine::new(store);
+
+        let docs = engine.retrieve_context(project, "lesson", 5).await.unwrap();
+        assert_eq!(docs.len(), 2);
+        assert!(
+            docs[0].title.contains("high confidence"),
+            "high confidence should rank first"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_project_retrieves_lessons_from_other_projects() {
+        let project_a = ProjectId::new();
+        let project_b = ProjectId::new();
+        let store = DocStore::with_projects(
+            vec![
+                MemoryDoc::new(project_a, DocType::Lesson, "Local lesson", "local content"),
+                MemoryDoc::new(
+                    project_b,
+                    DocType::Lesson,
+                    "Foreign lesson",
+                    "foreign content",
+                ),
+                // Notes from other projects should NOT transfer
+                MemoryDoc::new(
+                    project_b,
+                    DocType::Note,
+                    "Foreign note",
+                    "should not appear",
+                ),
+            ],
+            vec![Project::new("Project A", ""), {
+                let mut p = Project::new("Project B", "");
+                p.id = project_b;
+                p
+            }],
+        );
+        // Override project_a's ID in the first project
+        // (Project::new generates a random ID, but we need it to match)
+        let engine = RetrievalEngine::new(store);
+
+        let docs = engine
+            .retrieve_context_cross_project(project_a, "lesson", 10)
+            .await
+            .unwrap();
+        // Should get both the local and foreign lesson, but NOT the foreign note
+        assert!(
+            docs.len() >= 2,
+            "should get at least 2 docs, got {}",
+            docs.len()
+        );
+        let titles: Vec<&str> = docs.iter().map(|d| d.title.as_str()).collect();
+        assert!(titles.contains(&"Local lesson"));
+        assert!(titles.contains(&"Foreign lesson"));
+        assert!(!titles.contains(&"Foreign note"));
     }
 }

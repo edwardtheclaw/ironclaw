@@ -33,8 +33,24 @@ Manage the knowledge the agent has accumulated from completed work. The v2 engin
 
 The engine uses title prefixes to identify doc types:
 - `skill:<name>` — extracted skills (e.g. `skill:github-issue-triage`)
+- `pattern:<name>` — positive learning patterns (e.g. `pattern:search-before-write`)
 - `insight:<category>:<topic>` — conversation insights (e.g. `insight:preference:concise-output`)
 - Lessons and issues use plain titles without prefixes
+
+## Confidence scoring
+
+Every learning doc can have a `confidence` field in metadata (1-10 scale):
+- **9-10**: User-stated or verified by reading specific code
+- **7-8**: High confidence pattern match, confirmed by user feedback
+- **5-6**: Moderate, observed once or twice
+- **3-4**: Low confidence, may be false positive
+- **1-2**: Speculation, likely to be pruned
+
+Confidence affects retrieval ranking — lower confidence docs score lower. User-stated docs (`"source": "user_stated"`) never decay regardless of age.
+
+## False positive history
+
+Dismissed findings are logged to `context/fp-history.md`. Review skills should check this file before flagging issues to avoid re-flagging known FPs.
 
 Use these prefixes when searching via `memory_search`.
 
@@ -174,7 +190,33 @@ User says: "remember that...", "add a lesson:", "I want you to know that..."
    - Lesson → `memory_write(target="context/lessons/<slug>.md", ...)`
    - Preference → append to `MEMORY.md` or `USER.md`
    - Intelligence → `memory_write(target="context/intel/<slug>.md", ...)`
-3. Confirm: "Noted: <summary>. Stored as <type>."
+3. Set metadata: `"source": "user_stated"` for preferences (these never decay in retrieval), `"source": "observed"` for lessons
+4. Set initial confidence: `"confidence": 9` for user-stated (high — user said it directly), `"confidence": 6` for observed
+5. Confirm: "Noted: <summary>. Stored as <type>."
+
+### Confirm or dismiss a learning (confidence recalibration)
+
+User says: "that finding was correct", "that was a false positive", "good catch", "wrong about X"
+
+**Action: Confirming (boosting confidence):**
+1. Find the referenced learning via `memory_search`
+2. Read its current confidence from metadata (default 10 if not set)
+3. Boost: `new_confidence = min(current + 2, 10)`
+4. Rewrite the doc with updated confidence via `memory_write` (append=false)
+5. Confirm: "Boosted confidence on '<title>' to <new>/10."
+
+**Action: Dismissing (lowering confidence):**
+1. Find the referenced learning
+2. Lower: `new_confidence = max(current - 3, 1)`
+3. Rewrite with updated confidence
+4. If confidence drops below 3, suggest removing: "Confidence is now <new>/10. Remove this learning?"
+5. Log the dismissal to `context/fp-history.md`:
+   ```
+   - <date>: Dismissed "<title>" — reason: <user's reason>
+   ```
+6. Confirm: "Lowered confidence on '<title>' to <new>/10. Logged as potential false positive."
+
+The FP history at `context/fp-history.md` is checked by review skills (security-review, qa-review) to avoid re-flagging dismissed patterns.
 
 ### Review learning quality
 
@@ -184,18 +226,25 @@ User says: "are the learnings helping?", "learning quality"
 1. Search for skills with usage metrics in metadata
 2. Calculate: how many extracted skills have been used? What's the average success rate?
 3. Identify top performers and underperformers
-4. Present:
+4. Check for positive vs negative learnings (metadata `"positive": true`)
+5. Present:
 
 ```
 ## Learning Quality
 
 ### High-value learnings (used and successful)
-- <skill/lesson> — used <N> times, <success>% success
+- <skill/lesson> — used <N> times, <success>% success, confidence: <N>/10
+
+### Positive patterns captured
+- <pattern> — confidence: <N>/10, observed in <N> threads
 
 ### Unused learnings (may be stale)
-- <skill/lesson> — 0 uses since extraction <date>
+- <skill/lesson> — 0 uses since extraction <date>, confidence: <N>/10
 
 ### Failed learnings (may need correction)
-- <skill> — <N> uses, <success>% success (below 50%)
+- <skill> — <N> uses, <success>% success (below 50%), confidence: <N>/10
   Consider revising or removing.
+
+### False positive history
+- <count> findings dismissed. Check context/fp-history.md for details.
 ```
