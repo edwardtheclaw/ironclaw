@@ -365,7 +365,7 @@ pub async fn execute_code_with_skills(
     // Pending async tool executions keyed by Monty call_id.
     // When a tool FunctionCall comes in, we spawn a tokio task and store
     // the JoinHandle here. When ResolveFutures yields, we await them.
-    let mut pending_tools: HashMap<u32, PendingTool> = HashMap::new();
+    let mut pending_futures: HashMap<u32, PendingFuture> = HashMap::new();
 
     // Drive the execution loop
     let mut call_counter = 0u32;
@@ -409,19 +409,31 @@ pub async fn execute_code_with_skills(
                         final_answer = Some(format!("[FINAL_VAR: {var_name}]"));
                         Some(ExtFunctionResult::Return(MontyObject::None))
                     }
-                    "llm_query" => Some(
-                        handle_llm_query(&call.args, &call.kwargs, llm, &mut recursive_tokens)
-                            .await,
-                    ),
-                    "llm_query_batched" => Some(
-                        handle_llm_query_batched(
-                            &call.args,
-                            &call.kwargs,
-                            llm,
-                            &mut recursive_tokens,
-                        )
-                        .await,
-                    ),
+                    // LLM calls are async — spawn tokio task, resume_pending.
+                    // This allows asyncio.gather(llm_query(...), tool(...))
+                    // to run the LLM call and tool call concurrently.
+                    "llm_query" => {
+                        let args = call.args.clone();
+                        let kwargs = call.kwargs.clone();
+                        let llm = llm.clone();
+                        let handle = tokio::spawn(async move {
+                            handle_llm_query_standalone(&args, &kwargs, &llm).await
+                        });
+                        pending_futures.insert(monty_call_id, PendingFuture::Llm { handle });
+                        None // handled as async below
+                    }
+                    "llm_query_batched" => {
+                        let args = call.args.clone();
+                        let kwargs = call.kwargs.clone();
+                        let llm = llm.clone();
+                        let handle = tokio::spawn(async move {
+                            handle_llm_query_batched_standalone(&args, &kwargs, &llm).await
+                        });
+                        pending_futures.insert(monty_call_id, PendingFuture::Llm { handle });
+                        None
+                    }
+                    // rlm_query stays synchronous — it spawns a child Monty VM
+                    // which isn't Send, so it can't run in tokio::spawn.
                     "rlm_query" => Some(
                         handle_rlm_query(
                             &call.args,
@@ -476,6 +488,36 @@ pub async fn execute_code_with_skills(
                     continue;
                 }
 
+                // If an LLM call already inserted a pending future, just
+                // resume_pending and continue — no preflight needed.
+                if pending_futures.contains_key(&monty_call_id) {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        call.resume_pending(PrintWriter::Collect(&mut stdout))
+                    })) {
+                        Ok(Ok(p)) => progress = p,
+                        Ok(Err(e)) => {
+                            stdout.push_str(&format!("\nError: {e}"));
+                            had_error = true;
+                            return Ok(CodeExecutionResult {
+                                return_value: serde_json::Value::Null,
+                                stdout,
+                                action_results,
+                                events,
+                                need_approval: None,
+                                recursive_tokens,
+                                final_answer,
+                                had_error,
+                            });
+                        }
+                        Err(_) => {
+                            return Err(EngineError::Effect {
+                                reason: "Monty VM panicked during resume_pending".into(),
+                            });
+                        }
+                    }
+                    continue;
+                }
+
                 // ── Async tool dispatch ─────────────────────────────
                 // Preflight (lease + policy) is sync. If denied or
                 // needs approval, resume with error immediately.
@@ -511,13 +553,12 @@ pub async fn execute_code_with_skills(
                                 .await
                         });
 
-                        pending_tools.insert(
+                        pending_futures.insert(
                             monty_call_id,
-                            PendingTool {
+                            PendingFuture::Tool {
                                 handle,
                                 action_name,
                                 call_id: str_call_id,
-                                params,
                                 params_summary: ps,
                             },
                         );
@@ -590,109 +631,49 @@ pub async fn execute_code_with_skills(
                 }
             }
 
-            // ── ResolveFutures: parallel tool execution ─────────
+            // ── ResolveFutures: parallel execution ────────────────
+            // Resolves both tool calls and LLM calls that were deferred
+            // via resume_pending(). All pending tokio tasks are awaited
+            // and their results fed back to Monty.
             RunProgress::ResolveFutures(resolve) => {
                 let pending_ids = resolve.pending_call_ids().to_vec();
-                debug!(pending = ?pending_ids, "Monty: ResolveFutures — resolving pending tools");
+                debug!(pending = ?pending_ids, "Monty: ResolveFutures — resolving {} pending futures", pending_ids.len());
 
                 let mut results: Vec<(u32, ExtFunctionResult)> =
                     Vec::with_capacity(pending_ids.len());
 
                 for &mid in &pending_ids {
-                    if let Some(pt) = pending_tools.remove(&mid) {
-                        let exec_result = match pt.handle.await {
-                            Ok(Ok(result)) => {
-                                events.push(EventKind::ActionExecuted {
-                                    step_id: context.step_id,
-                                    action_name: pt.action_name.clone(),
-                                    call_id: pt.call_id.clone(),
-                                    duration_ms: result.duration.as_millis() as u64,
-                                    params_summary: pt.params_summary,
-                                });
-                                let monty_val = json_to_monty(&result.output);
-                                action_results.push(result);
-                                ExtFunctionResult::Return(monty_val)
-                            }
-                            Ok(Err(EngineError::NeedAuthentication {
-                                credential_name,
+                    let ext_result = if let Some(pf) = pending_futures.remove(&mid) {
+                        match pf {
+                            PendingFuture::Tool {
+                                handle,
                                 action_name,
                                 call_id,
-                                parameters: _,
-                            })) => {
-                                events.push(EventKind::ActionFailed {
-                                    step_id: context.step_id,
-                                    action_name: action_name.clone(),
-                                    call_id: call_id.clone(),
-                                    error: format!(
-                                        "authentication required for credential '{credential_name}'"
-                                    ),
-                                    params_summary: pt.params_summary,
-                                });
-                                // Store the interrupt — we'll return it after resolving
-                                // all futures (so other parallel tasks get recorded too).
-                                // For now, return an error to the Python side.
-                                ExtFunctionResult::Error(MontyException::new(
-                                    ExcType::RuntimeError,
-                                    Some(format!(
-                                        "authentication required for credential '{credential_name}'"
-                                    )),
-                                ))
+                                params_summary,
+                            } => {
+                                resolve_tool_future(
+                                    handle,
+                                    &action_name,
+                                    &call_id,
+                                    params_summary,
+                                    context,
+                                    &mut action_results,
+                                    &mut events,
+                                )
+                                .await
                             }
-                            Ok(Err(EngineError::NeedApproval {
-                                action_name,
-                                call_id,
-                                ..
-                            })) => {
-                                events.push(EventKind::ApprovalRequested {
-                                    action_name,
-                                    call_id,
-                                });
-                                ExtFunctionResult::Error(MontyException::new(
-                                    ExcType::RuntimeError,
-                                    Some("action requires approval".into()),
-                                ))
+                            PendingFuture::Llm { handle } => {
+                                resolve_llm_future(handle, &mut recursive_tokens).await
                             }
-                            Ok(Err(e)) => {
-                                events.push(EventKind::ActionFailed {
-                                    step_id: context.step_id,
-                                    action_name: pt.action_name.clone(),
-                                    call_id: pt.call_id.clone(),
-                                    error: e.to_string(),
-                                    params_summary: pt.params_summary,
-                                });
-                                action_results.push(ActionResult {
-                                    call_id: pt.call_id,
-                                    action_name: pt.action_name,
-                                    output: serde_json::json!({"error": e.to_string()}),
-                                    is_error: true,
-                                    duration: Duration::ZERO,
-                                });
-                                ExtFunctionResult::Error(MontyException::new(
-                                    ExcType::RuntimeError,
-                                    Some(e.to_string()),
-                                ))
-                            }
-                            Err(e) => {
-                                // tokio task panicked
-                                debug!("async tool task panicked: {e}");
-                                ExtFunctionResult::Error(MontyException::new(
-                                    ExcType::RuntimeError,
-                                    Some(format!("tool execution panicked: {e}")),
-                                ))
-                            }
-                        };
-                        results.push((mid, exec_result));
+                        }
                     } else {
-                        // Unknown call_id — shouldn't happen, but be safe
                         debug!(call_id = mid, "ResolveFutures: unknown pending call_id");
-                        results.push((
-                            mid,
-                            ExtFunctionResult::Error(MontyException::new(
-                                ExcType::RuntimeError,
-                                Some(format!("unknown pending call_id {mid}")),
-                            )),
-                        ));
-                    }
+                        ExtFunctionResult::Error(MontyException::new(
+                            ExcType::RuntimeError,
+                            Some(format!("unknown pending call_id {mid}")),
+                        ))
+                    };
+                    results.push((mid, ext_result));
                 }
 
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -801,17 +782,22 @@ pub async fn execute_code_with_skills(
     }
 }
 
-// ── Pending tool tracking ──────────────────────────────────
+// ── Pending future tracking ─────────────────────────────────
 
-/// A tool execution that has been spawned as a tokio task and is pending
-/// resolution via `ResolveFutures`.
-struct PendingTool {
-    handle: tokio::task::JoinHandle<Result<ActionResult, EngineError>>,
-    action_name: String,
-    call_id: String,
-    #[allow(dead_code)]
-    params: serde_json::Value,
-    params_summary: Option<String>,
+/// A deferred computation spawned as a tokio task, pending resolution
+/// via `ResolveFutures`. Can be a tool execution or an LLM call.
+enum PendingFuture {
+    /// Tool action execution.
+    Tool {
+        handle: tokio::task::JoinHandle<Result<ActionResult, EngineError>>,
+        action_name: String,
+        call_id: String,
+        params_summary: Option<String>,
+    },
+    /// LLM call (llm_query / llm_query_batched / rlm_query).
+    Llm {
+        handle: tokio::task::JoinHandle<(ExtFunctionResult, TokenUsage)>,
+    },
 }
 
 /// Result of preflight checks (lease + policy) for a tool call.
@@ -1212,6 +1198,140 @@ async fn handle_rlm_query(
             ExcType::RuntimeError,
             Some(format!("rlm_query failed: {e}")),
         )),
+    }
+}
+
+// ── Standalone async handlers (for tokio::spawn) ────────────
+
+/// `llm_query()` — standalone version that returns `(ExtFunctionResult, TokenUsage)`.
+async fn handle_llm_query_standalone(
+    args: &[MontyObject],
+    kwargs: &[(MontyObject, MontyObject)],
+    llm: &Arc<dyn LlmBackend>,
+) -> (ExtFunctionResult, TokenUsage) {
+    let mut tokens = TokenUsage::default();
+    let result = handle_llm_query(args, kwargs, llm, &mut tokens).await;
+    (result, tokens)
+}
+
+/// `llm_query_batched()` — standalone version.
+async fn handle_llm_query_batched_standalone(
+    args: &[MontyObject],
+    kwargs: &[(MontyObject, MontyObject)],
+    llm: &Arc<dyn LlmBackend>,
+) -> (ExtFunctionResult, TokenUsage) {
+    let mut tokens = TokenUsage::default();
+    let result = handle_llm_query_batched(args, kwargs, llm, &mut tokens).await;
+    (result, tokens)
+}
+
+// ── Future resolution helpers ───────────────────────────────
+
+/// Resolve a pending tool execution future.
+async fn resolve_tool_future(
+    handle: tokio::task::JoinHandle<Result<ActionResult, EngineError>>,
+    action_name: &str,
+    call_id: &str,
+    params_summary: Option<String>,
+    context: &ThreadExecutionContext,
+    action_results: &mut Vec<ActionResult>,
+    events: &mut Vec<EventKind>,
+) -> ExtFunctionResult {
+    match handle.await {
+        Ok(Ok(result)) => {
+            events.push(EventKind::ActionExecuted {
+                step_id: context.step_id,
+                action_name: action_name.into(),
+                call_id: call_id.into(),
+                duration_ms: result.duration.as_millis() as u64,
+                params_summary,
+            });
+            let monty_val = json_to_monty(&result.output);
+            action_results.push(result);
+            ExtFunctionResult::Return(monty_val)
+        }
+        Ok(Err(EngineError::NeedAuthentication {
+            credential_name,
+            action_name,
+            call_id,
+            ..
+        })) => {
+            events.push(EventKind::ActionFailed {
+                step_id: context.step_id,
+                action_name: action_name.clone(),
+                call_id: call_id.clone(),
+                error: format!("authentication required for credential '{credential_name}'"),
+                params_summary,
+            });
+            ExtFunctionResult::Error(MontyException::new(
+                ExcType::RuntimeError,
+                Some(format!(
+                    "authentication required for credential '{credential_name}'"
+                )),
+            ))
+        }
+        Ok(Err(EngineError::NeedApproval {
+            action_name,
+            call_id,
+            ..
+        })) => {
+            events.push(EventKind::ApprovalRequested {
+                action_name,
+                call_id,
+            });
+            ExtFunctionResult::Error(MontyException::new(
+                ExcType::RuntimeError,
+                Some("action requires approval".into()),
+            ))
+        }
+        Ok(Err(e)) => {
+            events.push(EventKind::ActionFailed {
+                step_id: context.step_id,
+                action_name: action_name.into(),
+                call_id: call_id.into(),
+                error: e.to_string(),
+                params_summary,
+            });
+            action_results.push(ActionResult {
+                call_id: call_id.into(),
+                action_name: action_name.into(),
+                output: serde_json::json!({"error": e.to_string()}),
+                is_error: true,
+                duration: Duration::ZERO,
+            });
+            ExtFunctionResult::Error(MontyException::new(
+                ExcType::RuntimeError,
+                Some(e.to_string()),
+            ))
+        }
+        Err(e) => {
+            debug!("async tool task panicked: {e}");
+            ExtFunctionResult::Error(MontyException::new(
+                ExcType::RuntimeError,
+                Some(format!("tool execution panicked: {e}")),
+            ))
+        }
+    }
+}
+
+/// Resolve a pending LLM call future, accumulating token usage.
+async fn resolve_llm_future(
+    handle: tokio::task::JoinHandle<(ExtFunctionResult, TokenUsage)>,
+    recursive_tokens: &mut TokenUsage,
+) -> ExtFunctionResult {
+    match handle.await {
+        Ok((result, tokens)) => {
+            recursive_tokens.input_tokens += tokens.input_tokens;
+            recursive_tokens.output_tokens += tokens.output_tokens;
+            result
+        }
+        Err(e) => {
+            debug!("async LLM task panicked: {e}");
+            ExtFunctionResult::Error(MontyException::new(
+                ExcType::RuntimeError,
+                Some(format!("LLM call panicked: {e}")),
+            ))
+        }
     }
 }
 
