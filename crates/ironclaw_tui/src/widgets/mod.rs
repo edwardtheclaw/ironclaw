@@ -195,6 +195,31 @@ pub enum ToolStatus {
     Failed,
 }
 
+/// Execution status of a thread or job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThreadStatus {
+    /// Currently executing work.
+    #[default]
+    Active,
+    /// Alive but waiting for input or a timer.
+    Idle,
+    /// Finished successfully.
+    Completed,
+    /// Terminated with an error.
+    Failed,
+}
+
+impl std::fmt::Display for ThreadStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Active => write!(f, "active"),
+            Self::Idle => write!(f, "idle"),
+            Self::Completed => write!(f, "done"),
+            Self::Failed => write!(f, "failed"),
+        }
+    }
+}
+
 /// Thread information for the sidebar.
 #[derive(Debug, Clone)]
 pub struct ThreadInfo {
@@ -203,6 +228,10 @@ pub struct ThreadInfo {
     pub is_foreground: bool,
     pub is_running: bool,
     pub duration_secs: u64,
+    /// Richer status indicator.
+    pub status: ThreadStatus,
+    /// When the thread was created / started.
+    pub started_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Search state for Ctrl+F in conversation.

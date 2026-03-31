@@ -2,7 +2,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
@@ -13,6 +13,18 @@ use crate::render::{format_tokens, format_tool_duration, render_markdown, trunca
 use crate::theme::Theme;
 
 use super::{AppState, MessageRole, ToolActivity, ToolStatus, TuiWidget};
+
+/// ASCII art startup banner displayed when the conversation is empty.
+const BANNER: &[&str] = &[
+    r"  ___                    ____ _                 ",
+    r" |_ _|_ __ ___  _ __   / ___| | __ ___      __ ",
+    r"  | || '__/ _ \| '_ \ | |   | |/ _` \ \ /\ / / ",
+    r"  | || | | (_) | | | || |___| | (_| |\ V  V /  ",
+    r" |___|_|  \___/|_| |_| \____|_|\__,_| \_/\_/   ",
+];
+
+/// Tagline shown beneath the ASCII art banner.
+const BANNER_TAGLINE: &str = "Secure AI Assistant";
 
 pub struct ConversationWidget {
     theme: Theme,
@@ -41,6 +53,52 @@ impl TuiWidget for ConversationWidget {
         let usable_width = (area.width as usize).saturating_sub(4);
         let mut all_lines: Vec<Line<'_>> = Vec::new();
         let mut turn_count = 0u32;
+
+        // Welcome block when the conversation is empty
+        if state.messages.is_empty() {
+            // ASCII banner
+            for banner_line in BANNER {
+                all_lines.push(Line::from(Span::styled(
+                    (*banner_line).to_string(),
+                    self.theme.accent_style(),
+                )));
+            }
+            all_lines.push(Line::from(Span::styled(
+                format!("  {BANNER_TAGLINE}"),
+                self.theme.dim_style(),
+            )));
+            all_lines.push(Line::from(""));
+
+            // Session metadata line: "  IronClaw v0.22.0  ·  gpt-4  ·  128k context"
+            let context_label = format!("{} context", format_tokens(state.context_window));
+            all_lines.push(Line::from(vec![
+                Span::styled("  IronClaw".to_string(), self.theme.accent_style()),
+                Span::styled(format!(" v{}", state.version), self.theme.accent_style()),
+                Span::styled("  \u{00B7}  ".to_string(), self.theme.dim_style()),
+                Span::styled(state.model.clone(), self.theme.dim_style()),
+                Span::styled("  \u{00B7}  ".to_string(), self.theme.dim_style()),
+                Span::styled(context_label, self.theme.dim_style()),
+            ]));
+
+            // Session start time: "  Session started 08:15 UTC"
+            let time_str = state.session_start.format("%H:%M UTC").to_string();
+            all_lines.push(Line::from(Span::styled(
+                format!("  Session started {time_str}"),
+                self.theme.dim_style(),
+            )));
+
+            // Blank line
+            all_lines.push(Line::from(""));
+
+            // Welcome prompt
+            all_lines.push(Line::from(vec![
+                Span::styled(
+                    "  What can I help you with?".to_string(),
+                    self.theme.bold_style(),
+                ),
+                Span::styled("  /help for commands".to_string(), self.theme.dim_style()),
+            ]));
+        }
 
         for msg in &state.messages {
             let (prefix, style) = match msg.role {
@@ -167,7 +225,7 @@ impl TuiWidget for ConversationWidget {
         }
 
         // Show thinking indicator if active
-        const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        const SPINNER: &[&str] = &["\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280F}"];
 
         if !state.status_text.is_empty() && !state.is_streaming {
             let frame = SPINNER[state.spinner_frame % SPINNER.len()];
@@ -180,9 +238,9 @@ impl TuiWidget for ConversationWidget {
         // Show streaming dots indicator
         if state.is_streaming {
             let dots = match state.spinner_frame % 4 {
-                0 => "·",
-                1 => "··",
-                2 => "···",
+                0 => "\u{00B7}",
+                1 => "\u{00B7}\u{00B7}",
+                2 => "\u{00B7}\u{00B7}\u{00B7}",
                 _ => "",
             };
             all_lines.push(Line::from(Span::styled(
@@ -303,9 +361,37 @@ impl TuiWidget for ConversationWidget {
 }
 
 impl ConversationWidget {
+    /// Return a category-specific icon and style for the given tool name.
+    ///
+    /// Categories are detected by simple substring matching on the tool name:
+    /// - Shell/Bash (`shell`, `bash`, `exec`) -> `$` in warning/yellow
+    /// - File (`file`, `read`, `write`, `edit`) -> `\u{270E}` in success/green
+    /// - Web/HTTP (`http`, `web`, `fetch`) -> `\u{25CE}` in cyan
+    /// - Memory (`memory`, `search`) -> `\u{25C8}` in magenta
+    /// - Default -> `$` in dim style
+    fn tool_category_icon(&self, tool_name: &str) -> (&'static str, Style) {
+        let name = tool_name.to_lowercase();
+
+        if name.contains("shell") || name.contains("bash") || name.contains("exec") {
+            ("$", self.theme.warning_style())
+        } else if name.contains("file")
+            || name.contains("read")
+            || name.contains("write")
+            || name.contains("edit")
+        {
+            ("\u{270E}", self.theme.success_style()) // ✎
+        } else if name.contains("http") || name.contains("web") || name.contains("fetch") {
+            ("\u{25CE}", Style::default().fg(Color::Cyan)) // ◎
+        } else if name.contains("memory") || name.contains("search") {
+            ("\u{25C8}", Style::default().fg(Color::Magenta)) // ◈
+        } else {
+            ("$", self.theme.dim_style())
+        }
+    }
+
     /// Render a single tool call line in the Claude Code inline style.
     ///
-    /// Format: `  ┊ icon $  command_text...             1.3s`
+    /// Format: `  \u{250A} icon category_icon  command_text...             1.3s`
     fn render_tool_line(
         &self,
         tool: &ToolActivity,
@@ -335,13 +421,16 @@ impl ConversationWidget {
                 .unwrap_or_default()
         };
 
-        // Build the command description: "$ detail" or "tool_name detail"
+        // Determine category icon and style from the tool name
+        let (cat_icon, cat_style) = self.tool_category_icon(&tool.name);
+
+        // Build the command description: "cat_icon  detail" or "cat_icon  tool_name"
         let cmd_text = match &tool.detail {
-            Some(d) => format!("$  {d}"),
-            None => format!("$  {}", tool.name),
+            Some(d) => format!("{cat_icon}  {d}"),
+            None => format!("{cat_icon}  {}", tool.name),
         };
 
-        // Layout: "  ┊ icon  cmd...  duration"
+        // Layout: "  \u{250A} icon  cmd...  duration"
         //          ^2  ^2    ^cmd    ^gap ^duration
         let prefix = format!("  \u{250A} {icon} ");
         let prefix_width = UnicodeWidthStr::width(prefix.as_str());
@@ -358,10 +447,25 @@ impl ConversationWidget {
             .max(1);
         let padding = " ".repeat(gap);
 
+        // Split cmd_truncated into the category icon part and the rest
+        // so we can apply the category style to just the icon.
+        let (styled_icon_part, rest_part) = if cmd_truncated.len() >= cat_icon.len()
+            && cmd_truncated.starts_with(cat_icon)
+        {
+            (
+                cmd_truncated[..cat_icon.len()].to_string(),
+                cmd_truncated[cat_icon.len()..].to_string(),
+            )
+        } else {
+            // Truncation cut into the icon; just dim everything
+            (String::new(), cmd_truncated)
+        };
+
         Line::from(vec![
             Span::styled("  \u{250A} ".to_string(), self.theme.dim_style()),
             Span::styled(format!("{icon} "), icon_style),
-            Span::styled(cmd_truncated, self.theme.dim_style()),
+            Span::styled(styled_icon_part, cat_style),
+            Span::styled(rest_part, self.theme.dim_style()),
             Span::raw(padding),
             Span::styled(duration_text, self.theme.dim_style()),
         ])

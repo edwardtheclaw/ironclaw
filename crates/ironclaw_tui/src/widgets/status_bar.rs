@@ -104,6 +104,33 @@ impl TuiWidget for StatusBarWidget {
                 format!("v{}", state.version),
                 self.theme.dim_style(),
             ),
+        ];
+
+        // Fleet/activity summary: active tools and threads
+        let tool_count = state.active_tools.len();
+        let thread_count = state.threads.len();
+        if tool_count > 0 || thread_count > 0 {
+            left_spans.push(sep.clone());
+            let mut parts: Vec<Span> = Vec::new();
+            if tool_count > 0 {
+                parts.push(Span::styled(
+                    format!("\u{26A1}{tool_count} tools"),
+                    self.theme.accent_style(),
+                ));
+            }
+            if tool_count > 0 && thread_count > 0 {
+                parts.push(Span::styled(" \u{00B7} ", self.theme.dim_style()));
+            }
+            if thread_count > 0 {
+                parts.push(Span::styled(
+                    format!("\u{25C6}{thread_count} threads"),
+                    self.theme.dim_style(),
+                ));
+            }
+            left_spans.extend(parts);
+        }
+
+        left_spans.extend([
             sep.clone(),
             Span::styled(
                 format!("{tokens_used_str}/{context_max_str}"),
@@ -112,7 +139,7 @@ impl TuiWidget for StatusBarWidget {
             sep.clone(),
             Span::styled(bar_str, bar_style),
             Span::styled(format!(" {pct}%"), self.theme.dim_style()),
-        ];
+        ]);
 
         if state.total_cost_usd != "$0.00" {
             left_spans.push(sep.clone());
