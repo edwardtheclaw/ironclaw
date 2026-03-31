@@ -624,7 +624,7 @@ pub async fn create_response_handler(
     let response_uuid = Uuid::new_v4();
 
     // Build the message for the agent loop.
-    let msg = IncomingMessage::new("responses_api", &user.user_id, &content)
+    let msg = IncomingMessage::new("gateway", &user.user_id, &content)
         .with_thread(&thread_id_str)
         .with_metadata(serde_json::json!({
             "thread_id": &thread_id_str,
