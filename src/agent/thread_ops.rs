@@ -109,10 +109,7 @@ impl Agent {
                     // Allow new threads from the Responses API — it generates
                     // fresh UUIDs that don't exist in the DB yet.
                     if !exists
-                        && message
-                            .metadata
-                            .get("source")
-                            .and_then(|v| v.as_str())
+                        && message.metadata.get("source").and_then(|v| v.as_str())
                             == Some("responses_api")
                     {
                         tracing::debug!(
