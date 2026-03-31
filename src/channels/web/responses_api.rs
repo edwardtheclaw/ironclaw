@@ -64,6 +64,13 @@ pub struct ResponsesRequest {
     pub tools: Option<Vec<ResponsesTool>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// Structured context injected into the agent's conversation.
+    ///
+    /// Used by integrations (e.g. Abound) to pass notification responses,
+    /// approval/rejection status, or other structured data that the agent
+    /// should see when processing the user's message.
+    #[serde(default)]
+    pub context: Option<serde_json::Value>,
 }
 
 fn default_model() -> String {
@@ -289,6 +296,38 @@ fn unix_timestamp() -> i64 {
 
 fn make_item_id() -> String {
     format!("item_{}", Uuid::new_v4().simple())
+}
+
+/// Format structured context as a human-readable prefix for the agent.
+///
+/// Flattens a JSON object like `{"notification_response": {"id": "msg_1", "action": "approved"}}`
+/// into `[Context: notification_response — id: msg_1, action: approved]`.
+fn format_context(ctx: &serde_json::Value) -> String {
+    let obj = match ctx.as_object() {
+        Some(o) => o,
+        None => return format!("[Context: {}]", ctx),
+    };
+    let mut parts = Vec::new();
+    for (key, value) in obj {
+        let detail = match value.as_object() {
+            Some(inner) => {
+                let fields: Vec<String> = inner
+                    .iter()
+                    .map(|(k, v)| {
+                        let s = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        format!("{k}: {s}")
+                    })
+                    .collect();
+                format!("[Context: {key} \u{2014} {}]", fields.join(", "))
+            }
+            None => format!("[Context: {key}: {value}]"),
+        };
+        parts.push(detail);
+    }
+    parts.join("\n")
 }
 
 /// Extract the user message text from the input.
@@ -606,8 +645,15 @@ pub async fn create_response_handler(
         ));
     }
 
-    let content = extract_user_content(&req.input)
+    let mut content = extract_user_content(&req.input)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, e, "invalid_request_error"))?;
+
+    // Prepend structured context (e.g. notification approval/rejection) so
+    // the agent sees it naturally in the conversation.
+    if let Some(ref ctx) = req.context {
+        let prefix = format_context(ctx);
+        content = format!("{prefix}\n\n{content}");
+    }
 
     // Resolve or create thread.
     let thread_uuid = match &req.previous_response_id {
@@ -624,13 +670,17 @@ pub async fn create_response_handler(
     let response_uuid = Uuid::new_v4();
 
     // Build the message for the agent loop.
+    let mut metadata = serde_json::json!({
+        "thread_id": &thread_id_str,
+        "user_id": &user.user_id,
+        "source": "responses_api",
+    });
+    if let Some(ref ctx) = req.context {
+        metadata["context"] = ctx.clone();
+    }
     let msg = IncomingMessage::new("gateway", &user.user_id, &content)
         .with_thread(&thread_id_str)
-        .with_metadata(serde_json::json!({
-            "thread_id": &thread_id_str,
-            "user_id": &user.user_id,
-            "source": "responses_api",
-        }));
+        .with_metadata(metadata);
 
     let resp_id = encode_response_id(&response_uuid, &thread_uuid);
     let model = req.model.clone();
@@ -1415,5 +1465,29 @@ mod tests {
         assert_eq!(json, "\"in_progress\"");
         let json = serde_json::to_string(&ResponseStatus::Completed).expect("serialize");
         assert_eq!(json, "\"completed\"");
+    }
+
+    #[test]
+    fn format_context_notification_response() {
+        let ctx = serde_json::json!({
+            "notification_response": {
+                "notification_id": "msg_123",
+                "action": "approved",
+                "score": 72
+            }
+        });
+        let result = format_context(&ctx);
+        assert!(result.contains("[Context: notification_response"));
+        assert!(result.contains("notification_id: msg_123"));
+        assert!(result.contains("action: approved"));
+        assert!(result.contains("score: 72"));
+    }
+
+    #[test]
+    fn format_context_simple_value() {
+        let ctx = serde_json::json!({"status": "ok"});
+        let result = format_context(&ctx);
+        assert!(result.contains("status"));
+        assert!(result.contains("ok"));
     }
 }
