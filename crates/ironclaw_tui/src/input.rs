@@ -41,15 +41,34 @@ pub enum InputAction {
     PaletteSelect,
     /// Close the command palette.
     PaletteClose,
+    /// Navigate input history backward (older).
+    HistoryUp,
+    /// Navigate input history forward (newer).
+    HistoryDown,
+    /// Toggle search mode on/off.
+    SearchToggle,
+    /// Jump to next search match.
+    SearchNext,
+    /// Jump to previous search match.
+    SearchPrev,
     /// No recognized action — pass to input box.
     Forward,
 }
 
-/// Map a key event to an action, considering whether an approval dialog or
-/// the command palette is active.
-pub fn map_key(key: KeyEvent, approval_active: bool, palette_active: bool) -> InputAction {
+/// Map a key event to an action, considering whether an approval dialog,
+/// the command palette, or the search bar is active.
+pub fn map_key(
+    key: KeyEvent,
+    approval_active: bool,
+    palette_active: bool,
+    search_active: bool,
+) -> InputAction {
     if approval_active {
         return map_approval_key(key);
+    }
+
+    if search_active {
+        return map_search_key(key);
     }
 
     if palette_active {
@@ -61,12 +80,32 @@ pub fn map_key(key: KeyEvent, approval_active: bool, palette_active: bool) -> In
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => InputAction::Quit,
         (KeyCode::Char('b'), KeyModifiers::CONTROL) => InputAction::ToggleSidebar,
         (KeyCode::Char('l'), KeyModifiers::CONTROL) => InputAction::ToggleLogs,
+        (KeyCode::Char('f'), KeyModifiers::CONTROL) => InputAction::SearchToggle,
         (KeyCode::Esc, _) => InputAction::Interrupt,
         (KeyCode::PageUp, _) => InputAction::ScrollUp,
         (KeyCode::PageDown, _) => InputAction::ScrollDown,
         // Ctrl+Up / Ctrl+Down for scroll
         (KeyCode::Up, KeyModifiers::CONTROL) => InputAction::ScrollUp,
         (KeyCode::Down, KeyModifiers::CONTROL) => InputAction::ScrollDown,
+        // Ctrl+P / Ctrl+N for input history navigation
+        (KeyCode::Char('p'), KeyModifiers::CONTROL) => InputAction::HistoryUp,
+        (KeyCode::Char('n'), KeyModifiers::CONTROL) => InputAction::HistoryDown,
+        _ => InputAction::Forward,
+    }
+}
+
+/// Map key events when the search bar is active.
+fn map_search_key(key: KeyEvent) -> InputAction {
+    match (key.code, key.modifiers) {
+        // Ctrl-C should still quit
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => InputAction::Quit,
+        // Esc closes search
+        (KeyCode::Esc, _) => InputAction::SearchToggle,
+        // Enter jumps to next match
+        (KeyCode::Enter, KeyModifiers::NONE) => InputAction::SearchNext,
+        // Shift+Enter jumps to previous match
+        (KeyCode::Enter, KeyModifiers::SHIFT) => InputAction::SearchPrev,
+        // All other keys are forwarded (to update the search query)
         _ => InputAction::Forward,
     }
 }
@@ -116,75 +155,143 @@ mod tests {
     #[test]
     fn enter_submits() {
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(map_key(key, false, false), InputAction::Submit);
+        assert_eq!(map_key(key, false, false, false), InputAction::Submit);
     }
 
     #[test]
     fn ctrl_c_quits() {
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(map_key(key, false, false), InputAction::Quit);
+        assert_eq!(map_key(key, false, false, false), InputAction::Quit);
     }
 
     #[test]
     fn ctrl_b_toggles_sidebar() {
         let key = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
-        assert_eq!(map_key(key, false, false), InputAction::ToggleSidebar);
+        assert_eq!(map_key(key, false, false, false), InputAction::ToggleSidebar);
     }
 
     #[test]
     fn ctrl_l_toggles_logs() {
         let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
-        assert_eq!(map_key(key, false, false), InputAction::ToggleLogs);
+        assert_eq!(map_key(key, false, false, false), InputAction::ToggleLogs);
     }
 
     #[test]
     fn esc_interrupts() {
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(map_key(key, false, false), InputAction::Interrupt);
+        assert_eq!(map_key(key, false, false, false), InputAction::Interrupt);
     }
 
     #[test]
     fn approval_mode_y_approves() {
         let key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
-        assert_eq!(map_key(key, true, false), InputAction::QuickApprove);
+        assert_eq!(map_key(key, true, false, false), InputAction::QuickApprove);
     }
 
     #[test]
     fn approval_mode_n_denies() {
         let key = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
-        assert_eq!(map_key(key, true, false), InputAction::QuickDeny);
+        assert_eq!(map_key(key, true, false, false), InputAction::QuickDeny);
     }
 
     #[test]
     fn palette_up_down() {
         let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
-        assert_eq!(map_key(up, false, true), InputAction::PaletteUp);
+        assert_eq!(map_key(up, false, true, false), InputAction::PaletteUp);
         let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
-        assert_eq!(map_key(down, false, true), InputAction::PaletteDown);
+        assert_eq!(map_key(down, false, true, false), InputAction::PaletteDown);
     }
 
     #[test]
     fn palette_enter_selects() {
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(map_key(key, false, true), InputAction::PaletteSelect);
+        assert_eq!(map_key(key, false, true, false), InputAction::PaletteSelect);
     }
 
     #[test]
     fn palette_tab_selects() {
         let key = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
-        assert_eq!(map_key(key, false, true), InputAction::PaletteSelect);
+        assert_eq!(map_key(key, false, true, false), InputAction::PaletteSelect);
     }
 
     #[test]
     fn palette_esc_closes() {
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(map_key(key, false, true), InputAction::PaletteClose);
+        assert_eq!(map_key(key, false, true, false), InputAction::PaletteClose);
     }
 
     #[test]
     fn palette_typing_forwards() {
         let key = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
-        assert_eq!(map_key(key, false, true), InputAction::Forward);
+        assert_eq!(map_key(key, false, true, false), InputAction::Forward);
+    }
+
+    #[test]
+    fn ctrl_p_history_up() {
+        let key = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert_eq!(map_key(key, false, false, false), InputAction::HistoryUp);
+    }
+
+    #[test]
+    fn ctrl_n_history_down() {
+        let key = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert_eq!(map_key(key, false, false, false), InputAction::HistoryDown);
+    }
+
+    #[test]
+    fn history_keys_ignored_in_approval_mode() {
+        let key_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        // In approval mode, Ctrl+P is forwarded (not a recognized approval key)
+        assert_eq!(map_key(key_p, true, false, false), InputAction::Forward);
+    }
+
+    #[test]
+    fn history_keys_ignored_in_palette_mode() {
+        let key_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        // In palette mode, Ctrl+P is forwarded (not a recognized palette key)
+        assert_eq!(map_key(key_p, false, true, false), InputAction::Forward);
+    }
+
+    #[test]
+    fn ctrl_f_toggles_search() {
+        let key = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert_eq!(
+            map_key(key, false, false, false),
+            InputAction::SearchToggle
+        );
+    }
+
+    #[test]
+    fn search_esc_closes() {
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            map_key(key, false, false, true),
+            InputAction::SearchToggle
+        );
+    }
+
+    #[test]
+    fn search_enter_next() {
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(map_key(key, false, false, true), InputAction::SearchNext);
+    }
+
+    #[test]
+    fn search_shift_enter_prev() {
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(map_key(key, false, false, true), InputAction::SearchPrev);
+    }
+
+    #[test]
+    fn search_typing_forwards() {
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(map_key(key, false, false, true), InputAction::Forward);
+    }
+
+    #[test]
+    fn search_ctrl_c_quits() {
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(map_key(key, false, false, true), InputAction::Quit);
     }
 
     #[test]

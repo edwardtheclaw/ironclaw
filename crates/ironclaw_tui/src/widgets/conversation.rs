@@ -9,7 +9,7 @@ use ratatui::widgets::Widget;
 use crate::layout::TuiSlot;
 use unicode_width::UnicodeWidthStr;
 
-use crate::render::{format_tool_duration, render_markdown, truncate, wrap_text};
+use crate::render::{format_tokens, format_tool_duration, render_markdown, truncate, wrap_text};
 use crate::theme::Theme;
 
 use super::{AppState, MessageRole, ToolActivity, ToolStatus, TuiWidget};
@@ -40,6 +40,7 @@ impl TuiWidget for ConversationWidget {
 
         let usable_width = (area.width as usize).saturating_sub(4);
         let mut all_lines: Vec<Line<'_>> = Vec::new();
+        let mut turn_count = 0u32;
 
         for msg in &state.messages {
             let (prefix, style) = match msg.role {
@@ -53,19 +54,29 @@ impl TuiWidget for ConversationWidget {
                 if !all_lines.is_empty() {
                     all_lines.push(Line::from(""));
                 }
+                let time_str = msg.timestamp.format("%H:%M").to_string();
                 let user_line = Line::from(vec![
                     Span::styled(prefix.to_string(), self.theme.accent_style()),
                     Span::styled(msg.content.clone(), self.theme.bold_style()),
+                    Span::styled(format!("  {time_str}"), self.theme.dim_style()),
                 ]);
                 all_lines.push(user_line);
                 all_lines.push(Line::from(""));
             } else if msg.role == MessageRole::Assistant {
-                // Separator before assistant response
-                let sep = "\u{2500}".repeat(usable_width.min(60));
-                all_lines.push(Line::from(Span::styled(
-                    format!("  {sep}"),
-                    self.theme.dim_style(),
-                )));
+                // Separator with turn counter before assistant response
+                turn_count += 1;
+                let turn_label = format!(" Turn {turn_count} ");
+                let sep_left_len = 2usize;
+                let sep_right_len = usable_width
+                    .min(60)
+                    .saturating_sub(sep_left_len + turn_label.len());
+                let sep_left = "\u{2500}".repeat(sep_left_len);
+                let sep_right = "\u{2500}".repeat(sep_right_len);
+                all_lines.push(Line::from(vec![
+                    Span::styled(format!("  {sep_left}"), self.theme.dim_style()),
+                    Span::styled(turn_label, self.theme.dim_style()),
+                    Span::styled(sep_right, self.theme.dim_style()),
+                ]));
 
                 let wrapped =
                     render_markdown(&msg.content, usable_width.saturating_sub(2), &self.theme);
@@ -78,6 +89,19 @@ impl TuiWidget for ConversationWidget {
                     );
                     all_lines.push(Line::from(padded));
                 }
+
+                // Per-turn cost summary
+                if let Some(ref cost) = msg.cost_summary {
+                    let cost_line = format!(
+                        "  \u{25CB} {}in + {}out  {}",
+                        format_tokens(cost.input_tokens),
+                        format_tokens(cost.output_tokens),
+                        cost.cost_usd,
+                    );
+                    all_lines
+                        .push(Line::from(Span::styled(cost_line, self.theme.dim_style())));
+                }
+
                 all_lines.push(Line::from(""));
             } else {
                 let wrapped = wrap_text(&msg.content, usable_width, style);
@@ -106,18 +130,135 @@ impl TuiWidget for ConversationWidget {
             all_lines.push(Line::from(""));
             for tool in &turn_recent {
                 all_lines.push(self.render_tool_line(tool, usable_width, false));
+                // Tool output preview line
+                if let Some(ref preview) = tool.result_preview {
+                    let preview_max = usable_width.saturating_sub(8);
+                    let first_line = preview.lines().next().unwrap_or("");
+                    if !first_line.is_empty() {
+                        all_lines.push(Line::from(vec![
+                            Span::styled("  \u{250A}   ".to_string(), self.theme.dim_style()),
+                            Span::styled("\u{2192} ".to_string(), self.theme.dim_style()),
+                            Span::styled(
+                                truncate(first_line, preview_max),
+                                self.theme.dim_style(),
+                            ),
+                        ]));
+                    }
+                }
             }
             for tool in &state.active_tools {
                 all_lines.push(self.render_tool_line(tool, usable_width, true));
+                // Tool output preview line for active tools
+                if let Some(ref preview) = tool.result_preview {
+                    let preview_max = usable_width.saturating_sub(8);
+                    let first_line = preview.lines().next().unwrap_or("");
+                    if !first_line.is_empty() {
+                        all_lines.push(Line::from(vec![
+                            Span::styled("  \u{250A}   ".to_string(), self.theme.dim_style()),
+                            Span::styled("\u{2192} ".to_string(), self.theme.dim_style()),
+                            Span::styled(
+                                truncate(first_line, preview_max),
+                                self.theme.dim_style(),
+                            ),
+                        ]));
+                    }
+                }
             }
         }
 
         // Show thinking indicator if active
+        const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
         if !state.status_text.is_empty() && !state.is_streaming {
+            let frame = SPINNER[state.spinner_frame % SPINNER.len()];
+            all_lines.push(Line::from(vec![
+                Span::styled(format!("  {frame} "), self.theme.accent_style()),
+                Span::styled(state.status_text.clone(), self.theme.dim_style()),
+            ]));
+        }
+
+        // Show streaming dots indicator
+        if state.is_streaming {
+            let dots = match state.spinner_frame % 4 {
+                0 => "·",
+                1 => "··",
+                2 => "···",
+                _ => "",
+            };
             all_lines.push(Line::from(Span::styled(
-                format!("  \u{25CB} {}", state.status_text),
+                format!("  {dots}"),
+                self.theme.accent_style(),
+            )));
+        }
+
+        // Render follow-up suggestions when not streaming
+        if !state.suggestions.is_empty() && !state.is_streaming {
+            all_lines.push(Line::from(""));
+            all_lines.push(Line::from(Span::styled(
+                "  Suggestions:".to_string(),
                 self.theme.dim_style(),
             )));
+            for (i, suggestion) in state.suggestions.iter().take(3).enumerate() {
+                all_lines.push(Line::from(vec![
+                    Span::styled(format!("  {} ", i + 1), self.theme.accent_style()),
+                    Span::styled(
+                        truncate(suggestion, usable_width.saturating_sub(6)),
+                        self.theme.dim_style(),
+                    ),
+                ]));
+            }
+        }
+
+        // Search highlighting: replace spans that contain the query with
+        // highlighted versions (black text on yellow background).
+        if state.search.active && !state.search.query.is_empty() {
+            let highlight_style = Style::default()
+                .fg(ratatui::style::Color::Black)
+                .bg(ratatui::style::Color::Yellow);
+            let query_lower = state.search.query.to_lowercase();
+
+            all_lines = all_lines
+                .into_iter()
+                .map(|line| {
+                    let mut new_spans: Vec<Span<'_>> = Vec::new();
+
+                    for span in line.spans {
+                        let text = span.content.to_string();
+                        let text_lower = text.to_lowercase();
+
+                        if text_lower.contains(&query_lower) {
+                            let mut remaining = text.as_str();
+                            while !remaining.is_empty() {
+                                let lower_remaining = remaining.to_lowercase();
+                                if let Some(pos) = lower_remaining.find(&query_lower) {
+                                    if pos > 0 {
+                                        new_spans.push(Span::styled(
+                                            remaining[..pos].to_string(),
+                                            span.style,
+                                        ));
+                                    }
+                                    let match_end = pos + query_lower.len();
+                                    new_spans.push(Span::styled(
+                                        remaining[pos..match_end].to_string(),
+                                        highlight_style,
+                                    ));
+                                    remaining = &remaining[match_end..];
+                                } else {
+                                    new_spans.push(Span::styled(
+                                        remaining.to_string(),
+                                        span.style,
+                                    ));
+                                    break;
+                                }
+                            }
+                        } else {
+                            new_spans.push(Span::styled(text, span.style));
+                        }
+                    }
+
+                    Line::from(new_spans)
+                })
+                .collect();
         }
 
         // Compute visible window (scroll from bottom)
@@ -127,11 +268,34 @@ impl TuiWidget for ConversationWidget {
         let start = total_lines.saturating_sub(visible_height + scroll);
         let end = total_lines.saturating_sub(scroll).min(total_lines);
 
-        let visible: Vec<Line<'_>> = all_lines
+        let mut visible: Vec<Line<'_>> = all_lines
             .into_iter()
             .skip(start)
             .take(end.saturating_sub(start))
             .collect();
+
+        // Insert search bar at top of visible area when search is active
+        if state.search.active {
+            let match_info = format!(
+                "  {}/{}",
+                if state.search.match_count > 0 {
+                    state.search.current_match + 1
+                } else {
+                    0
+                },
+                state.search.match_count
+            );
+            let search_line = Line::from(vec![
+                Span::styled(" / ", self.theme.accent_style()),
+                Span::styled(state.search.query.clone(), self.theme.bold_style()),
+                Span::styled(match_info, self.theme.dim_style()),
+            ]);
+            visible.insert(0, search_line);
+            // Remove the last line to keep the total count consistent
+            if visible.len() > visible_height {
+                visible.pop();
+            }
+        }
 
         let paragraph = ratatui::widgets::Paragraph::new(visible);
         paragraph.render(area, buf);

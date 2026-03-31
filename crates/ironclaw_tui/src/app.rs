@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, Event as CtEvent, KeyEventKind, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{
+    self, Event as CtEvent, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -31,6 +33,7 @@ use crate::widgets::logs::LogsWidget;
 use crate::widgets::registry::{BuiltinWidgets, create_default_widgets};
 use crate::widgets::{
     ActiveTab, AppState, ChatMessage, MessageRole, ToolActivity, ToolStatus, TuiWidget,
+    TurnCostSummary,
 };
 
 /// Handle returned when the TUI is started. The main crate uses this to
@@ -202,6 +205,21 @@ async fn run_tui(
     Ok(())
 }
 
+/// Count the number of case-insensitive matches of `query` across all messages.
+fn count_search_matches(messages: &[ChatMessage], query: &str) -> usize {
+    if query.is_empty() {
+        return 0;
+    }
+    let query_lower = query.to_lowercase();
+    messages
+        .iter()
+        .map(|m| {
+            let content_lower = m.content.to_lowercase();
+            content_lower.matches(&query_lower).count()
+        })
+        .sum()
+}
+
 /// Handle a single TUI event.
 async fn handle_event(
     event: TuiEvent,
@@ -213,7 +231,8 @@ async fn handle_event(
         TuiEvent::Key(key) => {
             let approval_active = state.pending_approval.is_some();
             let palette_active = state.command_palette.visible;
-            let action = map_key(key, approval_active, palette_active);
+            let search_active = state.search.active;
+            let action = map_key(key, approval_active, palette_active, search_active);
 
             match action {
                 InputAction::Submit => {
@@ -222,11 +241,18 @@ async fn handle_event(
                     let text = widgets.input_box.take_input();
                     let trimmed = text.trim().to_string();
                     if !trimmed.is_empty() {
+                        // Push to input history
+                        state.input_history.push(trimmed.clone());
+                        state.history_index = None;
+                        state.history_draft.clear();
+                        // Clear follow-up suggestions from previous turn
+                        state.suggestions.clear();
                         // Add user message to conversation
                         state.messages.push(ChatMessage {
                             role: MessageRole::User,
                             content: trimmed.clone(),
                             timestamp: chrono::Utc::now(),
+                            cost_summary: None,
                         });
                         state.scroll_offset = 0;
                         // Send to agent
@@ -337,10 +363,87 @@ async fn handle_event(
                 InputAction::PaletteClose => {
                     state.command_palette.close();
                 }
+                InputAction::SearchToggle => {
+                    state.search.active = !state.search.active;
+                    if !state.search.active {
+                        state.search.query.clear();
+                        state.search.match_count = 0;
+                        state.search.current_match = 0;
+                    }
+                }
+                InputAction::SearchNext => {
+                    if state.search.match_count > 0 {
+                        state.search.current_match =
+                            (state.search.current_match + 1) % state.search.match_count;
+                    }
+                }
+                InputAction::SearchPrev => {
+                    if state.search.match_count > 0 {
+                        state.search.current_match = if state.search.current_match == 0 {
+                            state.search.match_count - 1
+                        } else {
+                            state.search.current_match - 1
+                        };
+                    }
+                }
+                InputAction::HistoryUp => {
+                    if !state.input_history.is_empty() {
+                        let new_idx = match state.history_index {
+                            None => {
+                                // Save current draft, start from most recent
+                                state.history_draft = widgets.input_box.current_text();
+                                state.input_history.len() - 1
+                            }
+                            Some(idx) => idx.saturating_sub(1),
+                        };
+                        state.history_index = Some(new_idx);
+                        if let Some(text) = state.input_history.get(new_idx) {
+                            widgets.input_box.set_text(text);
+                        }
+                    }
+                }
+                InputAction::HistoryDown => {
+                    if let Some(idx) = state.history_index {
+                        if idx + 1 >= state.input_history.len() {
+                            // Back to draft
+                            state.history_index = None;
+                            let draft = state.history_draft.clone();
+                            widgets.input_box.set_text(&draft);
+                        } else {
+                            let new_idx = idx + 1;
+                            state.history_index = Some(new_idx);
+                            if let Some(text) = state.input_history.get(new_idx) {
+                                widgets.input_box.set_text(text);
+                            }
+                        }
+                    }
+                }
                 InputAction::Forward => {
-                    widgets.input_box.handle_key(key, state);
-                    // Update command palette visibility based on input content
-                    update_palette_from_input(&widgets.input_box, state);
+                    if state.search.active {
+                        // Update the search query with the key event
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                                state.search.query.push(c);
+                            }
+                            (KeyCode::Backspace, _) => {
+                                state.search.query.pop();
+                            }
+                            _ => {}
+                        }
+                        // Recount matches
+                        state.search.match_count =
+                            count_search_matches(&state.messages, &state.search.query);
+                        // Clamp current_match
+                        if state.search.match_count == 0 {
+                            state.search.current_match = 0;
+                        } else if state.search.current_match >= state.search.match_count {
+                            state.search.current_match = state.search.match_count - 1;
+                        }
+                    } else {
+                        widgets.input_box.handle_key(key, state);
+                        // Update command palette visibility based on input content
+                        update_palette_from_input(&widgets.input_box, state);
+                    }
                 }
             }
         }
@@ -358,7 +461,9 @@ async fn handle_event(
             // Terminal will re-render on next frame
         }
 
-        TuiEvent::Tick => {}
+        TuiEvent::Tick => {
+            state.spinner_frame = (state.spinner_frame + 1) % 10;
+        }
 
         TuiEvent::Thinking(msg) => {
             state.status_text = msg;
@@ -429,6 +534,7 @@ async fn handle_event(
                         role: MessageRole::Assistant,
                         content: chunk,
                         timestamp: chrono::Utc::now(),
+                        cost_summary: None,
                     });
                 }
             } else {
@@ -436,6 +542,7 @@ async fn handle_event(
                     role: MessageRole::Assistant,
                     content: chunk,
                     timestamp: chrono::Utc::now(),
+                    cost_summary: None,
                 });
             }
             state.scroll_offset = 0;
@@ -457,6 +564,7 @@ async fn handle_event(
                         role: MessageRole::Assistant,
                         content,
                         timestamp: chrono::Utc::now(),
+                        cost_summary: None,
                     });
                 }
             } else {
@@ -464,6 +572,7 @@ async fn handle_event(
                     role: MessageRole::Assistant,
                     content,
                     timestamp: chrono::Utc::now(),
+                    cost_summary: None,
                 });
             }
             state.scroll_offset = 0;
@@ -475,6 +584,7 @@ async fn handle_event(
                 role: MessageRole::System,
                 content: format!("[job] {title} ({job_id})"),
                 timestamp: chrono::Utc::now(),
+                cost_summary: None,
             });
         }
 
@@ -508,6 +618,7 @@ async fn handle_event(
                 role: MessageRole::System,
                 content: msg,
                 timestamp: chrono::Utc::now(),
+                cost_summary: None,
             });
         }
 
@@ -521,6 +632,7 @@ async fn handle_event(
                 role: MessageRole::System,
                 content: format!("{prefix} {extension_name}: {message}"),
                 timestamp: chrono::Utc::now(),
+                cost_summary: None,
             });
         }
 
@@ -537,11 +649,24 @@ async fn handle_event(
         } => {
             state.total_input_tokens += input_tokens;
             state.total_output_tokens += output_tokens;
-            state.total_cost_usd = cost_usd;
+            state.total_cost_usd = cost_usd.clone();
+            // Attach to last assistant message
+            if let Some(msg) = state
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|m| m.role == MessageRole::Assistant)
+            {
+                msg.cost_summary = Some(TurnCostSummary {
+                    input_tokens,
+                    output_tokens,
+                    cost_usd,
+                });
+            }
         }
 
-        TuiEvent::Suggestions { .. } => {
-            // Future: show as clickable chips below conversation
+        TuiEvent::Suggestions { suggestions } => {
+            state.suggestions = suggestions;
         }
 
         TuiEvent::Log {

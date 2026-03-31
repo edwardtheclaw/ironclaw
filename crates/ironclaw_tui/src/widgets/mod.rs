@@ -96,6 +96,22 @@ pub struct AppState {
 
     /// Command palette state.
     pub command_palette: CommandPaletteState,
+
+    /// Current spinner animation frame index (cycles 0..9 on each tick).
+    pub spinner_frame: usize,
+
+    /// History of sent messages for up-arrow recall.
+    pub input_history: Vec<String>,
+    /// Current position in input history (`None` = not browsing).
+    pub history_index: Option<usize>,
+    /// Saved draft when entering history mode.
+    pub history_draft: String,
+
+    /// Suggested follow-up messages.
+    pub suggestions: Vec<String>,
+
+    /// Search state for conversation.
+    pub search: SearchState,
 }
 
 impl Default for AppState {
@@ -122,6 +138,12 @@ impl Default for AppState {
             log_scroll: 0,
             context_window: 128_000,
             command_palette: CommandPaletteState::default(),
+            spinner_frame: 0,
+            input_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
+            suggestions: Vec::new(),
+            search: SearchState::default(),
         }
     }
 }
@@ -132,6 +154,16 @@ pub struct ChatMessage {
     pub role: MessageRole,
     pub content: String,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Per-turn cost summary (if available).
+    pub cost_summary: Option<TurnCostSummary>,
+}
+
+/// Per-turn token usage and cost information.
+#[derive(Debug, Clone)]
+pub struct TurnCostSummary {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: String,
 }
 
 /// Who sent the message.
@@ -171,6 +203,19 @@ pub struct ThreadInfo {
     pub is_foreground: bool,
     pub is_running: bool,
     pub duration_secs: u64,
+}
+
+/// Search state for Ctrl+F in conversation.
+#[derive(Debug, Clone, Default)]
+pub struct SearchState {
+    /// Whether search mode is active.
+    pub active: bool,
+    /// Current search query.
+    pub query: String,
+    /// Total number of matches found.
+    pub match_count: usize,
+    /// Current match index (0-based).
+    pub current_match: usize,
 }
 
 /// Pending approval request.

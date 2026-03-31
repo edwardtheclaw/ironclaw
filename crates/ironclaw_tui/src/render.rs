@@ -217,10 +217,8 @@ pub fn render_markdown(text: &str, max_width: usize, theme: &Theme) -> Vec<Line<
             // ── Text content ─────────────────────────────────────
             Event::Text(txt) => {
                 if ctx.in_code_block {
-                    let code_style = theme.success_style();
                     for raw_line in txt.lines() {
-                        ctx.lines
-                            .push(Line::from(Span::styled(raw_line.to_string(), code_style)));
+                        ctx.lines.push(highlight_code_line(raw_line, theme));
                     }
                 } else {
                     let style = ctx.top_style();
@@ -263,6 +261,130 @@ pub fn render_markdown(text: &str, max_width: usize, theme: &Theme) -> Vec<Line<
     }
 
     ctx.lines
+}
+
+// ── Code syntax highlighting ──────────────────────────────────────────
+
+/// Keywords highlighted with bold accent style in code blocks.
+const CODE_KEYWORDS: &[&str] = &[
+    // Rust
+    "fn", "let", "mut", "pub", "use", "struct", "enum", "impl", "trait", "for", "while", "if",
+    "else", "match", "return", "self", "Self", "async", "await", "const", "static", "type",
+    "where", "mod", "crate", "super", "true", "false", "None", "Some", "Ok", "Err",
+    // Python
+    "def", "class", "import", "from", "print",
+    // JS/TS
+    "var", "function", "export", "default", "require",
+];
+
+/// Produce a syntax-highlighted `Line` for a single code-block line.
+///
+/// Applies basic keyword, string, comment, and number highlighting without
+/// any heavy parsing dependency.
+fn highlight_code_line(line: &str, theme: &Theme) -> Line<'static> {
+    let trimmed = line.trim_start();
+
+    // Full-line comments: `//` or `#` prefix.
+    if trimmed.starts_with("//") || trimmed.starts_with('#') {
+        return Line::from(Span::styled(line.to_string(), theme.dim_style()));
+    }
+
+    let base_style = theme.success_style();
+    let keyword_style = Style::default()
+        .fg(theme.accent.to_color())
+        .add_modifier(Modifier::BOLD);
+    let string_style = theme.warning_style();
+    let number_style = theme.accent_style();
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let chars: Vec<char> = line.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        let ch = chars[i];
+
+        // ── Whitespace run ───────────────────────────────────
+        if ch.is_whitespace() {
+            let start = i;
+            while i < len && chars[i].is_whitespace() {
+                i += 1;
+            }
+            let s: String = chars[start..i].iter().collect();
+            spans.push(Span::styled(s, base_style));
+            continue;
+        }
+
+        // ── String literals ──────────────────────────────────
+        if ch == '"' || ch == '\'' {
+            let quote = ch;
+            let start = i;
+            i += 1;
+            while i < len {
+                if chars[i] == '\\' {
+                    i += 2; // skip escaped char
+                } else if chars[i] == quote {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            let s: String = chars[start..i].iter().collect();
+            spans.push(Span::styled(s, string_style));
+            continue;
+        }
+
+        // ── Inline comment (// in the middle of a line) ──────
+        if ch == '/' && i + 1 < len && chars[i + 1] == '/' {
+            let s: String = chars[i..].iter().collect();
+            spans.push(Span::styled(s, theme.dim_style()));
+            break;
+        }
+
+        // ── Word token (identifier / keyword / number) ───────
+        if ch.is_alphanumeric() || ch == '_' {
+            let start = i;
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+
+            if CODE_KEYWORDS.contains(&word.as_str()) {
+                spans.push(Span::styled(word, keyword_style));
+            } else if word.chars().all(|c| c.is_ascii_digit() || c == '_') && !word.is_empty() {
+                spans.push(Span::styled(word, number_style));
+            } else {
+                spans.push(Span::styled(word, base_style));
+            }
+            continue;
+        }
+
+        // ── Punctuation / operators ──────────────────────────
+        let start = i;
+        while i < len
+            && !chars[i].is_whitespace()
+            && !chars[i].is_alphanumeric()
+            && chars[i] != '_'
+            && chars[i] != '"'
+            && chars[i] != '\''
+            && !(chars[i] == '/' && i + 1 < len && chars[i + 1] == '/')
+        {
+            i += 1;
+        }
+        if i == start {
+            // Safety: advance at least one character to avoid infinite loop.
+            i += 1;
+        }
+        let s: String = chars[start..i].iter().collect();
+        spans.push(Span::styled(s, base_style));
+    }
+
+    if spans.is_empty() {
+        Line::from(Span::styled(String::new(), base_style))
+    } else {
+        Line::from(spans)
+    }
 }
 
 /// Internal state for the markdown event walker.
@@ -790,5 +912,113 @@ That's all!";
         let text = lines_text(&lines);
         assert!(text.contains("deleted"));
         assert!(has_modifier(&lines, Modifier::CROSSED_OUT));
+    }
+
+    // ── highlight_code_line tests ──────────────────────────────
+
+    #[test]
+    fn highlight_comment_line() {
+        let theme = Theme::dark();
+        let line = highlight_code_line("    // this is a comment", &theme);
+        // Entire line should be dim (one span).
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].style, theme.dim_style());
+    }
+
+    #[test]
+    fn highlight_hash_comment() {
+        let theme = Theme::dark();
+        let line = highlight_code_line("# comment", &theme);
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].style, theme.dim_style());
+    }
+
+    #[test]
+    fn highlight_keyword() {
+        let theme = Theme::dark();
+        let line = highlight_code_line("fn main() {}", &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("fn"));
+        // The "fn" span should have bold + accent color.
+        let fn_span = line.spans.iter().find(|s| s.content.as_ref() == "fn");
+        assert!(fn_span.is_some());
+        let style = fn_span.unwrap().style;
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(style.fg, Some(theme.accent.to_color()));
+    }
+
+    #[test]
+    fn highlight_string_literal() {
+        let theme = Theme::dark();
+        let line = highlight_code_line("let x = \"hello world\";", &theme);
+        let str_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref().contains("hello"));
+        assert!(str_span.is_some());
+        assert_eq!(str_span.unwrap().style, theme.warning_style());
+    }
+
+    #[test]
+    fn highlight_number() {
+        let theme = Theme::dark();
+        let line = highlight_code_line("let x = 42;", &theme);
+        let num_span = line.spans.iter().find(|s| s.content.as_ref() == "42");
+        assert!(num_span.is_some());
+        assert_eq!(num_span.unwrap().style, theme.accent_style());
+    }
+
+    #[test]
+    fn highlight_preserves_indentation() {
+        let theme = Theme::dark();
+        let line = highlight_code_line("    let x = 1;", &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with("    "));
+    }
+
+    #[test]
+    fn highlight_inline_comment() {
+        let theme = Theme::dark();
+        let line = highlight_code_line("let x = 1; // count", &theme);
+        let comment_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref().contains("// count"));
+        assert!(comment_span.is_some());
+        assert_eq!(comment_span.unwrap().style, theme.dim_style());
+    }
+
+    #[test]
+    fn highlight_empty_line() {
+        let theme = Theme::dark();
+        let line = highlight_code_line("", &theme);
+        // Should produce a valid (possibly empty) line without panicking.
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn highlight_python_keywords() {
+        let theme = Theme::dark();
+        let line = highlight_code_line("def hello():", &theme);
+        let def_span = line.spans.iter().find(|s| s.content.as_ref() == "def");
+        assert!(def_span.is_some());
+        assert!(def_span.unwrap().style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn highlight_code_block_integration() {
+        let theme = Theme::dark();
+        let md = "```rust\nfn main() {\n    let x = 42;\n}\n```";
+        let lines = render_markdown(md, 80, &theme);
+        // "fn" keyword should be bold accent, not plain green.
+        let has_bold_accent = lines.iter().any(|l| {
+            l.spans.iter().any(|s| {
+                s.content.as_ref() == "fn"
+                    && s.style.add_modifier.contains(Modifier::BOLD)
+                    && s.style.fg == Some(theme.accent.to_color())
+            })
+        });
+        assert!(has_bold_accent, "expected 'fn' to be highlighted as keyword");
     }
 }
