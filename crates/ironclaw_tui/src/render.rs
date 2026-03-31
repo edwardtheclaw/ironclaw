@@ -443,6 +443,24 @@ pub fn format_duration(secs: u64) -> String {
     }
 }
 
+/// Format a tool duration in milliseconds (e.g., "37ms", "1.3s", "2m 5s").
+pub fn format_tool_duration(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        let secs = ms / 1_000;
+        let m = secs / 60;
+        let s = secs % 60;
+        if s > 0 {
+            format!("{m}m {s}s")
+        } else {
+            format!("{m}m")
+        }
+    }
+}
+
 /// Format a token count with K/M suffix.
 pub fn format_tokens(tokens: u64) -> String {
     if tokens < 1_000 {

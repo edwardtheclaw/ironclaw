@@ -7,10 +7,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
 use crate::layout::TuiSlot;
-use crate::render::{render_markdown, wrap_text};
+use unicode_width::UnicodeWidthStr;
+
+use crate::render::{format_tool_duration, render_markdown, truncate, wrap_text};
 use crate::theme::Theme;
 
-use super::{AppState, MessageRole, TuiWidget};
+use super::{AppState, MessageRole, ToolActivity, ToolStatus, TuiWidget};
 
 pub struct ConversationWidget {
     theme: Theme,
@@ -83,6 +85,33 @@ impl TuiWidget for ConversationWidget {
             }
         }
 
+        // Inline tool calls (current turn only: tools started after last assistant message)
+        let last_assistant_ts = state
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == MessageRole::Assistant)
+            .map(|m| m.timestamp);
+
+        let turn_recent: Vec<&ToolActivity> = state
+            .recent_tools
+            .iter()
+            .filter(|t| match last_assistant_ts {
+                Some(ts) => t.started_at > ts,
+                None => true,
+            })
+            .collect();
+
+        if !turn_recent.is_empty() || !state.active_tools.is_empty() {
+            all_lines.push(Line::from(""));
+            for tool in &turn_recent {
+                all_lines.push(self.render_tool_line(tool, usable_width, false));
+            }
+            for tool in &state.active_tools {
+                all_lines.push(self.render_tool_line(tool, usable_width, true));
+            }
+        }
+
         // Show thinking indicator if active
         if !state.status_text.is_empty() && !state.is_streaming {
             all_lines.push(Line::from(Span::styled(
@@ -110,6 +139,70 @@ impl TuiWidget for ConversationWidget {
 }
 
 impl ConversationWidget {
+    /// Render a single tool call line in the Claude Code inline style.
+    ///
+    /// Format: `  ┊ icon $  command_text...             1.3s`
+    fn render_tool_line(
+        &self,
+        tool: &ToolActivity,
+        usable_width: usize,
+        is_active: bool,
+    ) -> Line<'static> {
+        let (icon, icon_style) = if is_active {
+            ("\u{25CB}", self.theme.accent_style()) // ○ running
+        } else {
+            match tool.status {
+                ToolStatus::Success => ("\u{25CF}", self.theme.success_style()), // ● green
+                ToolStatus::Failed => ("\u{2717}", self.theme.error_style()),    // ✗ red
+                ToolStatus::Running => ("\u{25CB}", self.theme.accent_style()),  // ○ accent
+            }
+        };
+
+        // Duration text
+        let duration_text = if is_active {
+            let elapsed = chrono::Utc::now()
+                .signed_duration_since(tool.started_at)
+                .num_milliseconds()
+                .unsigned_abs();
+            format_tool_duration(elapsed)
+        } else {
+            tool.duration_ms
+                .map(format_tool_duration)
+                .unwrap_or_default()
+        };
+
+        // Build the command description: "$ detail" or "tool_name detail"
+        let cmd_text = match &tool.detail {
+            Some(d) => format!("$  {d}"),
+            None => format!("$  {}", tool.name),
+        };
+
+        // Layout: "  ┊ icon  cmd...  duration"
+        //          ^2  ^2    ^cmd    ^gap ^duration
+        let prefix = format!("  \u{250A} {icon} ");
+        let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+        let duration_width = UnicodeWidthStr::width(duration_text.as_str());
+        let available_for_cmd =
+            usable_width.saturating_sub(prefix_width + duration_width + 2); // 2 for gap
+
+        let cmd_truncated = truncate(&cmd_text, available_for_cmd);
+        let cmd_width = UnicodeWidthStr::width(cmd_truncated.as_str());
+
+        // Pad between command and duration
+        let gap = usable_width
+            .saturating_sub(prefix_width + cmd_width + duration_width)
+            .max(1);
+        let padding = " ".repeat(gap);
+
+        Line::from(vec![
+            Span::styled("  \u{250A} ".to_string(), self.theme.dim_style()),
+            Span::styled(format!("{icon} "), icon_style),
+            Span::styled(cmd_truncated, self.theme.dim_style()),
+            Span::raw(padding),
+            Span::styled(duration_text, self.theme.dim_style()),
+        ])
+    }
+
     /// Handle scroll up/down. Returns true if scrolling occurred.
     pub fn scroll(&self, state: &mut AppState, delta: i16) {
         if delta < 0 {

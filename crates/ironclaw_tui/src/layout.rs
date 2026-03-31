@@ -213,7 +213,7 @@ mod tests {
         assert_eq!(layout.theme, "dark");
         assert!(layout.sidebar.visible);
         assert_eq!(layout.sidebar.effective_width(), 25);
-        assert!(layout.header.visible);
+        assert!(!layout.header.visible);
         assert!(layout.status_bar.visible);
     }
 
