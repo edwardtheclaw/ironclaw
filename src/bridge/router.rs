@@ -2960,9 +2960,7 @@ mod tests {
     // ── /expected command tests ─────────────────────────────────
 
     /// Build a minimal EngineState backed by a TestStore for /expected tests.
-    fn make_expected_test_state(
-        store: Arc<TestStore>,
-    ) -> EngineState {
+    fn make_expected_test_state(store: Arc<TestStore>) -> EngineState {
         use ironclaw_engine::{
             CapabilityRegistry, ConversationManager, LeaseManager, PolicyEngine, ThreadManager,
         };
@@ -3106,7 +3104,7 @@ mod tests {
 
         // Alice should NOT see Bob's thread
         let result = find_most_recent_thread(&state, &Some(conv), "alice").await;
-        assert!(result.is_none(), "alice should not see bob's thread");
+        assert!(result.is_none(), "alice should not see bob's thread"); // safety: test-only
     }
 
     /// find_most_recent_thread falls back to entry-referenced threads
