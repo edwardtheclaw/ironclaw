@@ -111,8 +111,7 @@ impl Agent {
                     if !exists
                         && message
                             .metadata
-                            .as_ref()
-                            .and_then(|m| m.get("source"))
+                            .get("source")
                             .and_then(|v| v.as_str())
                             == Some("responses_api")
                     {
