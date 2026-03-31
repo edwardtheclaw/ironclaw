@@ -2455,33 +2455,99 @@ mod tests {
         );
     }
 
+    /// Exercises the combined auto-approve + state-transition logic from
+    /// `process_approval()`. This helper mirrors the single-lock pattern
+    /// at lines 1035-1064: auto-approve the tool, then attempt the state
+    /// transition, rolling back the auto-approve if the thread is gone.
+    ///
+    /// Returns `true` if the transition succeeded, `false` if the thread
+    /// was missing and the auto-approve was rolled back.
+    fn apply_auto_approve_and_transition(
+        session: &mut crate::agent::session::Session,
+        thread_id: uuid::Uuid,
+        tool_name: &str,
+        always: bool,
+    ) -> bool {
+        // Mirror the production code: auto-approve first, then transition.
+        if always {
+            session.auto_approve_tool(tool_name);
+        }
+
+        match session.threads.get_mut(&thread_id) {
+            Some(thread) => {
+                thread.state = ThreadState::Processing;
+                true
+            }
+            None => {
+                // Roll back auto-approve if the thread vanished
+                if always {
+                    session.auto_approved_tools.remove(tool_name);
+                }
+                false
+            }
+        }
+    }
+
     #[test]
     fn test_auto_approve_with_thread_disappearance_rolls_back() {
-        // Regression test: when always=true and the thread disappears after
-        // auto_approve_tool is called, the auto-approve must be rolled back
-        // to prevent a dangling policy for a tool that never executed.
+        // Regression test: when always=true and the thread disappears between
+        // the auto-approve and the state transition, the auto-approve must be
+        // rolled back to prevent a dangling policy for a tool that never
+        // executed. This mirrors the single-lock pattern in process_approval().
         use crate::agent::session::Session;
-        use std::collections::HashSet;
-        use uuid::Uuid;
 
         let mut session = Session::new("test-user");
-        let thread_id = Uuid::new_v4();
+        let thread_id = uuid::Uuid::new_v4();
 
-        // Simulate: always=true, auto-approve is set, but thread is missing
-        session.auto_approve_tool("dangerous_tool");
-        assert!(session.is_tool_auto_approved("dangerous_tool"));
-
-        // Thread doesn't exist — rollback should remove the auto-approve
+        // Thread does not exist — the combined operation must roll back
         assert!(!session.threads.contains_key(&thread_id));
-        // Simulate the rollback logic from process_approval
-        session.auto_approved_tools.remove("dangerous_tool");
-        assert!(!session.is_tool_auto_approved("dangerous_tool"));
+        let ok = apply_auto_approve_and_transition(&mut session, thread_id, "dangerous_tool", true);
+        assert!(!ok, "transition must fail when thread is missing");
+        assert!(
+            !session.is_tool_auto_approved("dangerous_tool"),
+            "auto-approve must be rolled back when the thread is missing"
+        );
+    }
+
+    #[test]
+    fn test_auto_approve_with_present_thread_succeeds() {
+        // Happy-path counterpart: when always=true and the thread exists, the
+        // tool should remain auto-approved and the thread should transition
+        // to Processing.
+        use crate::agent::session::Session;
+
+        let mut session = Session::new("test-user");
+        let thread = session.create_thread();
+        let thread_id = thread.id;
+
+        let ok = apply_auto_approve_and_transition(&mut session, thread_id, "safe_tool", true);
+        assert!(ok, "transition must succeed when thread is present");
+        assert!(
+            session.is_tool_auto_approved("safe_tool"),
+            "tool must remain auto-approved after successful transition"
+        );
         assert_eq!(
-            session
-                .auto_approved_tools
-                .intersection(&HashSet::from(["dangerous_tool".to_string()]))
-                .count(),
-            0
+            session.threads.get(&thread_id).map(|t| &t.state),
+            Some(&ThreadState::Processing),
+            "thread must be in Processing state after approval"
+        );
+    }
+
+    #[test]
+    fn test_non_always_approve_does_not_add_to_auto_approved() {
+        // When always=false, the tool should not be added to auto-approved
+        // regardless of whether the thread exists.
+        use crate::agent::session::Session;
+
+        let mut session = Session::new("test-user");
+        let thread = session.create_thread();
+        let thread_id = thread.id;
+
+        let ok = apply_auto_approve_and_transition(&mut session, thread_id, "one_time_tool", false);
+        assert!(ok, "transition must succeed when thread is present");
+        assert!(
+            !session.is_tool_auto_approved("one_time_tool"),
+            "tool must not be auto-approved when always=false"
         );
     }
 
