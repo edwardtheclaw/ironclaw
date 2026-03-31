@@ -80,6 +80,7 @@ fn format_source(source: &SkillSource) -> &str {
     match source {
         SkillSource::Workspace(_) => "workspace",
         SkillSource::User(_) => "user",
+        SkillSource::Installed(_) => "installed",
         SkillSource::Bundled(_) => "bundled",
     }
 }

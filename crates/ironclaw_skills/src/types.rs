@@ -57,6 +57,8 @@ pub enum SkillSource {
     Workspace(PathBuf),
     /// User skills directory (~/.ironclaw/skills/).
     User(PathBuf),
+    /// Registry-installed skills directory (~/.ironclaw/installed_skills/).
+    Installed(PathBuf),
     /// Bundled with the application.
     Bundled(PathBuf),
 }

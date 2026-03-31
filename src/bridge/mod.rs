@@ -30,6 +30,7 @@ pub use router::{
     handle_approval,
     handle_clear,
     handle_exec_approval,
+    handle_expected,
     handle_interrupt,
     handle_new_thread,
     handle_with_engine,
@@ -46,3 +47,6 @@ pub use router::{
     pending_approval_for_user_thread,
     resume_engine_mission,
 };
+
+#[cfg(feature = "libsql")]
+pub use router::reset_engine_state;

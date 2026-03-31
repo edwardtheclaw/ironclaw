@@ -8,11 +8,11 @@
 
 use std::sync::Arc;
 
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::capability::lease::LeaseManager;
 use crate::capability::policy::PolicyEngine;
-use crate::runtime::messaging::{SignalReceiver, ThreadOutcome, ThreadSignal};
+use crate::runtime::messaging::{SignalReceiver, ThreadOutcome};
 use crate::traits::effect::EffectExecutor;
 use crate::traits::llm::LlmBackend;
 use crate::types::error::EngineError;
@@ -23,13 +23,12 @@ use crate::types::thread::{Thread, ThreadState};
 
 const RUNTIME_CHECKPOINT_METADATA_KEY: &str = "runtime_checkpoint";
 
+/// Persisted state from a prior execution, used to resume threads.
+/// The Python orchestrator manages loop counters internally; Rust only
+/// needs the opaque `persisted_state` blob to hand back on resume.
 #[derive(Default)]
-#[allow(dead_code)]
 struct RuntimeCheckpoint {
     persisted_state: serde_json::Value,
-    nudge_count: u32,
-    consecutive_errors: u32,
-    compaction_count: u32,
 }
 
 /// The core execution loop for a thread.
@@ -40,8 +39,8 @@ pub struct ExecutionLoop {
     leases: Arc<LeaseManager>,
     policy: Arc<PolicyEngine>,
     signal_rx: SignalReceiver,
-    #[allow(dead_code)]
-    user_id: String,
+    /// Stored for potential future use (e.g. user-scoped prompt overlays).
+    _user_id: String,
     /// Optional capability registry for resolving capability-level policies.
     capabilities: Option<Arc<crate::capability::registry::CapabilityRegistry>>,
     /// Optional broadcast sender for live event streaming.
@@ -71,7 +70,7 @@ impl ExecutionLoop {
             leases,
             policy,
             signal_rx,
-            user_id,
+            _user_id: user_id,
             capabilities: None,
             event_tx: None,
             retrieval: None,
@@ -117,7 +116,6 @@ impl ExecutionLoop {
     }
 
     /// Add an event to the thread and broadcast it for live status updates.
-    #[allow(dead_code)]
     fn emit_event(&mut self, kind: EventKind) {
         let event = crate::types::event::ThreadEvent::new(self.thread.id, kind);
         if let Some(ref tx) = self.event_tx {
@@ -128,58 +126,15 @@ impl ExecutionLoop {
     }
 
     fn load_runtime_checkpoint(&self) -> RuntimeCheckpoint {
-        let Some(checkpoint) = self
+        let persisted_state = self
             .thread
             .metadata
             .get(RUNTIME_CHECKPOINT_METADATA_KEY)
-            .and_then(|value| value.as_object())
-        else {
-            return RuntimeCheckpoint {
-                persisted_state: serde_json::json!({}),
-                ..RuntimeCheckpoint::default()
-            };
-        };
+            .and_then(|value| value.get("persisted_state"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
 
-        RuntimeCheckpoint {
-            persisted_state: checkpoint
-                .get("persisted_state")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({})),
-            nudge_count: checkpoint
-                .get("nudge_count")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0) as u32,
-            consecutive_errors: checkpoint
-                .get("consecutive_errors")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0) as u32,
-            compaction_count: checkpoint
-                .get("compaction_count")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0) as u32,
-        }
-    }
-
-    #[allow(dead_code)]
-    fn save_runtime_checkpoint(
-        &mut self,
-        persisted_state: &serde_json::Value,
-        nudge_count: u32,
-        consecutive_errors: u32,
-        compaction_count: u32,
-    ) {
-        if let Some(metadata) = self.thread.metadata.as_object_mut() {
-            metadata.insert(
-                RUNTIME_CHECKPOINT_METADATA_KEY.into(),
-                serde_json::json!({
-                    "persisted_state": persisted_state,
-                    "nudge_count": nudge_count,
-                    "consecutive_errors": consecutive_errors,
-                    "compaction_count": compaction_count,
-                }),
-            );
-        }
-        self.thread.updated_at = chrono::Utc::now();
+        RuntimeCheckpoint { persisted_state }
     }
 
     fn clear_runtime_checkpoint(&mut self) {
@@ -198,16 +153,34 @@ impl ExecutionLoop {
             return Ok(());
         };
 
-        if let Some(step) = step {
-            store.save_step(step).await?;
-        }
-        if *persisted_event_count < self.thread.events.len() {
-            store
-                .append_events(&self.thread.events[*persisted_event_count..])
-                .await?;
-            *persisted_event_count = self.thread.events.len();
-        }
-        store.save_thread(&self.thread).await?;
+        // All three store writes are independent — run them in parallel.
+        let step_fut = async {
+            if let Some(step) = step {
+                store.save_step(step).await
+            } else {
+                Ok(())
+            }
+        };
+
+        let new_event_count = self.thread.events.len();
+        let events_fut = async {
+            if *persisted_event_count < new_event_count {
+                store
+                    .append_events(&self.thread.events[*persisted_event_count..])
+                    .await
+            } else {
+                Ok(())
+            }
+        };
+
+        let thread_fut = store.save_thread(&self.thread);
+
+        let (step_res, events_res, thread_res) = tokio::join!(step_fut, events_fut, thread_fut);
+        step_res?;
+        events_res?;
+        thread_res?;
+
+        *persisted_event_count = new_event_count;
         Ok(())
     }
 
@@ -221,6 +194,17 @@ impl ExecutionLoop {
             self.thread.transition_to(ThreadState::Running, None)?;
         }
 
+        // Pre-fetch system memory docs once — used by both prompt overlay and
+        // orchestrator loading, avoiding a duplicate Store query.
+        let system_docs = if let Some(store) = self.store.as_ref() {
+            store
+                .list_memory_docs(self.thread.project_id, "system")
+                .await
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         // Inject CodeAct/RLM system prompt if none exists
         if !self
             .thread
@@ -228,22 +212,21 @@ impl ExecutionLoop {
             .iter()
             .any(|m| m.role == crate::types::message::MessageRole::System)
         {
-            // Get available actions for the prompt
+            // Fetch active leases (needed for action list)
             let active_leases = self.leases.active_for_thread(self.thread.id).await;
             let actions = match self.effects.available_actions(&active_leases).await {
                 Ok(a) => a,
                 Err(e) => {
-                    warn!(thread_id = %self.thread.id, "failed to load actions for system prompt: {e}");
+                    debug!(thread_id = %self.thread.id, "failed to load actions for system prompt: {e}");
                     Vec::new()
                 }
             };
-            let system_prompt = crate::executor::prompt::build_codeact_system_prompt(
+            // Build prompt using pre-fetched docs (no extra Store query)
+            let system_prompt = crate::executor::prompt::build_codeact_system_prompt_with_docs(
                 &actions,
-                self.store.as_ref(),
-                self.thread.project_id,
+                &system_docs,
                 self.platform_info.as_ref(),
-            )
-            .await;
+            );
 
             // Skill selection and injection happens in the Python orchestrator
             // via __list_skills__() host function — not here in Rust.
@@ -255,13 +238,9 @@ impl ExecutionLoop {
         self.persist_runtime_state(None, &mut persisted_event_count)
             .await?;
 
-        // Load versioned Python orchestrator (runtime version or compiled-in v0)
+        // Load versioned Python orchestrator using pre-fetched docs
         let (orchestrator_code, orchestrator_version) =
-            crate::executor::orchestrator::load_orchestrator(
-                self.store.as_ref(),
-                self.thread.project_id,
-            )
-            .await;
+            crate::executor::orchestrator::load_orchestrator_from_docs(&system_docs);
 
         debug!(
             thread_id = %self.thread.id,
@@ -332,7 +311,7 @@ impl ExecutionLoop {
                 Ok(orch_result.outcome)
             }
             Err(e) => {
-                warn!(
+                debug!(
                     thread_id = %self.thread.id,
                     error = %e,
                     orchestrator_version,
@@ -378,104 +357,67 @@ impl ExecutionLoop {
             }
         }
     }
-
-    /// Check for pending signals without blocking.
-    #[allow(dead_code)]
-    fn check_signals(&mut self) -> SignalAction {
-        match self.signal_rx.try_recv() {
-            Ok(ThreadSignal::Stop) => SignalAction::Stop,
-            Ok(ThreadSignal::InjectMessage(msg)) => SignalAction::Inject(msg),
-            Ok(ThreadSignal::Suspend) => {
-                // For now, treat suspend as stop. Phase 3 adds proper suspend/resume.
-                SignalAction::Stop
-            }
-            Ok(ThreadSignal::Resume) | Ok(ThreadSignal::ChildCompleted { .. }) => {
-                SignalAction::Continue
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => SignalAction::Continue,
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                // Channel closed — the manager dropped our sender. Treat as stop.
-                SignalAction::Stop
-            }
-        }
-    }
-}
-
-#[allow(dead_code)]
-enum SignalAction {
-    Continue,
-    Stop,
-    Inject(ThreadMessage),
-}
-
-/// Extract a FINAL() answer from the LLM's text response.
-///
-/// Matches `FINAL(...)` anywhere in the text, handling:
-/// - Single-line: `FINAL("the answer")`
-/// - Multi-line: `FINAL("""\n...\n""")`
-/// - With or without quotes
-///
-/// This is the regex fallback from the official RLM implementation
-/// (`find_final_answer` in parsing.py) for when the model writes
-/// FINAL() outside a code block.
-#[allow(dead_code)]
-fn extract_final_from_text(text: &str) -> Option<String> {
-    // Find FINAL( — could be at start of line or after whitespace
-    let marker = "FINAL(";
-    let start = text.find(marker)?;
-    let content_start = start + marker.len();
-
-    // Extract everything after FINAL( up to the matching closing paren
-    // Handle nested parens and triple-quoted strings
-    let remaining = &text[content_start..];
-
-    // Try triple-quoted string first: FINAL("""...""")
-    if remaining.starts_with("\"\"\"") {
-        let inner_start = 3;
-        if let Some(end) = remaining[inner_start..].find("\"\"\"") {
-            let answer = remaining[inner_start..inner_start + end].trim();
-            if !answer.is_empty() {
-                return Some(answer.to_string());
-            }
-        }
-    }
-
-    // Try single/double quoted: FINAL("...") or FINAL('...')
-    if remaining.starts_with('"') || remaining.starts_with('\'') {
-        let quote = remaining.as_bytes()[0] as char;
-        if let Some(end) = remaining[1..].find(quote) {
-            let answer = &remaining[1..1 + end];
-            if !answer.is_empty() {
-                return Some(answer.to_string());
-            }
-        }
-    }
-
-    // Unquoted: FINAL(some content here) — find matching close paren
-    let mut depth = 1;
-    for (i, ch) in remaining.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    let answer = remaining[..i].trim();
-                    if !answer.is_empty() {
-                        return Some(answer.to_string());
-                    }
-                    return None;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
 }
 
 #[cfg(test)]
 mod tests {
+    /// Extract a FINAL() answer from the LLM's text response.
+    ///
+    /// Matches `FINAL(...)` anywhere in the text, handling:
+    /// - Single-line: `FINAL("the answer")`
+    /// - Multi-line: `FINAL("""\n...\n""")`
+    /// - With or without quotes
+    fn extract_final_from_text(text: &str) -> Option<String> {
+        let marker = "FINAL(";
+        let start = text.find(marker)?;
+        let content_start = start + marker.len();
+        let remaining = &text[content_start..];
+
+        // Try triple-quoted string first: FINAL("""...""")
+        if remaining.starts_with("\"\"\"") {
+            let inner_start = 3;
+            if let Some(end) = remaining[inner_start..].find("\"\"\"") {
+                let answer = remaining[inner_start..inner_start + end].trim();
+                if !answer.is_empty() {
+                    return Some(answer.to_string());
+                }
+            }
+        }
+
+        // Try single/double quoted: FINAL("...") or FINAL('...')
+        if remaining.starts_with('"') || remaining.starts_with('\'') {
+            let quote = remaining.as_bytes()[0] as char;
+            if let Some(end) = remaining[1..].find(quote) {
+                let answer = &remaining[1..1 + end];
+                if !answer.is_empty() {
+                    return Some(answer.to_string());
+                }
+            }
+        }
+
+        // Unquoted: FINAL(some content here) — find matching close paren
+        let mut depth = 1;
+        for (i, ch) in remaining.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let answer = remaining[..i].trim();
+                        if !answer.is_empty() {
+                            return Some(answer.to_string());
+                        }
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        None
+    }
     use super::*;
+    use crate::runtime::messaging::ThreadSignal;
     use crate::traits::effect::ThreadExecutionContext;
     use crate::traits::llm::{LlmCallConfig, LlmOutput};
     use crate::types::capability::{ActionDef, CapabilityLease, EffectType};
@@ -619,7 +561,13 @@ mod tests {
         config: ThreadConfig,
     ) -> (ExecutionLoop, crate::runtime::messaging::SignalSender) {
         let project_id = ProjectId::new();
-        let thread = Thread::new("test goal", ThreadType::Foreground, project_id, config);
+        let thread = Thread::new(
+            "test goal",
+            ThreadType::Foreground,
+            project_id,
+            "test-user",
+            config,
+        );
         let tid = thread.id;
 
         let llm = Arc::new(MockLlm::new(llm_responses));
@@ -798,7 +746,7 @@ mod tests {
             exec.thread
                 .messages
                 .iter()
-                .any(|m| m.content.contains("didn't make an action call"))
+                .any(|m| m.content.contains("did not include any tool calls"))
         );
     }
 
@@ -1248,6 +1196,7 @@ mod tests {
             "test",
             ThreadType::Foreground,
             project_id,
+            "test-user",
             ThreadConfig::default(),
         );
         let tid = thread.id;

@@ -35,6 +35,9 @@ pub enum EngineError {
     #[error("project not found: {0}")]
     ProjectNotFound(ProjectId),
 
+    #[error("lease not found: {lease_id}")]
+    LeaseNotFound { lease_id: String },
+
     #[error("lease expired for capability: {capability_name}")]
     LeaseExpired { capability_name: String },
 
@@ -73,6 +76,9 @@ pub enum EngineError {
         call_id: String,
         parameters: serde_json::Value,
     },
+
+    #[error("access denied: user '{user_id}' cannot access {entity}")]
+    AccessDenied { user_id: String, entity: String },
 }
 
 use crate::types::project::ProjectId;

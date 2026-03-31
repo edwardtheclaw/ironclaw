@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 use serde::Serialize;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::types::event::ThreadEvent;
 use crate::types::thread::{Thread, ThreadId, ThreadState};
@@ -120,12 +120,12 @@ pub fn write_trace(trace: &ExecutionTrace) -> Option<PathBuf> {
                 Some(path)
             }
             Err(e) => {
-                warn!("Failed to write trace: {e}");
+                debug!("Failed to write trace: {e}");
                 None
             }
         },
         Err(e) => {
-            warn!("Failed to serialize trace: {e}");
+            debug!("Failed to serialize trace: {e}");
             None
         }
     }
@@ -147,13 +147,13 @@ pub fn log_trace_summary(trace: &ExecutionTrace) {
 
     for issue in &trace.issues {
         match issue.severity {
-            IssueSeverity::Error => warn!(
+            IssueSeverity::Error => debug!(
                 category = %issue.category,
                 step = ?issue.step,
                 "ISSUE: {}",
                 issue.description
             ),
-            IssueSeverity::Warning => warn!(
+            IssueSeverity::Warning => debug!(
                 category = %issue.category,
                 step = ?issue.step,
                 "WARNING: {}",
@@ -274,12 +274,11 @@ fn analyze_trace(thread: &Thread) -> Vec<TraceIssue> {
         .messages
         .iter()
         .any(|m| m.role == crate::types::message::MessageRole::ActionResult);
-    let has_tool_output_in_messages = thread.messages.iter().any(|m| {
-        m.role == crate::types::message::MessageRole::ActionResult
-            || m.content.contains(" result]")
-            || m.content.contains(" error]")
+    let has_tool_output_in_context = thread.messages.iter().any(|m| {
+        m.role == crate::types::message::MessageRole::User
+            && (m.content.contains(" result]") || m.content.contains(" error]"))
     });
-    if has_tool_results && !has_tool_output_in_messages {
+    if has_tool_results && !has_tool_output_in_context {
         issues.push(TraceIssue {
             severity: IssueSeverity::Warning,
             category: "missing_tool_output".into(),
@@ -397,6 +396,7 @@ mod tests {
             "test goal",
             ThreadType::Foreground,
             ProjectId::new(),
+            "test-user",
             ThreadConfig::default(),
         )
     }

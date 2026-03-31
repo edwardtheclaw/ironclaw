@@ -314,9 +314,15 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         policy,
     ));
 
+    // Migrate legacy records: pre-existing engine records deserialize without a
+    // user_id field and get the serde default "legacy". Stamp the owner's identity
+    // onto them so user-scoped queries find them after upgrade.
+    let owner_id = &agent.deps.owner_id;
+    migrate_legacy_user_ids(&store_dyn, owner_id).await;
+
     // Reuse the persisted default project when available.
     let project_id = match store
-        .list_projects()
+        .list_projects(owner_id)
         .await
         .map_err(|e| engine_err("store error", e))?
         .into_iter()
@@ -324,7 +330,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     {
         Some(project) => project.id,
         None => {
-            let project = Project::new("default", "Default project for engine v2");
+            let project = Project::new(owner_id, "default", "Default project for engine v2");
             let project_id = project.id;
             store
                 .save_project(&project)
@@ -365,8 +371,11 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     mission_manager.start_cron_ticker(agent.deps.owner_id.clone());
     mission_manager.start_event_listener(agent.deps.owner_id.clone());
 
-    // Ensure all learning missions exist for this project
-    if let Err(e) = mission_manager.ensure_learning_missions(project_id).await {
+    // Ensure per-user learning missions exist for the owner
+    if let Err(e) = mission_manager
+        .ensure_learning_missions(project_id, owner_id)
+        .await
+    {
         debug!("engine v2: failed to create learning missions: {e}");
     }
 
@@ -894,7 +903,11 @@ pub async fn handle_interrupt(
     let mut stopped = 0u32;
     for tid in &active_threads {
         if state.thread_manager.is_running(*tid).await {
-            if let Err(e) = state.thread_manager.stop_thread(*tid).await {
+            if let Err(e) = state
+                .thread_manager
+                .stop_thread(*tid, &message.user_id)
+                .await
+            {
                 debug!(thread_id = %tid, error = %e, "engine v2: failed to stop thread");
             } else {
                 stopped += 1;
@@ -928,6 +941,167 @@ pub async fn handle_clear(
     Ok(Some("Conversation cleared.".into()))
 }
 
+/// Handle `/expected <description>` — collect context from the engine thread
+/// and fire the expected-behavior learning mission.
+///
+/// In v2, conversation history lives in engine threads (not v1 sessions).
+/// This handler finds the most recent thread for the user's conversation,
+/// extracts the last N messages, and fires the system event.
+pub async fn handle_expected(
+    agent: &Agent,
+    message: &IncomingMessage,
+    description: &str,
+) -> Result<Option<String>, Error> {
+    init_engine(agent).await?;
+
+    let lock = ENGINE_STATE
+        .get()
+        .ok_or_else(|| engine_err("init", "engine state not initialized"))?;
+    let guard = lock.read().await;
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| engine_err("init", "engine state is empty"))?;
+
+    // Find the conversation for this channel+user
+    let scope = message.conversation_scope();
+    let channel_key = match scope {
+        Some(tid) => format!("{}:{}", message.channel, tid),
+        None => message.channel.clone(),
+    };
+
+    let conv_id = state
+        .conversation_manager
+        .get_or_create_conversation(&channel_key, &message.user_id)
+        .await
+        .map_err(|e| engine_err("conversation error", e))?;
+
+    let conv = state.conversation_manager.get_conversation(conv_id).await;
+
+    // Find the most recent thread in this conversation (active or completed)
+    let recent_thread = find_most_recent_thread(state, &conv, &message.user_id).await;
+
+    let Some(thread) = recent_thread else {
+        return Ok(Some(
+            "No conversation history to attach feedback to.".into(),
+        ));
+    };
+
+    // Extract recent messages (last 10) as context for the learning mission
+    let start = thread.messages.len().saturating_sub(10);
+    let recent_messages: Vec<serde_json::Value> = thread.messages[start..]
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "role": m.role,
+                "content_preview": m.content.chars().take(500).collect::<String>(),
+                "action_name": m.action_name,
+            })
+        })
+        .collect();
+
+    // Extract tool call events for richer context
+    let tool_events: Vec<serde_json::Value> = thread
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            ironclaw_engine::EventKind::ActionExecuted {
+                action_name,
+                params_summary,
+                ..
+            } => Some(serde_json::json!({
+                "tool": action_name,
+                "params": params_summary,
+                "success": true,
+            })),
+            ironclaw_engine::EventKind::ActionFailed {
+                action_name, error, ..
+            } => Some(serde_json::json!({
+                "tool": action_name,
+                "error": error,
+                "success": false,
+            })),
+            _ => None,
+        })
+        .collect();
+
+    let payload = serde_json::json!({
+        "expected_behavior": description,
+        "thread_id": thread.id.to_string(),
+        "goal": thread.goal,
+        "recent_messages": recent_messages,
+        "tool_events": tool_events,
+        "step_count": thread.step_count,
+        "thread_state": thread.state,
+    });
+
+    // Fire the expected-behavior learning mission
+    let mgr = state.effect_adapter.mission_manager().await;
+    let fired = if let Some(mgr) = mgr {
+        match mgr
+            .fire_on_system_event(
+                "user_feedback",
+                "expected_behavior",
+                &message.user_id,
+                Some(payload),
+            )
+            .await
+        {
+            Ok(ids) => ids.len(),
+            Err(e) => {
+                debug!("failed to fire expected-behavior mission: {e}");
+                0
+            }
+        }
+    } else {
+        0
+    };
+
+    if fired > 0 {
+        Ok(Some(format!(
+            "Feedback captured. Fired {fired} self-improvement thread(s) to investigate."
+        )))
+    } else {
+        Ok(Some(
+            "Feedback noted but no self-improvement missions are configured to handle it. \
+             The engine will use this context in future learning cycles."
+                .into(),
+        ))
+    }
+}
+
+/// Find the most recent thread in a conversation (checks active threads first,
+/// then falls back to the last completed thread visible in conversation entries).
+async fn find_most_recent_thread(
+    state: &EngineState,
+    conv: &Option<ironclaw_engine::ConversationSurface>,
+    user_id: &str,
+) -> Option<ironclaw_engine::Thread> {
+    let conv = conv.as_ref()?;
+
+    // Try active threads first (most recent interaction)
+    for tid in conv.active_threads.iter().rev() {
+        if let Ok(Some(thread)) = state.store.load_thread(*tid).await
+            && thread.user_id == user_id
+        {
+            return Some(thread);
+        }
+    }
+
+    // Fall back to the most recent thread referenced in entries
+    for entry in conv.entries.iter().rev() {
+        let Some(tid) = entry.origin_thread_id else {
+            continue;
+        };
+        if let Ok(Some(thread)) = state.store.load_thread(tid).await
+            && thread.user_id == user_id
+        {
+            return Some(thread);
+        }
+    }
+
+    None
+}
+
 /// Stop all active threads and clear conversation entries.
 async fn clear_engine_conversation(agent: &Agent, message: &IncomingMessage) -> Result<(), Error> {
     init_engine(agent).await?;
@@ -950,7 +1124,10 @@ async fn clear_engine_conversation(agent: &Agent, message: &IncomingMessage) -> 
     if let Some(conv) = state.conversation_manager.get_conversation(conv_id).await {
         for tid in &conv.active_threads {
             if state.thread_manager.is_running(*tid).await {
-                let _ = state.thread_manager.stop_thread(*tid).await;
+                let _ = state
+                    .thread_manager
+                    .stop_thread(*tid, &message.user_id)
+                    .await;
             }
         }
     }
@@ -958,7 +1135,7 @@ async fn clear_engine_conversation(agent: &Agent, message: &IncomingMessage) -> 
     // Clear the conversation entries and active thread list
     state
         .conversation_manager
-        .clear_conversation(conv_id)
+        .clear_conversation(conv_id, &message.user_id)
         .await
         .map_err(|e| engine_err("clear conversation error", e))?;
 
@@ -1034,6 +1211,24 @@ pub async fn handle_with_engine(
     message: &IncomingMessage,
     content: &str,
 ) -> Result<Option<String>, Error> {
+    handle_with_engine_inner(agent, message, content, 0).await
+}
+
+/// Maximum depth for auth-retry recursion (credential stored → retry original message).
+const MAX_AUTH_RETRY_DEPTH: u8 = 2;
+
+async fn handle_with_engine_inner(
+    agent: &Agent,
+    message: &IncomingMessage,
+    content: &str,
+    depth: u8,
+) -> Result<Option<String>, Error> {
+    if depth > MAX_AUTH_RETRY_DEPTH {
+        return Ok(Some(
+            "Credential stored, but too many auth retries. Please resend your message.".into(),
+        ));
+    }
+
     // Ensure engine is initialized
     init_engine(agent).await?;
 
@@ -1060,7 +1255,10 @@ pub async fn handle_with_engine(
             if token.is_empty() || token.eq_ignore_ascii_case("cancel") {
                 // Stop the waiting engine thread so it doesn't leak.
                 if let Some(engine_tid) = pending.engine_thread_id {
-                    let _ = state.thread_manager.stop_thread(engine_tid).await;
+                    let _ = state
+                        .thread_manager
+                        .stop_thread(engine_tid, &message.user_id)
+                        .await;
                 }
                 let response = "Authentication cancelled.".to_string();
                 // Write to v1 DB so the history API shows the response.
@@ -1132,8 +1330,13 @@ pub async fn handle_with_engine(
                         };
                         let retry_content = pending.original_message;
                         drop(guard);
-                        return Box::pin(handle_with_engine(agent, &retry_msg, &retry_content))
-                            .await;
+                        return Box::pin(handle_with_engine_inner(
+                            agent,
+                            &retry_msg,
+                            &retry_content,
+                            depth + 1,
+                        ))
+                        .await;
                     }
                     Err(e) => {
                         return Ok(Some(format!(
@@ -1203,7 +1406,13 @@ pub async fn handle_with_engine(
         {
             // Ensure the v1 conversation exists for this thread
             let _ = db
-                .ensure_conversation(uuid, &message.channel, &message.user_id, Some(tid))
+                .ensure_conversation(
+                    uuid,
+                    &message.channel,
+                    &message.user_id,
+                    Some(tid),
+                    Some(&message.channel),
+                )
                 .await;
             Some(uuid)
         } else {
@@ -1336,7 +1545,8 @@ async fn await_thread_outcome(
                     "text-based auth fallback triggered — pre-flight gate did not catch this"
                 );
 
-                // Extract credential name from the response text
+                // Extract credential name from the response text and validate
+                // it against the expected pattern (alphanumeric + underscores).
                 let cred_name = text
                     .split("credential_name")
                     .nth(1)
@@ -1344,6 +1554,12 @@ async fn await_thread_outcome(
                         // Handle both JSON ("credential_name":"foo") and prose
                         s.split(&['"', '\'', '`'][..])
                             .find(|seg| !seg.is_empty() && !seg.contains(':') && !seg.contains(' '))
+                    })
+                    .filter(|name| {
+                        // Reject names that don't look like valid credential identifiers
+                        !name.is_empty()
+                            && name.len() <= 64
+                            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                     })
                     .unwrap_or("unknown")
                     .to_string();
@@ -1355,18 +1571,28 @@ async fn await_thread_outcome(
                     .and_then(|mgr| mgr.get_setup_instructions(&cred_name))
                     .unwrap_or_else(|| format!("Provide your {} token", cred_name));
 
-                // Store pending auth for this user
-                state.pending_auth.write().await.insert(
-                    message.user_id.clone(),
-                    PendingAuth {
-                        credential_name: cred_name.clone(),
-                        original_message: message.content.clone(),
-                        user_id: message.user_id.clone(),
-                        channel: message.channel.clone(),
-                        metadata: message.metadata.clone(),
-                        engine_thread_id: None, // Completed path — thread already finished
-                    },
-                );
+                // Store pending auth for this user (only if not already pending)
+                {
+                    let mut pending = state.pending_auth.write().await;
+                    if pending.contains_key(&message.user_id) {
+                        debug!(
+                            user_id = %message.user_id,
+                            "skipping pending_auth — user already has a pending auth flow"
+                        );
+                    } else {
+                        pending.insert(
+                            message.user_id.clone(),
+                            PendingAuth {
+                                credential_name: cred_name.clone(),
+                                original_message: message.content.clone(),
+                                user_id: message.user_id.clone(),
+                                channel: message.channel.clone(),
+                                metadata: message.metadata.clone(),
+                                engine_thread_id: None, // Completed path — thread already finished
+                            },
+                        );
+                    }
+                }
 
                 // Show auth prompt via channel
                 let _ = agent
@@ -1452,6 +1678,8 @@ async fn await_thread_outcome(
                 .unwrap_or_else(|| format!("Provide your {} token", credential_name));
 
             // Enter the guided auth flow — next user message is treated as a token.
+            // Overwrite is intentional here: the engine-driven path has a concrete
+            // thread_id, so it takes priority over any stale text-fallback entry.
             state.pending_auth.write().await.insert(
                 message.user_id.clone(),
                 PendingAuth {
@@ -1496,6 +1724,35 @@ async fn await_thread_outcome(
     result
 }
 
+// ── Shared event display helpers ────────────────────────────
+
+/// Format an action name with optional parameter summary for display.
+/// e.g., `"http(https://api.github.com/...)"` or just `"web_search"`.
+fn format_action_display_name(action_name: &str, params_summary: &Option<String>) -> String {
+    match params_summary {
+        Some(summary) => format!("{}({})", action_name, summary),
+        None => action_name.to_string(),
+    }
+}
+
+/// Interpret a MessageAdded event into a human-readable status message.
+/// Returns `None` for events that don't need UI surfacing.
+fn interpret_message_event(role: &str, content_preview: &str) -> Option<&'static str> {
+    if role == "User" && content_preview.starts_with("[stdout]") {
+        Some("Code executed")
+    } else if role == "User" && content_preview.starts_with("[code ") {
+        Some("Code executed (no output)")
+    } else if role == "User"
+        && (content_preview.contains("Error") || content_preview.starts_with("Traceback"))
+    {
+        Some("Code error — retrying...")
+    } else if role == "Assistant" {
+        Some("Executing code...")
+    } else {
+        None
+    }
+}
+
 /// Forward an engine ThreadEvent to the channel as a StatusUpdate.
 async fn forward_event_to_channel(
     event: &ironclaw_engine::ThreadEvent,
@@ -1521,12 +1778,7 @@ async fn forward_event_to_channel(
             params_summary,
             ..
         } => {
-            // Format tool name with params summary: "http(https://api.github.com/...)"
-            let display_name = match params_summary {
-                Some(summary) => format!("{}({})", action_name, summary),
-                None => action_name.clone(),
-            };
-
+            let display_name = format_action_display_name(action_name, params_summary);
             let _ = channels
                 .send_status(
                     channel_name,
@@ -1555,11 +1807,7 @@ async fn forward_event_to_channel(
             params_summary,
             ..
         } => {
-            let display_name = match params_summary {
-                Some(summary) => format!("{}({})", action_name, summary),
-                None => action_name.clone(),
-            };
-
+            let display_name = format_action_display_name(action_name, params_summary);
             let _ = channels
                 .send_status(
                     channel_name,
@@ -1621,23 +1869,9 @@ async fn forward_event_to_channel(
             role,
             content_preview,
         } => {
-            // Surface code execution and tool results as thinking status
-            let msg = if role == "User" && content_preview.starts_with("[stdout]") {
-                Some("Code executed".to_string())
-            } else if role == "User" && content_preview.starts_with("[code ") {
-                Some("Code executed (no output)".to_string())
-            } else if role == "User"
-                && (content_preview.contains("Error") || content_preview.starts_with("Traceback"))
-            {
-                Some("Code error — retrying...".to_string())
-            } else if role == "Assistant" {
-                Some("Executing code...".to_string())
-            } else {
-                None
-            };
-            if let Some(text) = msg {
+            if let Some(text) = interpret_message_event(role, content_preview) {
                 let _ = channels
-                    .send_status(channel_name, StatusUpdate::Thinking(text), metadata)
+                    .send_status(channel_name, StatusUpdate::Thinking(text.into()), metadata)
                     .await;
             }
         }
@@ -1677,10 +1911,7 @@ fn thread_event_to_app_events(
             params_summary,
             ..
         } => {
-            let display_name = match params_summary {
-                Some(s) => format!("{}({})", action_name, s),
-                None => action_name.clone(),
-            };
+            let display_name = format_action_display_name(action_name, params_summary);
             vec![
                 AppEvent::ToolStarted {
                     name: display_name.clone(),
@@ -1701,10 +1932,7 @@ fn thread_event_to_app_events(
             params_summary,
             ..
         } => {
-            let display_name = match params_summary {
-                Some(s) => format!("{}({})", action_name, s),
-                None => action_name.clone(),
-            };
+            let display_name = format_action_display_name(action_name, params_summary);
             vec![
                 AppEvent::ToolStarted {
                     name: display_name.clone(),
@@ -1729,27 +1957,13 @@ fn thread_event_to_app_events(
         EventKind::MessageAdded {
             role,
             content_preview,
-        } => {
-            let msg = if role == "User" && content_preview.starts_with("[stdout]") {
-                Some("Code executed")
-            } else if role == "User" && content_preview.starts_with("[code ") {
-                Some("Code executed (no output)")
-            } else if role == "User"
-                && (content_preview.contains("Error") || content_preview.starts_with("Traceback"))
-            {
-                Some("Code error — retrying...")
-            } else if role == "Assistant" {
-                Some("Executing code...")
-            } else {
-                None
-            };
-            msg.map(|text| AppEvent::Thinking {
+        } => interpret_message_event(role, content_preview)
+            .map(|text| AppEvent::Thinking {
                 message: text.into(),
                 thread_id: Some(thread_id.into()),
             })
             .into_iter()
-            .collect()
-        }
+            .collect(),
         EventKind::StateChanged { from, to, reason } => {
             vec![AppEvent::ThreadStateChanged {
                 thread_id: thread_id.into(),
@@ -1886,7 +2100,10 @@ fn thread_to_info(t: &ironclaw_engine::Thread) -> EngineThreadInfo {
 }
 
 /// List engine threads, optionally filtered by project.
-pub async fn list_engine_threads(project_id: Option<&str>) -> Result<Vec<EngineThreadInfo>, Error> {
+pub async fn list_engine_threads(
+    project_id: Option<&str>,
+    user_id: &str,
+) -> Result<Vec<EngineThreadInfo>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(Vec::new());
     };
@@ -1905,7 +2122,7 @@ pub async fn list_engine_threads(project_id: Option<&str>) -> Result<Vec<EngineT
 
     let threads = state
         .store
-        .list_threads(pid)
+        .list_threads(pid, user_id)
         .await
         .map_err(|e| engine_err("list threads", e))?;
 
@@ -1913,7 +2130,10 @@ pub async fn list_engine_threads(project_id: Option<&str>) -> Result<Vec<EngineT
 }
 
 /// Get a single engine thread by ID.
-pub async fn get_engine_thread(thread_id: &str) -> Result<Option<EngineThreadDetail>, Error> {
+pub async fn get_engine_thread(
+    thread_id: &str,
+    user_id: &str,
+) -> Result<Option<EngineThreadDetail>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(None);
     };
@@ -1933,6 +2153,11 @@ pub async fn get_engine_thread(thread_id: &str) -> Result<Option<EngineThreadDet
     else {
         return Ok(None);
     };
+
+    // Ownership check: only return thread if it belongs to the requesting user
+    if thread.user_id != user_id {
+        return Ok(None);
+    }
 
     let messages: Vec<serde_json::Value> = thread
         .messages
@@ -1956,7 +2181,10 @@ pub async fn get_engine_thread(thread_id: &str) -> Result<Option<EngineThreadDet
 }
 
 /// List steps for a thread.
-pub async fn list_engine_thread_steps(thread_id: &str) -> Result<Vec<EngineStepInfo>, Error> {
+pub async fn list_engine_thread_steps(
+    thread_id: &str,
+    user_id: &str,
+) -> Result<Vec<EngineStepInfo>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(Vec::new());
     };
@@ -1966,6 +2194,21 @@ pub async fn list_engine_thread_steps(thread_id: &str) -> Result<Vec<EngineStepI
     };
 
     let tid = uuid::Uuid::parse_str(thread_id).map_err(|e| engine_err("parse thread_id", e))?;
+
+    // Validate thread ownership before returning steps.
+    if let Some(thread) = state
+        .store
+        .load_thread(ironclaw_engine::ThreadId(tid))
+        .await
+        .map_err(|e| engine_err("load thread", e))?
+    {
+        if thread.user_id != user_id {
+            return Ok(Vec::new());
+        }
+    } else {
+        return Ok(Vec::new());
+    }
+
     let steps = state
         .store
         .load_steps(ironclaw_engine::ThreadId(tid))
@@ -1989,7 +2232,10 @@ pub async fn list_engine_thread_steps(thread_id: &str) -> Result<Vec<EngineStepI
 }
 
 /// List events for a thread as raw JSON values.
-pub async fn list_engine_thread_events(thread_id: &str) -> Result<Vec<serde_json::Value>, Error> {
+pub async fn list_engine_thread_events(
+    thread_id: &str,
+    user_id: &str,
+) -> Result<Vec<serde_json::Value>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(Vec::new());
     };
@@ -1999,6 +2245,21 @@ pub async fn list_engine_thread_events(thread_id: &str) -> Result<Vec<serde_json
     };
 
     let tid = uuid::Uuid::parse_str(thread_id).map_err(|e| engine_err("parse thread_id", e))?;
+
+    // Validate thread ownership before returning events.
+    if let Some(thread) = state
+        .store
+        .load_thread(ironclaw_engine::ThreadId(tid))
+        .await
+        .map_err(|e| engine_err("load thread", e))?
+    {
+        if thread.user_id != user_id {
+            return Ok(Vec::new());
+        }
+    } else {
+        return Ok(Vec::new());
+    }
+
     let events = state
         .store
         .load_events(ironclaw_engine::ThreadId(tid))
@@ -2012,7 +2273,7 @@ pub async fn list_engine_thread_events(thread_id: &str) -> Result<Vec<serde_json
 }
 
 /// List all projects.
-pub async fn list_engine_projects() -> Result<Vec<EngineProjectInfo>, Error> {
+pub async fn list_engine_projects(user_id: &str) -> Result<Vec<EngineProjectInfo>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(Vec::new());
     };
@@ -2023,7 +2284,7 @@ pub async fn list_engine_projects() -> Result<Vec<EngineProjectInfo>, Error> {
 
     let projects = state
         .store
-        .list_projects()
+        .list_projects(user_id)
         .await
         .map_err(|e| engine_err("list projects", e))?;
 
@@ -2039,7 +2300,10 @@ pub async fn list_engine_projects() -> Result<Vec<EngineProjectInfo>, Error> {
 }
 
 /// Get a single project by ID.
-pub async fn get_engine_project(project_id: &str) -> Result<Option<EngineProjectInfo>, Error> {
+pub async fn get_engine_project(
+    project_id: &str,
+    user_id: &str,
+) -> Result<Option<EngineProjectInfo>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(None);
     };
@@ -2055,17 +2319,20 @@ pub async fn get_engine_project(project_id: &str) -> Result<Option<EngineProject
         .await
         .map_err(|e| engine_err("load project", e))?;
 
-    Ok(project.map(|p| EngineProjectInfo {
-        id: p.id.to_string(),
-        name: p.name,
-        description: p.description,
-        created_at: p.created_at.to_rfc3339(),
-    }))
+    Ok(project
+        .filter(|p| p.user_id == user_id)
+        .map(|p| EngineProjectInfo {
+            id: p.id.to_string(),
+            name: p.name,
+            description: p.description,
+            created_at: p.created_at.to_rfc3339(),
+        }))
 }
 
 /// List missions, optionally filtered by project.
 pub async fn list_engine_missions(
     project_id: Option<&str>,
+    user_id: &str,
 ) -> Result<Vec<EngineMissionInfo>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(Vec::new());
@@ -2085,7 +2352,7 @@ pub async fn list_engine_missions(
 
     let missions = state
         .store
-        .list_missions(pid)
+        .list_missions_with_shared(pid, user_id)
         .await
         .map_err(|e| engine_err("list missions", e))?;
 
@@ -2106,7 +2373,10 @@ pub async fn list_engine_missions(
 }
 
 /// Get a single mission by ID.
-pub async fn get_engine_mission(mission_id: &str) -> Result<Option<EngineMissionDetail>, Error> {
+pub async fn get_engine_mission(
+    mission_id: &str,
+    user_id: &str,
+) -> Result<Option<EngineMissionDetail>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(None);
     };
@@ -2125,6 +2395,11 @@ pub async fn get_engine_mission(mission_id: &str) -> Result<Option<EngineMission
     let Some(m) = mission else {
         return Ok(None);
     };
+
+    // Ownership check: allow access to user's own missions and system missions.
+    if m.user_id != user_id && m.user_id != "system" {
+        return Ok(None);
+    }
 
     let cadence_json = serde_json::to_value(&m.cadence).unwrap_or(serde_json::Value::Null);
 
@@ -2184,7 +2459,14 @@ pub async fn fire_engine_mission(mission_id: &str, user_id: &str) -> Result<Opti
 }
 
 /// Pause a mission.
-pub async fn pause_engine_mission(mission_id: &str) -> Result<(), Error> {
+///
+/// For system missions, the caller must be an admin (pass `is_admin=true`).
+/// For user missions, ownership is enforced by the engine.
+pub async fn pause_engine_mission(
+    mission_id: &str,
+    user_id: &str,
+    is_admin: bool,
+) -> Result<(), Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Err(engine_err("not initialized", "engine v2 is not running"));
     };
@@ -2194,18 +2476,28 @@ pub async fn pause_engine_mission(mission_id: &str) -> Result<(), Error> {
     };
 
     let mid = uuid::Uuid::parse_str(mission_id).map_err(|e| engine_err("parse mission_id", e))?;
-    state
+    let mgr = state
         .effect_adapter
         .mission_manager()
         .await
-        .ok_or_else(|| engine_err("mission", "mission manager not available"))?
-        .pause_mission(ironclaw_engine::MissionId(mid))
+        .ok_or_else(|| engine_err("mission", "mission manager not available"))?;
+
+    // System missions require admin role; pass "system" as user_id to satisfy engine check.
+    let effective_user_id = resolve_mission_user_id(&state.store, mid, user_id, is_admin).await?;
+    mgr.pause_mission(ironclaw_engine::MissionId(mid), &effective_user_id)
         .await
         .map_err(|e| engine_err("pause mission", e))
 }
 
 /// Resume a paused mission.
-pub async fn resume_engine_mission(mission_id: &str) -> Result<(), Error> {
+///
+/// For system missions, the caller must be an admin (pass `is_admin=true`).
+/// For user missions, ownership is enforced by the engine.
+pub async fn resume_engine_mission(
+    mission_id: &str,
+    user_id: &str,
+    is_admin: bool,
+) -> Result<(), Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Err(engine_err("not initialized", "engine v2 is not running"));
     };
@@ -2215,14 +2507,108 @@ pub async fn resume_engine_mission(mission_id: &str) -> Result<(), Error> {
     };
 
     let mid = uuid::Uuid::parse_str(mission_id).map_err(|e| engine_err("parse mission_id", e))?;
-    state
+    let mgr = state
         .effect_adapter
         .mission_manager()
         .await
-        .ok_or_else(|| engine_err("mission", "mission manager not available"))?
-        .resume_mission(ironclaw_engine::MissionId(mid))
+        .ok_or_else(|| engine_err("mission", "mission manager not available"))?;
+
+    let effective_user_id = resolve_mission_user_id(&state.store, mid, user_id, is_admin).await?;
+    mgr.resume_mission(ironclaw_engine::MissionId(mid), &effective_user_id)
         .await
         .map_err(|e| engine_err("resume mission", e))
+}
+
+/// Reset the global engine state so a fresh engine can be initialized.
+///
+/// Used by the test rig to isolate engine v2 tests — each test gets a clean
+/// engine state instead of inheriting the prior test's `OnceLock` singleton.
+#[cfg(feature = "libsql")]
+pub async fn reset_engine_state() {
+    if let Some(lock) = ENGINE_STATE.get() {
+        *lock.write().await = None;
+    }
+}
+
+/// Resolve the effective user_id for mission management operations.
+///
+/// If the mission is system-owned, requires admin role and returns "system"
+/// so the engine ownership check passes. Otherwise returns the caller's user_id.
+async fn resolve_mission_user_id(
+    store: &Arc<dyn ironclaw_engine::Store>,
+    mid: uuid::Uuid,
+    user_id: &str,
+    is_admin: bool,
+) -> Result<String, Error> {
+    if let Ok(Some(mission)) = store.load_mission(ironclaw_engine::MissionId(mid)).await
+        && mission.user_id == "system"
+    {
+        if !is_admin {
+            return Err(engine_err(
+                "forbidden",
+                "system missions can only be managed by admins",
+            ));
+        }
+        return Ok("system".to_string());
+    }
+    Ok(user_id.to_string())
+}
+
+// ── Legacy migration ────────────────────────────────────────────
+
+/// One-time migration: stamp the owner's user_id onto any engine records that
+/// deserialized with the serde default `"legacy"` (pre-multi-tenancy data).
+///
+/// Runs at engine init before user-scoped queries. After migration, records
+/// are findable by the owner's identity and the "legacy" sentinel disappears.
+async fn migrate_legacy_user_ids(store: &Arc<dyn ironclaw_engine::Store>, owner_id: &str) {
+    // Projects
+    if let Ok(legacy) = store.list_projects("legacy").await {
+        for mut project in legacy {
+            project.user_id = owner_id.to_string();
+            project.updated_at = chrono::Utc::now();
+            let _ = store.save_project(&project).await;
+        }
+    }
+
+    // We need a project_id to query threads/missions/docs. Use list_projects
+    // with the now-migrated owner_id, or fall back to "legacy" in case save failed.
+    let all_projects: Vec<ironclaw_engine::Project> =
+        store.list_projects(owner_id).await.unwrap_or_default();
+
+    for project in &all_projects {
+        let pid = project.id;
+
+        // Threads
+        if let Ok(legacy) = store.list_all_threads(pid).await {
+            for mut thread in legacy.into_iter().filter(|t| t.user_id == "legacy") {
+                thread.user_id = owner_id.to_string();
+                thread.updated_at = chrono::Utc::now();
+                let _ = store.save_thread(&thread).await;
+            }
+        }
+
+        // Missions
+        if let Ok(legacy) = store.list_all_missions(pid).await {
+            for mut mission in legacy.into_iter().filter(|m| m.user_id == "legacy") {
+                // System learning missions keep "system"; only stamp truly orphaned ones.
+                mission.user_id = owner_id.to_string();
+                mission.updated_at = chrono::Utc::now();
+                let _ = store.save_mission(&mission).await;
+            }
+        }
+
+        // Memory docs (use list_memory_docs directly since "legacy" is the user_id)
+        if let Ok(legacy) = store.list_memory_docs(pid, "legacy").await {
+            for mut doc in legacy {
+                doc.user_id = owner_id.to_string();
+                doc.updated_at = chrono::Utc::now();
+                let _ = store.save_memory_doc(&doc).await;
+            }
+        }
+    }
+
+    debug!("engine v2: legacy user_id migration complete for owner {owner_id}");
 }
 
 #[cfg(test)]
@@ -2262,6 +2648,7 @@ mod tests {
         async fn list_threads(
             &self,
             _project_id: ironclaw_engine::ProjectId,
+            _user_id: &str,
         ) -> Result<Vec<ironclaw_engine::Thread>, ironclaw_engine::EngineError> {
             Ok(self.threads.read().await.values().cloned().collect())
         }
@@ -2310,6 +2697,7 @@ mod tests {
         }
         async fn list_projects(
             &self,
+            _user_id: &str,
         ) -> Result<Vec<ironclaw_engine::Project>, ironclaw_engine::EngineError> {
             Ok(vec![])
         }
@@ -2364,6 +2752,7 @@ mod tests {
         async fn list_memory_docs(
             &self,
             _: ironclaw_engine::ProjectId,
+            _user_id: &str,
         ) -> Result<Vec<ironclaw_engine::MemoryDoc>, ironclaw_engine::EngineError> {
             Ok(vec![])
         }
@@ -2401,6 +2790,7 @@ mod tests {
         async fn list_missions(
             &self,
             _: ironclaw_engine::ProjectId,
+            _user_id: &str,
         ) -> Result<Vec<ironclaw_engine::Mission>, ironclaw_engine::EngineError> {
             Ok(vec![])
         }
@@ -2509,6 +2899,7 @@ mod tests {
             "goal",
             ironclaw_engine::ThreadType::Foreground,
             ironclaw_engine::ProjectId::new(),
+            "user1",
             ironclaw_engine::ThreadConfig::default(),
         );
         thread.id = thread_id;
@@ -2569,6 +2960,7 @@ mod tests {
                 "goal",
                 ironclaw_engine::ThreadType::Foreground,
                 ironclaw_engine::ProjectId::new(),
+                "user1",
                 ironclaw_engine::ThreadConfig::default(),
             );
             thread.id = thread_id;
@@ -2605,5 +2997,185 @@ mod tests {
                 .await
                 .unwrap();
         assert!(matches!(resolved, PendingApprovalResolution::Ambiguous));
+    }
+
+    // ── /expected command tests ─────────────────────────────────
+
+    /// Build a minimal EngineState backed by a TestStore for /expected tests.
+    fn make_expected_test_state(store: Arc<TestStore>) -> EngineState {
+        use ironclaw_engine::{
+            CapabilityRegistry, ConversationManager, LeaseManager, PolicyEngine, ThreadManager,
+        };
+
+        // Minimal mocks — /expected doesn't execute threads, just reads state
+        struct NoopLlm;
+        #[async_trait::async_trait]
+        impl ironclaw_engine::LlmBackend for NoopLlm {
+            async fn complete(
+                &self,
+                _: &[ironclaw_engine::ThreadMessage],
+                _: &[ironclaw_engine::ActionDef],
+                _: &ironclaw_engine::LlmCallConfig,
+            ) -> Result<ironclaw_engine::LlmOutput, ironclaw_engine::EngineError> {
+                Ok(ironclaw_engine::LlmOutput {
+                    response: ironclaw_engine::LlmResponse::Text("done".into()),
+                    usage: ironclaw_engine::TokenUsage::default(),
+                })
+            }
+            fn model_name(&self) -> &str {
+                "noop"
+            }
+        }
+
+        struct NoopEffects;
+        #[async_trait::async_trait]
+        impl ironclaw_engine::EffectExecutor for NoopEffects {
+            async fn execute_action(
+                &self,
+                _: &str,
+                _: serde_json::Value,
+                _: &ironclaw_engine::CapabilityLease,
+                _: &ironclaw_engine::ThreadExecutionContext,
+            ) -> Result<ironclaw_engine::ActionResult, ironclaw_engine::EngineError> {
+                unreachable!()
+            }
+            async fn available_actions(
+                &self,
+                _: &[ironclaw_engine::CapabilityLease],
+            ) -> Result<Vec<ironclaw_engine::ActionDef>, ironclaw_engine::EngineError> {
+                Ok(vec![])
+            }
+        }
+
+        let store_dyn: Arc<dyn Store> = store;
+        let effect_adapter = Arc::new(EffectBridgeAdapter::new(
+            Arc::new(crate::tools::ToolRegistry::new()),
+            Arc::new(ironclaw_safety::SafetyLayer::new(
+                &ironclaw_safety::SafetyConfig {
+                    max_output_length: 10_000,
+                    injection_check_enabled: false,
+                },
+            )),
+            Arc::new(crate::hooks::HookRegistry::default()),
+        ));
+
+        let tm = Arc::new(ThreadManager::new(
+            Arc::new(NoopLlm),
+            Arc::new(NoopEffects),
+            store_dyn.clone(),
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        ));
+
+        let cm = ConversationManager::new(Arc::clone(&tm), store_dyn.clone());
+
+        EngineState {
+            thread_manager: tm,
+            conversation_manager: cm,
+            effect_adapter,
+            store: store_dyn,
+            default_project_id: ironclaw_engine::ProjectId::new(),
+            pending_approvals: RwLock::new(HashMap::new()),
+            pending_auth: RwLock::new(HashMap::new()),
+            sse: None,
+            db: None,
+            secrets_store: None,
+            auth_manager: None,
+        }
+    }
+
+    /// find_most_recent_thread returns the active thread when one exists.
+    #[tokio::test]
+    async fn find_recent_thread_returns_active() {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+
+        let project_id = state.default_project_id;
+        let mut thread = ironclaw_engine::Thread::new(
+            "test goal",
+            ironclaw_engine::ThreadType::Foreground,
+            project_id,
+            "alice",
+            ironclaw_engine::ThreadConfig::default(),
+        );
+        thread.add_message(ironclaw_engine::ThreadMessage::user("hello"));
+        thread.add_message(ironclaw_engine::ThreadMessage::assistant("hi there"));
+        let tid = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let mut conv = ironclaw_engine::ConversationSurface::new("web", "alice");
+        conv.track_thread(tid);
+        let conv_opt = Some(conv);
+
+        let result = find_most_recent_thread(&state, &conv_opt, "alice").await;
+        assert!(result.is_some(), "should find thread");
+        assert_eq!(result.unwrap().id, tid);
+    }
+
+    /// find_most_recent_thread returns None for empty conversation.
+    #[tokio::test]
+    async fn find_recent_thread_empty_conv_returns_none() {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store);
+
+        let conv = Some(ironclaw_engine::ConversationSurface::new("web", "alice"));
+        let result = find_most_recent_thread(&state, &conv, "alice").await;
+        assert!(result.is_none());
+    }
+
+    /// find_most_recent_thread filters by user_id (tenant isolation).
+    #[tokio::test]
+    async fn find_recent_thread_filters_by_user() {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+
+        let project_id = state.default_project_id;
+        let thread = ironclaw_engine::Thread::new(
+            "bob's thread",
+            ironclaw_engine::ThreadType::Foreground,
+            project_id,
+            "bob", // owned by bob
+            ironclaw_engine::ThreadConfig::default(),
+        );
+        let tid = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let mut conv = ironclaw_engine::ConversationSurface::new("web", "alice");
+        conv.track_thread(tid);
+
+        // Alice should NOT see Bob's thread
+        let result = find_most_recent_thread(&state, &Some(conv), "alice").await;
+        assert!(result.is_none(), "alice should not see bob's thread"); // safety: test-only
+    }
+
+    /// find_most_recent_thread falls back to entry-referenced threads
+    /// when no active threads exist.
+    #[tokio::test]
+    async fn find_recent_thread_falls_back_to_entries() {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+
+        let project_id = state.default_project_id;
+        let mut thread = ironclaw_engine::Thread::new(
+            "completed goal",
+            ironclaw_engine::ThreadType::Foreground,
+            project_id,
+            "alice",
+            ironclaw_engine::ThreadConfig::default(),
+        );
+        thread.add_message(ironclaw_engine::ThreadMessage::user("do something"));
+        thread.add_message(ironclaw_engine::ThreadMessage::assistant("done"));
+        let tid = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        // Conversation with no active threads, but an entry referencing the thread
+        let mut conv = ironclaw_engine::ConversationSurface::new("web", "alice");
+        conv.add_entry(ironclaw_engine::ConversationEntry::agent(tid, "done"));
+        // Thread is NOT in active_threads (it completed and was untracked)
+
+        let result = find_most_recent_thread(&state, &Some(conv), "alice").await;
+        assert!(result.is_some(), "should find thread via entry fallback");
+        assert_eq!(result.unwrap().id, tid);
     }
 }

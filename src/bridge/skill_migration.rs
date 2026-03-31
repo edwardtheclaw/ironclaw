@@ -48,7 +48,7 @@ pub async fn migrate_v1_skill_list(
     }
 
     // Load existing skill docs to check for duplicates by content_hash
-    let existing_docs = store.list_memory_docs(project_id).await?;
+    let existing_docs = store.list_memory_docs(project_id, "system").await?;
     let existing_hashes: std::collections::HashSet<String> = existing_docs
         .iter()
         .filter(|d| d.doc_type == DocType::Skill)
@@ -84,7 +84,7 @@ pub async fn migrate_v1_skill_list(
     }
 
     if migrated > 0 {
-        tracing::info!("migrated {migrated} v1 skill(s) to v2 engine");
+        tracing::debug!("migrated {migrated} v1 skill(s) to v2 engine");
     }
 
     Ok(migrated)
@@ -93,7 +93,9 @@ pub async fn migrate_v1_skill_list(
 /// Convert a single v1 `LoadedSkill` to a v2 `MemoryDoc`.
 fn v1_skill_to_memory_doc(skill: &LoadedSkill, project_id: ProjectId) -> MemoryDoc {
     let v2_source = match &skill.source {
-        SkillSource::Workspace(_) | SkillSource::User(_) => V2SkillSource::Migrated,
+        SkillSource::Workspace(_) | SkillSource::User(_) | SkillSource::Installed(_) => {
+            V2SkillSource::Migrated
+        }
         SkillSource::Bundled(_) => V2SkillSource::Migrated,
     };
 
@@ -112,6 +114,7 @@ fn v1_skill_to_memory_doc(skill: &LoadedSkill, project_id: ProjectId) -> MemoryD
 
     let mut doc = MemoryDoc::new(
         project_id,
+        "system",
         DocType::Skill,
         format!("skill:{}", skill.manifest.name),
         &skill.prompt_content,

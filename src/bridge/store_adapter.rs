@@ -703,12 +703,14 @@ fn deserialize_knowledge_doc(content: &str) -> Option<MemoryDoc> {
     }
 
     // Find closing ---
-    let after_first = &content[3..];
-    let after_first_line = after_first.find('\n').map(|pos| &after_first[pos + 1..])?;
+    // All slice points are at ASCII boundaries (---, \n) so UTF-8 safe.
+    let after_first = content.get(3..)?;
+    let nl_pos = after_first.find('\n')?;
+    let after_first_line = after_first.get(nl_pos + 1..)?;
     let yaml_end = after_first_line.find("\n---")?;
-    let yaml_str = &after_first_line[..yaml_end];
+    let yaml_str = after_first_line.get(..yaml_end)?;
     let body_start = yaml_end + 4; // skip \n---
-    let body = after_first_line[body_start..].trim_start_matches('\n');
+    let body = after_first_line.get(body_start..)?.trim_start_matches('\n');
 
     // Parse YAML frontmatter
     let yaml: serde_json::Value = serde_yml::from_str(yaml_str).ok()?;
@@ -727,6 +729,7 @@ fn deserialize_knowledge_doc(content: &str) -> Option<MemoryDoc> {
         "Issue" => DocType::Issue,
         "Spec" => DocType::Spec,
         "Skill" => DocType::Skill,
+        "Plan" => DocType::Plan,
         _ => DocType::Note,
     };
 
@@ -769,6 +772,7 @@ fn deserialize_knowledge_doc(content: &str) -> Option<MemoryDoc> {
     Some(MemoryDoc {
         id: DocId(id),
         project_id: ProjectId(uuid::Uuid::nil()),
+        user_id: "legacy".to_string(),
         doc_type,
         title,
         content: body.to_string(),
@@ -819,10 +823,11 @@ fn compact_thread_summary(thread: &Thread) -> ThreadArchiveSummary {
 
 fn truncate_for_readme(s: &str, max: usize) -> String {
     let trimmed = s.trim().replace('\n', " ");
-    if trimmed.len() <= max {
+    if trimmed.chars().count() <= max {
         trimmed
     } else {
-        format!("{}...", &trimmed[..max.min(trimmed.len())])
+        let truncated: String = trimmed.chars().take(max).collect();
+        format!("{truncated}...")
     }
 }
 
@@ -840,13 +845,17 @@ impl Store for HybridStore {
         Ok(self.threads.read().await.get(&id).cloned())
     }
 
-    async fn list_threads(&self, project_id: ProjectId) -> Result<Vec<Thread>, EngineError> {
+    async fn list_threads(
+        &self,
+        project_id: ProjectId,
+        user_id: &str,
+    ) -> Result<Vec<Thread>, EngineError> {
         Ok(self
             .threads
             .read()
             .await
             .values()
-            .filter(|thread| thread.project_id == project_id)
+            .filter(|thread| thread.project_id == project_id && thread.user_id == user_id)
             .cloned()
             .collect())
     }
@@ -951,8 +960,15 @@ impl Store for HybridStore {
         Ok(self.projects.read().await.get(&id).cloned())
     }
 
-    async fn list_projects(&self) -> Result<Vec<Project>, EngineError> {
-        Ok(self.projects.read().await.values().cloned().collect())
+    async fn list_projects(&self, user_id: &str) -> Result<Vec<Project>, EngineError> {
+        Ok(self
+            .projects
+            .read()
+            .await
+            .values()
+            .filter(|p| p.user_id == user_id)
+            .cloned()
+            .collect())
     }
 
     async fn save_conversation(
@@ -999,13 +1015,17 @@ impl Store for HybridStore {
         Ok(self.docs.read().await.get(&id).cloned())
     }
 
-    async fn list_memory_docs(&self, project_id: ProjectId) -> Result<Vec<MemoryDoc>, EngineError> {
+    async fn list_memory_docs(
+        &self,
+        project_id: ProjectId,
+        user_id: &str,
+    ) -> Result<Vec<MemoryDoc>, EngineError> {
         Ok(self
             .docs
             .read()
             .await
             .values()
-            .filter(|doc| doc.project_id == project_id)
+            .filter(|doc| doc.project_id == project_id && doc.user_id == user_id)
             .cloned()
             .collect())
     }
@@ -1061,7 +1081,33 @@ impl Store for HybridStore {
         Ok(self.missions.read().await.get(&id).cloned())
     }
 
-    async fn list_missions(&self, project_id: ProjectId) -> Result<Vec<Mission>, EngineError> {
+    async fn list_missions(
+        &self,
+        project_id: ProjectId,
+        user_id: &str,
+    ) -> Result<Vec<Mission>, EngineError> {
+        Ok(self
+            .missions
+            .read()
+            .await
+            .values()
+            .filter(|mission| mission.project_id == project_id && mission.user_id == user_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_all_threads(&self, project_id: ProjectId) -> Result<Vec<Thread>, EngineError> {
+        Ok(self
+            .threads
+            .read()
+            .await
+            .values()
+            .filter(|thread| thread.project_id == project_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_all_missions(&self, project_id: ProjectId) -> Result<Vec<Mission>, EngineError> {
         Ok(self
             .missions
             .read()

@@ -131,6 +131,14 @@ impl ConversationManager {
             reason: format!("conversation {conversation_id} not found"),
         })?;
 
+        // Tenant isolation: verify the requesting user owns this conversation.
+        if conv.user_id != user_id {
+            return Err(EngineError::AccessDenied {
+                user_id: user_id.to_string(),
+                entity: format!("conversation {conversation_id}"),
+            });
+        }
+
         // Record the user entry
         conv.add_entry(ConversationEntry::user(content));
 
@@ -145,7 +153,7 @@ impl ConversationManager {
                     "injecting message into active thread"
                 );
                 self.thread_manager
-                    .inject_message(thread_id, ThreadMessage::user(content))
+                    .inject_message(thread_id, user_id, ThreadMessage::user(content))
                     .await?;
                 self.store.save_conversation(conv).await?;
                 Ok(thread_id)
@@ -274,9 +282,17 @@ impl ConversationManager {
     pub async fn clear_conversation(
         &self,
         conversation_id: ConversationId,
+        user_id: &str,
     ) -> Result<(), EngineError> {
         let mut convs = self.conversations.write().await;
         if let Some(conv) = convs.get_mut(&conversation_id) {
+            // Tenant isolation: verify ownership.
+            if conv.user_id != user_id {
+                return Err(EngineError::AccessDenied {
+                    user_id: user_id.to_string(),
+                    entity: format!("conversation {conversation_id}"),
+                });
+            }
             conv.active_threads.clear();
             conv.entries.clear();
             conv.updated_at = chrono::Utc::now();
@@ -457,6 +473,7 @@ mod tests {
         async fn list_threads(
             &self,
             project_id: ProjectId,
+            _user_id: &str,
         ) -> Result<Vec<crate::types::thread::Thread>, EngineError> {
             Ok(self
                 .threads
@@ -527,7 +544,11 @@ mod tests {
         async fn load_memory_doc(&self, _: DocId) -> Result<Option<MemoryDoc>, EngineError> {
             Ok(None)
         }
-        async fn list_memory_docs(&self, _: ProjectId) -> Result<Vec<MemoryDoc>, EngineError> {
+        async fn list_memory_docs(
+            &self,
+            _: ProjectId,
+            _: &str,
+        ) -> Result<Vec<MemoryDoc>, EngineError> {
             Ok(vec![])
         }
         async fn save_lease(&self, _: &CapabilityLease) -> Result<(), EngineError> {
@@ -561,6 +582,7 @@ mod tests {
         async fn list_missions(
             &self,
             _: ProjectId,
+            _: &str,
         ) -> Result<Vec<crate::types::mission::Mission>, EngineError> {
             Ok(vec![])
         }
@@ -655,6 +677,7 @@ mod tests {
             "resume",
             ThreadType::Foreground,
             project,
+            "user1",
             ThreadConfig::default(),
         );
         thread.transition_to(ThreadState::Running, None).unwrap();
@@ -807,7 +830,7 @@ mod tests {
         assert!(!conv.entries.is_empty());
 
         // Clear the conversation
-        cm.clear_conversation(conv_id).await.unwrap();
+        cm.clear_conversation(conv_id, "user1").await.unwrap();
 
         let conv = cm.get_conversation(conv_id).await.unwrap();
         assert!(conv.entries.is_empty());

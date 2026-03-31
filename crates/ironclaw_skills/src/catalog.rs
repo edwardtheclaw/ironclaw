@@ -170,7 +170,10 @@ impl SkillCatalog {
             .timeout(REQUEST_TIMEOUT)
             .user_agent(concat!("ironclaw/", env!("CARGO_PKG_VERSION")))
             .build()
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to build HTTP client: {e}");
+                reqwest::Client::default()
+            });
 
         Self {
             registry_url,
@@ -190,7 +193,10 @@ impl SkillCatalog {
             .timeout(timeout)
             .user_agent(concat!("ironclaw/", env!("CARGO_PKG_VERSION")))
             .build()
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to build HTTP client: {e}");
+                reqwest::Client::default()
+            });
 
         Self {
             registry_url: url.to_string(),

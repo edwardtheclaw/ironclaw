@@ -11,6 +11,8 @@ use uuid::Uuid;
 use crate::types::project::ProjectId;
 use crate::types::thread::ThreadId;
 
+use super::default_user_id;
+
 /// Strongly-typed document identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DocId(pub Uuid);
@@ -51,6 +53,9 @@ pub enum DocType {
 pub struct MemoryDoc {
     pub id: DocId,
     pub project_id: ProjectId,
+    /// Tenant isolation: the user who owns this document.
+    #[serde(default = "default_user_id")]
+    pub user_id: String,
     pub doc_type: DocType,
     pub title: String,
     pub content: String,
@@ -64,6 +69,7 @@ pub struct MemoryDoc {
 impl MemoryDoc {
     pub fn new(
         project_id: ProjectId,
+        user_id: impl Into<String>,
         doc_type: DocType,
         title: impl Into<String>,
         content: impl Into<String>,
@@ -72,6 +78,7 @@ impl MemoryDoc {
         Self {
             id: DocId::new(),
             project_id,
+            user_id: user_id.into(),
             doc_type,
             title: title.into(),
             content: content.into(),

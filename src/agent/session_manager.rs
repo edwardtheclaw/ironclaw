@@ -204,9 +204,9 @@ impl SessionManager {
         let thread_id = {
             let mut sess = session.lock().await;
             let thread = if let Some(uuid) = ext_uuid {
-                sess.create_thread_with_id(uuid)
+                sess.create_thread_with_id(uuid, Some(channel))
             } else {
-                sess.create_thread()
+                sess.create_thread(Some(channel))
             };
             thread.id
         };
@@ -483,7 +483,7 @@ mod tests {
         let session = Arc::new(Mutex::new(Session::new("user-hydrate")));
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(thread_id, sess.id);
+            let thread = Thread::with_id(thread_id, sess.id, None);
             sess.threads.insert(thread_id, thread);
             sess.active_thread = Some(thread_id);
         }
@@ -607,7 +607,7 @@ mod tests {
         // Simulate hydration: create thread with a known UUID
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(known_uuid, session_id);
+            let thread = Thread::with_id(known_uuid, session_id, None);
             sess.threads.insert(known_uuid, thread);
         }
 
@@ -634,7 +634,7 @@ mod tests {
         let session = Arc::new(Mutex::new(Session::new("user-idem")));
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(tid, sess.id);
+            let thread = Thread::with_id(tid, sess.id, None);
             sess.threads.insert(tid, thread);
         }
 
@@ -663,7 +663,7 @@ mod tests {
         let session = Arc::new(Mutex::new(Session::new("user-undo")));
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(tid, sess.id);
+            let thread = Thread::with_id(tid, sess.id, None);
             sess.threads.insert(tid, thread);
         }
 
@@ -687,7 +687,7 @@ mod tests {
         let session = Arc::new(Mutex::new(Session::new("user-new")));
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(tid, sess.id);
+            let thread = Thread::with_id(tid, sess.id, None);
             sess.threads.insert(tid, thread);
         }
 
@@ -795,7 +795,7 @@ mod tests {
         let session = Arc::new(Mutex::new(Session::new("user-cross")));
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(tid, sess.id);
+            let thread = Thread::with_id(tid, sess.id, None);
             sess.threads.insert(tid, thread);
         }
 
@@ -822,7 +822,7 @@ mod tests {
         let session = Arc::new(Mutex::new(Session::new("user-cross")));
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(tid, sess.id);
+            let thread = Thread::with_id(tid, sess.id, None);
             sess.threads.insert(tid, thread);
         }
 
@@ -973,7 +973,7 @@ mod tests {
         let adopted_id = Uuid::new_v4();
         {
             let mut sess = session1.lock().await;
-            let thread = Thread::with_id(adopted_id, sess.id);
+            let thread = Thread::with_id(adopted_id, sess.id, None);
             sess.threads.insert(adopted_id, thread);
         }
         // Resolve with the UUID as external_thread_id -- should adopt it
@@ -999,7 +999,7 @@ mod tests {
         let session = Arc::new(Mutex::new(Session::new("user-direct")));
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(tid, sess.id);
+            let thread = Thread::with_id(tid, sess.id, None);
             sess.threads.insert(tid, thread);
         }
         {
@@ -1037,7 +1037,7 @@ mod tests {
         let known_id = Uuid::new_v4();
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(known_id, sess.id);
+            let thread = Thread::with_id(known_id, sess.id, None);
             sess.threads.insert(known_id, thread);
         }
 
@@ -1064,7 +1064,7 @@ mod tests {
         let known_id = Uuid::new_v4();
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(known_id, sess.id);
+            let thread = Thread::with_id(known_id, sess.id, None);
             sess.threads.insert(known_id, thread);
         }
 
@@ -1088,7 +1088,7 @@ mod tests {
         let known_id = Uuid::new_v4();
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(known_id, sess.id);
+            let thread = Thread::with_id(known_id, sess.id, None);
             sess.threads.insert(known_id, thread);
         }
 
@@ -1107,6 +1107,21 @@ mod tests {
         assert_ne!(
             resolved, known_id,
             "should NOT adopt UUID when external_thread_id is None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_thread_stores_source_channel() {
+        let manager = SessionManager::new();
+
+        let (session, thread_id) = manager.resolve_thread("user-1", "telegram", None).await;
+
+        let sess = session.lock().await;
+        let thread = sess.threads.get(&thread_id).unwrap();
+        assert_eq!(
+            thread.source_channel.as_deref(),
+            Some("telegram"),
+            "resolve_thread should store source_channel from the channel parameter"
         );
     }
 }

@@ -15,6 +15,8 @@ use crate::types::event::{EventKind, ThreadEvent};
 use crate::types::message::ThreadMessage;
 use crate::types::project::ProjectId;
 
+use super::default_user_id;
+
 /// Strongly-typed thread identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ThreadId(pub Uuid);
@@ -174,6 +176,9 @@ pub struct Thread {
     pub thread_type: ThreadType,
     pub state: ThreadState,
     pub project_id: ProjectId,
+    /// Tenant isolation: the user who owns this thread.
+    #[serde(default = "default_user_id")]
+    pub user_id: String,
     pub parent_id: Option<ThreadId>,
     pub config: ThreadConfig,
     pub messages: Vec<ThreadMessage>,
@@ -195,6 +200,7 @@ impl Thread {
         goal: impl Into<String>,
         thread_type: ThreadType,
         project_id: ProjectId,
+        user_id: impl Into<String>,
         config: ThreadConfig,
     ) -> Self {
         let now = Utc::now();
@@ -204,6 +210,7 @@ impl Thread {
             thread_type,
             state: ThreadState::Created,
             project_id,
+            user_id: user_id.into(),
             parent_id: None,
             config,
             messages: Vec::new(),
@@ -288,6 +295,7 @@ mod tests {
             "test goal",
             ThreadType::Foreground,
             ProjectId::new(),
+            "test-user",
             ThreadConfig::default(),
         )
     }
@@ -428,6 +436,7 @@ mod tests {
             "child goal",
             ThreadType::Research,
             parent.project_id,
+            "test-user",
             ThreadConfig::default(),
         )
         .with_parent(parent.id);

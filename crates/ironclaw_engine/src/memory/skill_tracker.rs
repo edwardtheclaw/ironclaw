@@ -171,6 +171,7 @@ mod tests {
 
         let mut doc = MemoryDoc::new(
             project_id,
+            "test-user",
             DocType::Skill,
             "skill:test",
             "Test skill prompt",

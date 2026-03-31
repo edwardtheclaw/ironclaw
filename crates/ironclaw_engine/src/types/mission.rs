@@ -11,6 +11,8 @@ use uuid::Uuid;
 use crate::types::project::ProjectId;
 use crate::types::thread::ThreadId;
 
+use super::default_user_id;
+
 /// Strongly-typed mission identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MissionId(pub Uuid);
@@ -77,6 +79,9 @@ pub enum MissionCadence {
 pub struct Mission {
     pub id: MissionId,
     pub project_id: ProjectId,
+    /// Tenant isolation: the user who owns this mission.
+    #[serde(default = "default_user_id")]
+    pub user_id: String,
     pub name: String,
     pub goal: String,
     pub status: MissionStatus,
@@ -115,6 +120,7 @@ pub struct Mission {
 impl Mission {
     pub fn new(
         project_id: ProjectId,
+        user_id: impl Into<String>,
         name: impl Into<String>,
         goal: impl Into<String>,
         cadence: MissionCadence,
@@ -123,6 +129,7 @@ impl Mission {
         Self {
             id: MissionId::new(),
             project_id,
+            user_id: user_id.into(),
             name: name.into(),
             goal: goal.into(),
             status: MissionStatus::Active,

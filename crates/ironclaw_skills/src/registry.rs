@@ -172,7 +172,7 @@ impl SkillRegistry {
             let skills = self
                 .discover_from_dir(&user_dir, SkillTrust::Trusted, &SkillSource::User, cap, 0)
                 .await;
-            self.absorb(skills, &mut seen, &mut loaded_names, "user/workspace");
+            self.absorb(skills, &mut seen, &mut loaded_names, "workspace");
         }
 
         // 3. Installed skills (registry-installed)
@@ -181,9 +181,15 @@ impl SkillRegistry {
         {
             let cap = MAX_DISCOVERED_SKILLS.saturating_sub(loaded_names.len());
             let skills = self
-                .discover_from_dir(&inst_dir, SkillTrust::Installed, &SkillSource::User, cap, 0)
+                .discover_from_dir(
+                    &inst_dir,
+                    SkillTrust::Installed,
+                    &SkillSource::Installed,
+                    cap,
+                    0,
+                )
                 .await;
-            self.absorb(skills, &mut seen, &mut loaded_names, "user/workspace");
+            self.absorb(skills, &mut seen, &mut loaded_names, "workspace or user");
         }
 
         // 4. Bundled skills (compiled into binary, lowest priority)
@@ -335,7 +341,7 @@ impl SkillRegistry {
                 let source = make_source(dir.to_path_buf());
                 match self.load_skill_md(&path, trust, source).await {
                     Ok((name, skill)) => {
-                        tracing::info!("Loaded skill: {}", name);
+                        tracing::debug!("Loaded skill: {}", name);
                         results.push((name, skill));
                     }
                     Err(e) => {
@@ -466,7 +472,7 @@ impl SkillRegistry {
             });
         }
         self.skills.push(skill);
-        tracing::info!("Installed skill: {}", name);
+        tracing::debug!("Installed skill: {}", name);
         Ok(())
     }
 
@@ -514,7 +520,7 @@ impl SkillRegistry {
         let skill = &self.skills[idx];
 
         match &skill.source {
-            SkillSource::User(path) => Ok(path.clone()),
+            SkillSource::User(path) | SkillSource::Installed(path) => Ok(path.clone()),
             SkillSource::Workspace(_) => Err(SkillRegistryError::CannotRemove {
                 name: name.to_string(),
                 reason: "workspace skills cannot be removed via this interface".to_string(),
@@ -555,7 +561,7 @@ impl SkillRegistry {
             .ok_or_else(|| SkillRegistryError::NotFound(name.to_string()))?;
 
         self.skills.remove(idx);
-        tracing::info!("Removed skill: {}", name);
+        tracing::debug!("Removed skill: {}", name);
         Ok(())
     }
 
@@ -598,9 +604,8 @@ impl SkillRegistry {
 
 /// Load and validate a single SKILL.md file from disk.
 ///
-/// Shared implementation used by both `SkillRegistry::load_skill_md` (discovery)
-/// and `SkillRegistry::prepare_install_to_disk` (installation). This avoids
-/// duplicating the read/parse/validate/hash pipeline.
+/// Reads the file, checks for symlinks and size limits, then delegates to
+/// `build_loaded_skill` for parsing, validation, and construction.
 async fn load_and_validate_skill(
     path: &Path,
     trust: SkillTrust,
@@ -642,17 +647,51 @@ async fn load_and_validate_skill(
         reason: format!("Invalid UTF-8: {}", e),
     })?;
 
-    // Normalize line endings before parsing to handle CRLF
     let normalized_content = normalize_line_endings(&raw_content);
+    let error_label = path.display().to_string();
 
-    // Parse SKILL.md
-    let parsed = parse_skill_md(&normalized_content).map_err(|e: SkillParseError| match e {
+    build_loaded_skill(&normalized_content, &error_label, trust, source).await
+}
+
+/// Load and validate a skill from in-memory content (no disk I/O).
+///
+/// Used for bundled skills compiled into the binary.
+async fn load_from_content(
+    raw_content: &str,
+    trust: SkillTrust,
+    source: SkillSource,
+) -> Result<(String, LoadedSkill), SkillRegistryError> {
+    if raw_content.len() as u64 > MAX_PROMPT_FILE_SIZE {
+        return Err(SkillRegistryError::FileTooLarge {
+            name: "(bundled)".to_string(),
+            size: raw_content.len() as u64,
+            max: MAX_PROMPT_FILE_SIZE,
+        });
+    }
+
+    let normalized_content = normalize_line_endings(raw_content);
+
+    build_loaded_skill(&normalized_content, "(bundled)", trust, source).await
+}
+
+/// Parse, validate, gate-check, and construct a `LoadedSkill` from normalized content.
+///
+/// Shared implementation used by both `load_and_validate_skill` (disk) and
+/// `load_from_content` (in-memory). The `error_label` is used in error messages
+/// to identify the source (file path or "(bundled)").
+async fn build_loaded_skill(
+    normalized_content: &str,
+    error_label: &str,
+    trust: SkillTrust,
+    source: SkillSource,
+) -> Result<(String, LoadedSkill), SkillRegistryError> {
+    let parsed = parse_skill_md(normalized_content).map_err(|e: SkillParseError| match e {
         SkillParseError::InvalidName { ref name } => SkillRegistryError::ParseError {
             name: name.clone(),
             reason: e.to_string(),
         },
         _ => SkillRegistryError::ParseError {
-            name: path.display().to_string(),
+            name: error_label.to_string(),
             reason: e.to_string(),
         },
     })?;
@@ -675,89 +714,6 @@ async fn load_and_validate_skill(
 
     // Check token budget (reject if prompt is > 2x declared budget)
     // ~4 bytes per token for English prose = ~0.25 tokens per byte
-    let approx_tokens = (prompt_content.len() as f64 * 0.25) as usize;
-    let declared = manifest.activation.max_context_tokens;
-    if declared > 0 && approx_tokens > declared * 2 {
-        return Err(SkillRegistryError::TokenBudgetExceeded {
-            name: manifest.name.clone(),
-            approx_tokens,
-            declared,
-        });
-    }
-
-    // Compute content hash
-    let content_hash = compute_hash(&prompt_content);
-
-    // Compile regex patterns
-    let compiled_patterns = LoadedSkill::compile_patterns(&manifest.activation.patterns);
-
-    // Pre-compute lowercased keywords and tags for efficient scoring
-    let lowercased_keywords = to_lowercase_vec(&manifest.activation.keywords);
-    let lowercased_exclude_keywords = to_lowercase_vec(&manifest.activation.exclude_keywords);
-    let lowercased_tags = to_lowercase_vec(&manifest.activation.tags);
-
-    let name = manifest.name.clone();
-    let skill = LoadedSkill {
-        manifest,
-        prompt_content,
-        trust,
-        source,
-        content_hash,
-        compiled_patterns,
-        lowercased_keywords,
-        lowercased_exclude_keywords,
-        lowercased_tags,
-    };
-
-    Ok((name, skill))
-}
-
-/// Load and validate a skill from in-memory content (no disk I/O).
-///
-/// Used for bundled skills compiled into the binary.
-async fn load_from_content(
-    raw_content: &str,
-    trust: SkillTrust,
-    source: SkillSource,
-) -> Result<(String, LoadedSkill), SkillRegistryError> {
-    if raw_content.len() as u64 > MAX_PROMPT_FILE_SIZE {
-        return Err(SkillRegistryError::FileTooLarge {
-            name: "(bundled)".to_string(),
-            size: raw_content.len() as u64,
-            max: MAX_PROMPT_FILE_SIZE,
-        });
-    }
-
-    let normalized_content = normalize_line_endings(raw_content);
-
-    let parsed = parse_skill_md(&normalized_content).map_err(|e: SkillParseError| match e {
-        SkillParseError::InvalidName { ref name } => SkillRegistryError::ParseError {
-            name: name.clone(),
-            reason: e.to_string(),
-        },
-        _ => SkillRegistryError::ParseError {
-            name: "(bundled)".to_string(),
-            reason: e.to_string(),
-        },
-    })?;
-
-    let manifest = parsed.manifest;
-    let prompt_content = parsed.prompt_content;
-
-    // Check gating requirements
-    if let Some(ref meta) = manifest.metadata
-        && let Some(ref openclaw) = meta.openclaw
-    {
-        let result = gating::check_requirements(&openclaw.requires).await;
-        if !result.passed {
-            return Err(SkillRegistryError::GatingFailed {
-                name: manifest.name.clone(),
-                reason: result.failures.join("; "),
-            });
-        }
-    }
-
-    // Check token budget
     let approx_tokens = (prompt_content.len() as f64 * 0.25) as usize;
     let declared = manifest.activation.max_context_tokens;
     if declared > 0 && approx_tokens > declared * 2 {
