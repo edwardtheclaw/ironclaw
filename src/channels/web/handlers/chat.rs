@@ -184,7 +184,7 @@ pub async fn chat_auth_token_handler(
                         setup_url: None,
                     },
                 );
-            } else {
+            } else if result.activated {
                 clear_auth_mode(&state, &user.user_id).await;
 
                 state.sse.broadcast_for_user(
@@ -195,6 +195,52 @@ pub async fn chat_auth_token_handler(
                         message: result.message,
                     },
                 );
+            } else {
+                match ext_mgr
+                    .activate_or_prepare(&req.extension_name, &user.user_id)
+                    .await
+                {
+                    Ok(crate::extensions::ActivationFlowResult::Activated(activate_result)) => {
+                        clear_auth_mode(&state, &user.user_id).await;
+                        resp = ActionResponse::ok(activate_result.message.clone());
+                        resp.activated = Some(true);
+                        state.sse.broadcast_for_user(
+                            &user.user_id,
+                            AppEvent::AuthCompleted {
+                                extension_name: req.extension_name.clone(),
+                                success: true,
+                                message: activate_result.message,
+                            },
+                        );
+                    }
+                    Ok(crate::extensions::ActivationFlowResult::Pending(auth_result)) => {
+                        resp = crate::channels::web::server::pending_auth_action_response(
+                            &req.extension_name,
+                            &auth_result,
+                        );
+                        state.sse.broadcast_for_user(
+                            &user.user_id,
+                            AppEvent::AuthRequired {
+                                extension_name: req.extension_name.clone(),
+                                instructions: resp.instructions.clone(),
+                                auth_url: auth_result.auth_url().map(String::from),
+                                setup_url: auth_result.setup_url().map(String::from),
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        let msg = err.to_string();
+                        resp = ActionResponse::fail(msg.clone());
+                        state.sse.broadcast_for_user(
+                            &user.user_id,
+                            AppEvent::AuthCompleted {
+                                extension_name: req.extension_name.clone(),
+                                success: false,
+                                message: msg,
+                            },
+                        );
+                    }
+                }
             }
 
             Ok(Json(resp))

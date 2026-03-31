@@ -282,7 +282,7 @@ async fn handle_client_message(
                                     setup_url: None,
                                 },
                             );
-                        } else {
+                        } else if result.activated {
                             crate::channels::web::server::clear_auth_mode(state, user_id).await;
                             state.sse.broadcast_for_user(
                                 user_id,
@@ -292,6 +292,48 @@ async fn handle_client_message(
                                     message: result.message,
                                 },
                             );
+                        } else {
+                            match ext_mgr.activate_or_prepare(&extension_name, user_id).await {
+                                Ok(crate::extensions::ActivationFlowResult::Activated(
+                                    activate_result,
+                                )) => {
+                                    crate::channels::web::server::clear_auth_mode(state, user_id)
+                                        .await;
+                                    state.sse.broadcast_for_user(
+                                        user_id,
+                                        crate::channels::web::types::AppEvent::AuthCompleted {
+                                            extension_name,
+                                            success: true,
+                                            message: activate_result.message,
+                                        },
+                                    );
+                                }
+                                Ok(crate::extensions::ActivationFlowResult::Pending(
+                                    auth_result,
+                                )) => {
+                                    state.sse.broadcast_for_user(
+                                        user_id,
+                                        crate::channels::web::types::AppEvent::AuthRequired {
+                                            extension_name: extension_name.clone(),
+                                            instructions: auth_result
+                                                .instructions()
+                                                .map(String::from),
+                                            auth_url: auth_result.auth_url().map(String::from),
+                                            setup_url: auth_result.setup_url().map(String::from),
+                                        },
+                                    );
+                                }
+                                Err(err) => {
+                                    state.sse.broadcast_for_user(
+                                        user_id,
+                                        crate::channels::web::types::AppEvent::AuthCompleted {
+                                            extension_name,
+                                            success: false,
+                                            message: err.to_string(),
+                                        },
+                                    );
+                                }
+                            }
                         }
                     }
                     Err(e) => {

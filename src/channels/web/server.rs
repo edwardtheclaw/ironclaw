@@ -1474,6 +1474,28 @@ async fn chat_approval_handler(
     ))
 }
 
+pub(crate) fn auth_result_opens_setup(
+    auth_result: &crate::extensions::AuthResult,
+) -> bool {
+    auth_result.is_awaiting_token() || auth_result.status_str() == "needs_setup"
+}
+
+pub(crate) fn pending_auth_action_response(
+    name: &str,
+    auth_result: &crate::extensions::AuthResult,
+) -> ActionResponse {
+    let mut resp = ActionResponse::fail(
+        auth_result
+            .instructions()
+            .map(String::from)
+            .unwrap_or_else(|| format!("'{}' requires setup.", name)),
+    );
+    resp.auth_url = auth_result.auth_url().map(String::from);
+    resp.awaiting_token = Some(auth_result_opens_setup(auth_result));
+    resp.instructions = auth_result.instructions().map(String::from);
+    resp
+}
+
 /// Submit an auth token directly to the extension manager, bypassing the message pipeline.
 ///
 /// The token never touches the LLM, chat history, or SSE stream.
@@ -1525,14 +1547,48 @@ async fn chat_auth_token_handler(
                     },
                 );
             } else {
-                state.sse.broadcast_for_user(
-                    &user.user_id,
-                    AppEvent::AuthCompleted {
-                        extension_name: req.extension_name.clone(),
-                        success: false,
-                        message: result.message,
-                    },
-                );
+                match ext_mgr
+                    .activate_or_prepare(&req.extension_name, &user.user_id)
+                    .await
+                {
+                    Ok(crate::extensions::ActivationFlowResult::Activated(activate_result)) => {
+                        clear_auth_mode(&state, &user.user_id).await;
+                        resp = ActionResponse::ok(activate_result.message.clone());
+                        resp.activated = Some(true);
+                        state.sse.broadcast_for_user(
+                            &user.user_id,
+                            AppEvent::AuthCompleted {
+                                extension_name: req.extension_name.clone(),
+                                success: true,
+                                message: activate_result.message,
+                            },
+                        );
+                    }
+                    Ok(crate::extensions::ActivationFlowResult::Pending(auth_result)) => {
+                        resp = pending_auth_action_response(&req.extension_name, &auth_result);
+                        state.sse.broadcast_for_user(
+                            &user.user_id,
+                            AppEvent::AuthRequired {
+                                extension_name: req.extension_name.clone(),
+                                instructions: resp.instructions.clone(),
+                                auth_url: auth_result.auth_url().map(String::from),
+                                setup_url: auth_result.setup_url().map(String::from),
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        let msg = err.to_string();
+                        resp = ActionResponse::fail(msg.clone());
+                        state.sse.broadcast_for_user(
+                            &user.user_id,
+                            AppEvent::AuthCompleted {
+                                extension_name: req.extension_name.clone(),
+                                success: false,
+                                message: msg,
+                            },
+                        );
+                    }
+                }
             }
 
             Ok(Json(resp))
@@ -2244,8 +2300,8 @@ async fn extensions_activate_handler(
         "Extension manager not available (secrets store required)".to_string(),
     ))?;
 
-    match ext_mgr.activate(&name, &user.user_id).await {
-        Ok(result) => {
+    match ext_mgr.activate_or_prepare(&name, &user.user_id).await {
+        Ok(crate::extensions::ActivationFlowResult::Activated(result)) => {
             tracing::info!(
                 extension = %name,
                 "extensions_activate_handler: activation succeeded"
@@ -2262,62 +2318,10 @@ async fn extensions_activate_handler(
             }
             Ok(Json(resp))
         }
-        Err(activate_err) => {
-            let needs_auth = matches!(
-                &activate_err,
-                crate::extensions::ExtensionError::AuthRequired
-            );
-
-            tracing::trace!(
-                extension = %name,
-                error = %activate_err,
-                needs_auth = needs_auth,
-                "extensions_activate_handler: activation failed, attempting auth fallback"
-            );
-
-            if !needs_auth {
-                return Ok(Json(ActionResponse::fail(activate_err.to_string())));
-            }
-
-            // Activation failed due to auth; try authenticating first.
-            match ext_mgr.auth(&name, &user.user_id).await {
-                Ok(auth_result) if auth_result.is_authenticated() => {
-                    tracing::trace!(
-                        extension = %name,
-                        "extensions_activate_handler: auth reports authenticated, retrying activate"
-                    );
-                    // Auth succeeded, retry activation.
-                    match ext_mgr.activate(&name, &user.user_id).await {
-                        Ok(result) => Ok(Json(ActionResponse::ok(result.message))),
-                        Err(e) => {
-                            tracing::warn!(
-                                extension = %name,
-                                error = %e,
-                                "extensions_activate_handler: retry after auth still failed"
-                            );
-                            Ok(Json(ActionResponse::fail(e.to_string())))
-                        }
-                    }
-                }
-                Ok(auth_result) => {
-                    // Auth in progress (OAuth URL or awaiting manual token).
-                    let mut resp = ActionResponse::fail(
-                        auth_result
-                            .instructions()
-                            .map(String::from)
-                            .unwrap_or_else(|| format!("'{}' requires authentication.", name)),
-                    );
-                    resp.auth_url = auth_result.auth_url().map(String::from);
-                    resp.awaiting_token = Some(auth_result.is_awaiting_token());
-                    resp.instructions = auth_result.instructions().map(String::from);
-                    Ok(Json(resp))
-                }
-                Err(auth_err) => Ok(Json(ActionResponse::fail(format!(
-                    "Authentication failed: {}",
-                    auth_err
-                )))),
-            }
-        }
+        Ok(crate::extensions::ActivationFlowResult::Pending(auth_result)) => Ok(Json(
+            pending_auth_action_response(&name, &auth_result),
+        )),
+        Err(err) => Ok(Json(ActionResponse::fail(err.to_string()))),
     }
 }
 
@@ -2908,7 +2912,7 @@ mod tests {
         ExtensionActivationStatus, classify_wasm_channel_activation,
     };
     use crate::cli::oauth_defaults;
-    use crate::extensions::{ExtensionKind, InstalledExtension};
+    use crate::extensions::{AuthResult, ExtensionKind, InstalledExtension};
     use crate::testing::credentials::TEST_GATEWAY_CRYPTO_KEY;
 
     #[test]
@@ -3288,6 +3292,89 @@ mod tests {
             client_id_secret_name: None,
             created_at: std::time::Instant::now(),
         }
+    }
+
+    #[test]
+    fn test_pending_auth_action_response_treats_needs_setup_as_setup_flow() {
+        let auth_result = AuthResult::needs_setup(
+            "whatsapp",
+            ExtensionKind::WasmChannel,
+            "Provide your permanent access token.".to_string(),
+            Some("https://business.facebook.com".to_string()),
+        );
+
+        assert!(auth_result_opens_setup(&auth_result));
+
+        let resp = pending_auth_action_response("whatsapp", &auth_result);
+        assert_eq!(resp.success, false);
+        assert_eq!(resp.awaiting_token, Some(true));
+        assert_eq!(resp.instructions.as_deref(), Some("Provide your permanent access token."));
+    }
+
+    #[tokio::test]
+    async fn test_extensions_activate_returns_pending_auth_for_setup_required_channel() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let secrets = test_secrets_store();
+        let (ext_mgr, _wasm_tools_dir, wasm_channels_dir) = test_ext_mgr(secrets);
+
+        let channel_name = "manual-activate";
+        std::fs::write(
+            wasm_channels_dir.path().join(format!("{channel_name}.wasm")),
+            b"\0asm fake",
+        )
+        .expect("write fake wasm");
+        let caps = serde_json::json!({
+            "type": "channel",
+            "name": channel_name,
+            "setup": {
+                "required_secrets": [
+                    {"name": "BOT_TOKEN", "prompt": "Enter bot token for activation"}
+                ]
+            }
+        });
+        std::fs::write(
+            wasm_channels_dir
+                .path()
+                .join(format!("{channel_name}.capabilities.json")),
+            serde_json::to_string(&caps).expect("serialize caps"),
+        )
+        .expect("write capabilities");
+
+        let state = test_gateway_state(Some(ext_mgr));
+        let app = Router::new()
+            .route(
+                "/api/extensions/{name}/activate",
+                post(extensions_activate_handler),
+            )
+            .with_state(state);
+
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/extensions/{channel_name}/activate"))
+            .body(Body::empty())
+            .expect("request");
+        req.extensions_mut().insert(UserIdentity {
+            user_id: "test".to_string(),
+            workspace_read_scopes: Vec::new(),
+        });
+
+        let resp = ServiceExt::<axum::http::Request<Body>>::oneshot(app, req)
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 64)
+            .await
+            .expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+        assert_eq!(parsed["success"], serde_json::Value::Bool(false));
+        assert_eq!(parsed["awaiting_token"], serde_json::Value::Bool(true));
+        assert!(parsed["instructions"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Enter bot token"));
     }
 
     #[tokio::test]

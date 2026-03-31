@@ -1610,6 +1610,19 @@ impl Agent {
         }
     }
 
+    fn format_secure_auth_instructions(instructions: &str) -> String {
+        let trimmed = instructions.trim();
+        let secure_note =
+            "Send the requested credential in your next message. It will be handled securely and will not be added to normal chat history.";
+        if trimmed.is_empty() {
+            return secure_note.to_string();
+        }
+        if trimmed.contains("handled securely") || trimmed.contains("normal chat history") {
+            return trimmed.to_string();
+        }
+        format!("{trimmed}\n\n{secure_note}")
+    }
+
     /// Handle an auth-required result from a tool execution.
     ///
     /// Enters auth mode on the thread, completes + persists the turn,
@@ -1624,6 +1637,7 @@ impl Agent {
         ext_name: String,
         instructions: String,
     ) {
+        let instructions = Self::format_secure_auth_instructions(&instructions);
         let auth_data = parse_auth_result(tool_result);
         {
             let mut sess = session.lock().await;
@@ -1707,7 +1721,8 @@ impl Agent {
                     .await;
                 Ok(Some(result.message))
             }
-            Ok(result) => {
+            Ok(result) if result.verification.is_some() => {
+                let instructions = Self::format_secure_auth_instructions(&result.message);
                 {
                     let mut sess = session.lock().await;
                     if let Some(thread) = sess.threads.get_mut(&thread_id) {
@@ -1720,19 +1735,83 @@ impl Agent {
                         &message.channel,
                         StatusUpdate::AuthRequired {
                             extension_name: pending.extension_name.clone(),
-                            instructions: Some(result.message.clone()),
+                            instructions: Some(instructions.clone()),
                             auth_url: None,
                             setup_url: None,
                         },
                         &message.metadata,
                     )
                     .await;
-                Ok(Some(result.message))
+                Ok(Some(instructions))
+            }
+            Ok(result) => {
+                match ext_mgr
+                    .activate_or_prepare(&pending.extension_name, &message.user_id)
+                    .await
+                {
+                    Ok(crate::extensions::ActivationFlowResult::Activated(activate_result)) => {
+                        let _ = self
+                            .channels
+                            .send_status(
+                                &message.channel,
+                                StatusUpdate::AuthCompleted {
+                                    extension_name: pending.extension_name.clone(),
+                                    success: true,
+                                    message: activate_result.message.clone(),
+                                },
+                                &message.metadata,
+                            )
+                            .await;
+                        Ok(Some(activate_result.message))
+                    }
+                    Ok(crate::extensions::ActivationFlowResult::Pending(auth_result)) => {
+                        let instructions = Self::format_secure_auth_instructions(
+                            auth_result.instructions().unwrap_or(&result.message),
+                        );
+                        {
+                            let mut sess = session.lock().await;
+                            if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                                thread.enter_auth_mode(pending.extension_name.clone());
+                            }
+                        }
+                        let _ = self
+                            .channels
+                            .send_status(
+                                &message.channel,
+                                StatusUpdate::AuthRequired {
+                                    extension_name: pending.extension_name.clone(),
+                                    instructions: Some(instructions.clone()),
+                                    auth_url: auth_result.auth_url().map(String::from),
+                                    setup_url: auth_result.setup_url().map(String::from),
+                                },
+                                &message.metadata,
+                            )
+                            .await;
+                        Ok(Some(instructions))
+                    }
+                    Err(err) => {
+                        let msg = err.to_string();
+                        let _ = self
+                            .channels
+                            .send_status(
+                                &message.channel,
+                                StatusUpdate::AuthCompleted {
+                                    extension_name: pending.extension_name.clone(),
+                                    success: false,
+                                    message: msg.clone(),
+                                },
+                                &message.metadata,
+                            )
+                            .await;
+                        Ok(Some(msg))
+                    }
+                }
             }
             Err(e) => {
                 let msg = e.to_string();
                 // Token validation errors: re-enter auth mode and re-prompt
                 if matches!(e, crate::extensions::ExtensionError::ValidationFailed(_)) {
+                    let instructions = Self::format_secure_auth_instructions(&msg);
                     {
                         let mut sess = session.lock().await;
                         if let Some(thread) = sess.threads.get_mut(&thread_id) {
@@ -1745,14 +1824,14 @@ impl Agent {
                             &message.channel,
                             StatusUpdate::AuthRequired {
                                 extension_name: pending.extension_name.clone(),
-                                instructions: Some(msg.clone()),
+                                instructions: Some(instructions.clone()),
                                 auth_url: None,
                                 setup_url: None,
                             },
                             &message.metadata,
                         )
                         .await;
-                    return Ok(Some(msg));
+                    return Ok(Some(instructions));
                 }
                 // Infrastructure errors
                 let _ = self
@@ -2178,6 +2257,16 @@ mod tests {
             }
             _ => panic!("Expected approval rejection message"),
         }
+    }
+
+    #[test]
+    fn test_format_secure_auth_instructions_appends_secure_note_once() {
+        let formatted = Agent::format_secure_auth_instructions("Provide your bot token.");
+        assert!(formatted.contains("Provide your bot token."));
+        assert!(formatted.contains("handled securely"));
+
+        let already = Agent::format_secure_auth_instructions(&formatted);
+        assert_eq!(already, formatted);
     }
 
     #[test]

@@ -18,9 +18,10 @@ use crate::channels::{ChannelManager, OutgoingResponse};
 use crate::extensions::discovery::OnlineDiscovery;
 use crate::extensions::registry::ExtensionRegistry;
 use crate::extensions::{
-    ActivateResult, AuthResult, ConfigureResult, ExtensionError, ExtensionKind, ExtensionSource,
-    InstallResult, InstalledExtension, RegistryEntry, ResultSource, SearchResult, ToolAuthState,
-    UpgradeOutcome, UpgradeResult, VerificationChallenge,
+    ActivateResult, ActivationFlowResult, AuthResult, ConfigureResult, ExtensionError,
+    ExtensionKind, ExtensionSource, InstallResult, InstalledExtension, RegistryEntry,
+    ResultSource, SearchResult, ToolAuthState, UpgradeOutcome, UpgradeResult,
+    VerificationChallenge,
 };
 use crate::hooks::HookRegistry;
 use crate::pairing::PairingStore;
@@ -1341,6 +1342,37 @@ impl ExtensionManager {
             ExtensionKind::WasmTool => self.activate_wasm_tool(name, user_id).await,
             ExtensionKind::WasmChannel => self.activate_wasm_channel(name, user_id).await,
             ExtensionKind::ChannelRelay => self.activate_channel_relay(name, user_id).await,
+        }
+    }
+
+    /// Attempt activation and, if credentials/setup are missing, return the
+    /// next backend-driven auth/setup step instead of a dead-end activation error.
+    pub async fn activate_or_prepare(
+        &self,
+        name: &str,
+        user_id: &str,
+    ) -> Result<ActivationFlowResult, ExtensionError> {
+        match self.activate(name, user_id).await {
+            Ok(result) => Ok(ActivationFlowResult::Activated(result)),
+            Err(activate_err)
+                if matches!(
+                    activate_err,
+                    ExtensionError::AuthRequired | ExtensionError::SetupRequired(_)
+                ) =>
+            {
+                match self.auth(name, user_id).await {
+                    Ok(auth_result) if auth_result.is_authenticated() => {
+                        let result = self.activate(name, user_id).await?;
+                        Ok(ActivationFlowResult::Activated(result))
+                    }
+                    Ok(auth_result) => Ok(ActivationFlowResult::Pending(auth_result)),
+                    Err(auth_err) => Err(ExtensionError::ActivationFailed(format!(
+                        "Activation failed ({}), and auth/setup fallback also failed: {}",
+                        activate_err, auth_err
+                    ))),
+                }
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -3755,8 +3787,8 @@ impl ExtensionManager {
         // the tool first, then starts the OAuth flow to obtain the token.
         let auth_state = self.check_tool_auth_status(name, user_id).await;
         if auth_state == ToolAuthState::NeedsSetup {
-            return Err(ExtensionError::ActivationFailed(format!(
-                "Tool '{}' requires configuration. Use the setup form to provide credentials.",
+            return Err(ExtensionError::SetupRequired(format!(
+                "Tool '{}' requires configuration.",
                 name
             )));
         }
@@ -3848,6 +3880,17 @@ impl ExtensionManager {
             }
         }
 
+        // Check auth/setup status before requiring runtime infrastructure so
+        // installed-but-unconfigured channels can still enter the shared
+        // credential flow even in tests or CLI contexts without a hot runtime.
+        let auth_state = self.check_channel_auth_status(name, user_id).await;
+        if auth_state != ToolAuthState::Ready && auth_state != ToolAuthState::NoAuth {
+            return Err(ExtensionError::SetupRequired(format!(
+                "Channel '{}' requires configuration.",
+                name
+            )));
+        }
+
         // Verify runtime infrastructure is available and clone Arcs so we don't
         // hold the RwLock guard across awaits.
         let (
@@ -3869,15 +3912,6 @@ impl ExtensionManager {
                 rt.wasm_channel_owner_ids.clone(),
             )
         };
-
-        // Check auth status first
-        let auth_state = self.check_channel_auth_status(name, user_id).await;
-        if auth_state != ToolAuthState::Ready && auth_state != ToolAuthState::NoAuth {
-            return Err(ExtensionError::ActivationFailed(format!(
-                "Channel '{}' requires configuration. Use the setup form to provide credentials.",
-                name
-            )));
-        }
 
         // Load the channel from files
         let wasm_path = self.wasm_channels_dir.join(format!("{}.wasm", name));
@@ -6030,7 +6064,8 @@ mod tests {
         telegram_message_matches_verification_code,
     };
     use crate::extensions::{
-        ExtensionError, ExtensionKind, ExtensionSource, InstallResult, VerificationChallenge,
+        ActivationFlowResult, ExtensionError, ExtensionKind, ExtensionSource, InstallResult,
+        VerificationChallenge,
     };
     use crate::pairing::PairingStore;
 
@@ -7972,6 +8007,120 @@ mod tests {
         );
     }
     // ── Regression tests for PR #677 (unify-extension-lifecycle) ─────────
+
+    #[tokio::test]
+    async fn test_activate_or_prepare_returns_pending_for_setup_required_channel() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&channels_dir).unwrap();
+
+        std::fs::write(channels_dir.join("manual.wasm"), b"\0asm fake").unwrap();
+        let caps = serde_json::json!({
+            "type": "channel",
+            "name": "manual",
+            "setup": {
+                "required_secrets": [
+                    {"name": "BOT_TOKEN", "prompt": "Enter bot token for manual setup"}
+                ]
+            }
+        });
+        std::fs::write(
+            channels_dir.join("manual.capabilities.json"),
+            serde_json::to_string(&caps).unwrap(),
+        )
+        .unwrap();
+
+        let mgr = make_manager_custom_dirs(dir.path().join("tools"), channels_dir);
+
+        let result = mgr
+            .activate_or_prepare("manual", "test")
+            .await
+            .expect("activate_or_prepare should produce a next step");
+
+        match result {
+            ActivationFlowResult::Pending(auth_result) => {
+                assert!(auth_result.is_awaiting_token());
+                assert_eq!(auth_result.status_str(), "awaiting_token");
+                assert!(auth_result
+                    .instructions()
+                    .unwrap_or_default()
+                    .contains("Enter bot token"));
+            }
+            other => panic!("expected pending auth result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_activate_or_prepare_prompts_for_next_missing_secret() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&channels_dir).unwrap();
+
+        std::fs::write(channels_dir.join("multi.wasm"), b"\0asm fake").unwrap();
+        let caps = serde_json::json!({
+            "type": "channel",
+            "name": "multi",
+            "setup": {
+                "required_secrets": [
+                    {"name": "SECRET_A", "prompt": "Enter secret A (at least 30 chars for validation)"},
+                    {"name": "SECRET_B", "prompt": "Enter secret B (at least 30 chars for validation)"}
+                ]
+            }
+        });
+        std::fs::write(
+            channels_dir.join("multi.capabilities.json"),
+            serde_json::to_string(&caps).unwrap(),
+        )
+        .unwrap();
+
+        let mgr = make_manager_custom_dirs(dir.path().join("tools"), channels_dir);
+        mgr.secrets
+            .create(
+                "test",
+                crate::secrets::CreateSecretParams::new("SECRET_A", "value-a"),
+            )
+            .await
+            .expect("store SECRET_A");
+
+        let result = mgr
+            .activate_or_prepare("multi", "test")
+            .await
+            .expect("activate_or_prepare should prompt for the next secret");
+
+        match result {
+            ActivationFlowResult::Pending(auth_result) => {
+                assert!(auth_result.is_awaiting_token());
+                assert!(auth_result
+                    .instructions()
+                    .unwrap_or_default()
+                    .contains("Enter secret B"));
+            }
+            other => panic!("expected pending auth result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_activate_or_prepare_preserves_real_activation_failures() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&channels_dir).unwrap();
+
+        std::fs::write(channels_dir.join("broken.wasm"), b"not-real-wasm").unwrap();
+        let caps = serde_json::json!({
+            "type": "channel",
+            "name": "broken"
+        });
+        std::fs::write(
+            channels_dir.join("broken.capabilities.json"),
+            serde_json::to_string(&caps).unwrap(),
+        )
+        .unwrap();
+
+        let mgr = make_manager_custom_dirs(dir.path().join("tools"), channels_dir);
+
+        let result = mgr.activate_or_prepare("broken", "test").await;
+        assert!(matches!(result, Err(ExtensionError::ActivationFailed(_))));
+    }
 
     #[tokio::test]
     async fn test_configure_token_picks_first_missing_secret() {

@@ -310,52 +310,18 @@ impl Tool for ToolActivateTool {
 
         let name = require_str(&params, "name")?;
 
-        match self.manager.activate(name, &ctx.user_id).await {
-            Ok(result) => {
+        match self.manager.activate_or_prepare(name, &ctx.user_id).await {
+            Ok(crate::extensions::ActivationFlowResult::Activated(result)) => {
                 let output = serde_json::to_value(&result)
                     .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"}));
                 Ok(ToolOutput::success(output, start.elapsed()))
             }
-            Err(activate_err) => {
-                let err_str = activate_err.to_string();
-                let needs_auth = err_str.contains("authentication")
-                    || err_str.contains("401")
-                    || err_str.contains("Unauthorized")
-                    || err_str.contains("not authenticated");
-
-                if !needs_auth {
-                    return Err(ToolError::ExecutionFailed(err_str));
-                }
-
-                // Activation failed due to missing auth; initiate auth flow
-                // so the agent loop can show the auth card.
-                match self.manager.auth(name, &ctx.user_id).await {
-                    Ok(auth_result) if auth_result.is_authenticated() => {
-                        // Auth succeeded (e.g. env var was set); retry activation.
-                        let result = self
-                            .manager
-                            .activate(name, &ctx.user_id)
-                            .await
-                            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-                        let output = serde_json::to_value(&result).unwrap_or_else(
-                            |_| serde_json::json!({"error": "serialization failed"}),
-                        );
-                        Ok(ToolOutput::success(output, start.elapsed()))
-                    }
-                    Ok(auth_result) => {
-                        // Auth needs user input (awaiting_token). Return the auth
-                        // result so detect_auth_awaiting picks it up.
-                        let output = serde_json::to_value(&auth_result).unwrap_or_else(
-                            |_| serde_json::json!({"error": "serialization failed"}),
-                        );
-                        Ok(ToolOutput::success(output, start.elapsed()))
-                    }
-                    Err(auth_err) => Err(ToolError::ExecutionFailed(format!(
-                        "Activation failed ({}), and authentication also failed: {}",
-                        err_str, auth_err
-                    ))),
-                }
+            Ok(crate::extensions::ActivationFlowResult::Pending(auth_result)) => {
+                let output = serde_json::to_value(&auth_result)
+                    .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"}));
+                Ok(ToolOutput::success(output, start.elapsed()))
             }
+            Err(err) => Err(ToolError::ExecutionFailed(err.to_string())),
         }
     }
 }
@@ -755,6 +721,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tool_activate_returns_pending_auth_for_setup_required_channel() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&channels_dir).expect("create channels dir");
+
+        std::fs::write(channels_dir.join("manual.wasm"), b"\0asm fake").expect("write wasm");
+        let caps = serde_json::json!({
+            "type": "channel",
+            "name": "manual",
+            "setup": {
+                "required_secrets": [
+                    {"name": "BOT_TOKEN", "prompt": "Enter bot token for activation"}
+                ]
+            }
+        });
+        std::fs::write(
+            channels_dir.join("manual.capabilities.json"),
+            serde_json::to_string(&caps).expect("serialize caps"),
+        )
+        .expect("write capabilities");
+
+        let tool = ToolActivateTool {
+            manager: test_manager_with_dirs(dir.path().join("tools"), channels_dir),
+        };
+        let ctx = JobContext::with_user("test", "activate", "activate extension");
+
+        let output = tool
+            .execute(serde_json::json!({"name": "manual"}), &ctx)
+            .await
+            .expect("tool execute should succeed");
+
+        assert_eq!(output.result["name"], "manual");
+        assert_eq!(output.result["status"], "awaiting_token");
+        assert_eq!(output.result["awaiting_token"], true);
+        assert!(output.result["instructions"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Enter bot token"));
+    }
+
     #[test]
     fn test_tool_upgrade_schema() {
         use crate::tools::tool::ApprovalRequirement;
@@ -789,10 +796,23 @@ mod tests {
 
     /// Create a stub manager for schema tests (these don't call execute).
     fn test_manager_stub() -> Arc<ExtensionManager> {
+        test_manager_with_dirs(
+            std::env::temp_dir().join("ironclaw-test-tools"),
+            std::env::temp_dir().join("ironclaw-test-channels"),
+        )
+    }
+
+    fn test_manager_with_dirs(
+        tools_dir: std::path::PathBuf,
+        channels_dir: std::path::PathBuf,
+    ) -> Arc<ExtensionManager> {
         use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
         use crate::testing::credentials::TEST_CRYPTO_KEY;
         use crate::tools::ToolRegistry;
         use crate::tools::mcp::session::McpSessionManager;
+
+        std::fs::create_dir_all(&tools_dir).ok();
+        std::fs::create_dir_all(&channels_dir).ok();
 
         let master_key = secrecy::SecretString::from(TEST_CRYPTO_KEY.to_string());
         let crypto = Arc::new(SecretsCrypto::new(master_key).unwrap());
@@ -804,8 +824,8 @@ mod tests {
             Arc::new(ToolRegistry::new()),
             None,
             None,
-            std::env::temp_dir().join("ironclaw-test-tools"),
-            std::env::temp_dir().join("ironclaw-test-channels"),
+            tools_dir,
+            channels_dir,
             None,
             "test".to_string(),
             None,

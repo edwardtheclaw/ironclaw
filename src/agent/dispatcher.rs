@@ -1042,10 +1042,11 @@ pub(super) fn parse_auth_result(result: &Result<String, Error>) -> ParsedAuthDat
     }
 }
 
-/// Check if a tool_auth result indicates the extension is awaiting a token.
+/// Check if a tool auth/setup result should enter secure auth mode.
 ///
-/// Returns `Some((extension_name, instructions))` if the tool result contains
-/// `awaiting_token: true`, meaning the thread should enter auth mode.
+/// Returns `Some((extension_name, instructions))` when `tool_auth` or
+/// `tool_activate` reports either `awaiting_token` or `needs_setup`, meaning
+/// the next user message should be intercepted as a secure credential submission.
 pub(super) fn check_auth_required(
     tool_name: &str,
     result: &Result<String, Error>,
@@ -1055,7 +1056,13 @@ pub(super) fn check_auth_required(
     }
     let output = result.as_ref().ok()?;
     let parsed: serde_json::Value = serde_json::from_str(output).ok()?;
-    if parsed.get("awaiting_token") != Some(&serde_json::Value::Bool(true)) {
+    let awaiting_token = parsed.get("awaiting_token") == Some(&serde_json::Value::Bool(true));
+    let needs_setup = parsed
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(|status| status == "needs_setup")
+        .unwrap_or(false);
+    if !awaiting_token && !needs_setup {
         return None;
     }
     let name = parsed.get("name")?.as_str()?.to_string();
@@ -1673,6 +1680,25 @@ mod tests {
         let (name, instructions) = detected.unwrap();
         assert_eq!(name, "slack");
         assert!(instructions.contains("Slack Bot"));
+    }
+
+    #[test]
+    fn test_detect_auth_needs_setup_enters_secure_mode() {
+        let result: Result<String, Error> = Ok(serde_json::json!({
+            "name": "whatsapp",
+            "kind": "WasmChannel",
+            "awaiting_token": false,
+            "status": "needs_setup",
+            "instructions": "Provide your permanent access token.",
+            "setup_url": "https://business.facebook.com"
+        })
+        .to_string());
+
+        let detected = check_auth_required("tool_activate", &result);
+        assert!(detected.is_some());
+        let (name, instructions) = detected.unwrap();
+        assert_eq!(name, "whatsapp");
+        assert!(instructions.contains("permanent access token"));
     }
 
     #[test]

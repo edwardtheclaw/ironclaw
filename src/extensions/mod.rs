@@ -449,6 +449,14 @@ pub struct ActivateResult {
     pub message: String,
 }
 
+/// Shared backend outcome for "activate this extension, or tell me what
+/// credential/setup step is needed next".
+#[derive(Debug, Clone)]
+pub enum ActivationFlowResult {
+    Activated(ActivateResult),
+    Pending(AuthResult),
+}
+
 /// Result of configuring secrets for an extension.
 ///
 /// Returned by `ExtensionManager::configure()`, the single entrypoint
@@ -537,6 +545,9 @@ pub enum ExtensionError {
 
     #[error("Activation failed: {0}")]
     ActivationFailed(String),
+
+    #[error("Setup required: {0}")]
+    SetupRequired(String),
 
     #[error("Authentication required")]
     AuthRequired,
