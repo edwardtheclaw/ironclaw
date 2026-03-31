@@ -22,11 +22,12 @@ impl MemoryStore {
     pub async fn create_doc(
         &self,
         project_id: ProjectId,
+        user_id: &str,
         doc_type: DocType,
         title: &str,
         content: &str,
     ) -> Result<MemoryDoc, EngineError> {
-        let doc = MemoryDoc::new(project_id, doc_type, title, content);
+        let doc = MemoryDoc::new(project_id, user_id, doc_type, title, content);
         self.store.save_memory_doc(&doc).await?;
         Ok(doc)
     }
@@ -35,12 +36,13 @@ impl MemoryStore {
     pub async fn create_doc_from_thread(
         &self,
         project_id: ProjectId,
+        user_id: &str,
         doc_type: DocType,
         title: &str,
         content: &str,
         source_thread_id: ThreadId,
     ) -> Result<MemoryDoc, EngineError> {
-        let doc = MemoryDoc::new(project_id, doc_type, title, content)
+        let doc = MemoryDoc::new(project_id, user_id, doc_type, title, content)
             .with_source_thread(source_thread_id);
         self.store.save_memory_doc(&doc).await?;
         Ok(doc)
@@ -55,9 +57,10 @@ impl MemoryStore {
     pub async fn list_docs(
         &self,
         project_id: ProjectId,
+        user_id: &str,
         doc_type: Option<DocType>,
     ) -> Result<Vec<MemoryDoc>, EngineError> {
-        let all = self.store.list_memory_docs(project_id).await?;
+        let all = self.store.list_memory_docs(project_id, user_id).await?;
         match doc_type {
             Some(dt) => Ok(all.into_iter().filter(|d| d.doc_type == dt).collect()),
             None => Ok(all),
@@ -125,11 +128,11 @@ mod tests {
             Ok(threads.iter().find(|t| t.id == id).cloned())
         }
 
-        async fn list_threads(&self, project_id: ProjectId) -> Result<Vec<Thread>, EngineError> {
+        async fn list_threads(&self, project_id: ProjectId, user_id: &str) -> Result<Vec<Thread>, EngineError> {
             let threads = self.threads.read().await;
             Ok(threads
                 .iter()
-                .filter(|t| t.project_id == project_id)
+                .filter(|t| t.project_id == project_id && t.user_id == user_id)
                 .cloned()
                 .collect())
         }
@@ -211,11 +214,12 @@ mod tests {
         async fn list_memory_docs(
             &self,
             project_id: ProjectId,
+            user_id: &str,
         ) -> Result<Vec<MemoryDoc>, EngineError> {
             let docs = self.docs.read().await;
             Ok(docs
                 .iter()
-                .filter(|d| d.project_id == project_id)
+                .filter(|d| d.project_id == project_id && d.user_id == user_id)
                 .cloned()
                 .collect())
         }
@@ -263,11 +267,11 @@ mod tests {
             Ok(missions.iter().find(|m| m.id == id).cloned())
         }
 
-        async fn list_missions(&self, project_id: ProjectId) -> Result<Vec<Mission>, EngineError> {
+        async fn list_missions(&self, project_id: ProjectId, user_id: &str) -> Result<Vec<Mission>, EngineError> {
             let missions = self.missions.read().await;
             Ok(missions
                 .iter()
-                .filter(|m| m.project_id == project_id)
+                .filter(|m| m.project_id == project_id && m.user_id == user_id)
                 .cloned()
                 .collect())
         }
@@ -297,7 +301,7 @@ mod tests {
         let project_id = ProjectId::new();
 
         let doc = store
-            .create_doc(project_id, DocType::Summary, "Test Doc", "Some content")
+            .create_doc(project_id, "test-user", DocType::Summary, "Test Doc", "Some content")
             .await
             .unwrap();
 
@@ -323,6 +327,7 @@ mod tests {
         let doc = store
             .create_doc_from_thread(
                 project_id,
+                "test-user",
                 DocType::Lesson,
                 "Thread Lesson",
                 "Learned something",
@@ -345,23 +350,23 @@ mod tests {
         let project_b = ProjectId::new();
 
         store
-            .create_doc(project_a, DocType::Note, "A1", "content a1")
+            .create_doc(project_a, "test-user", DocType::Note, "A1", "content a1")
             .await
             .unwrap();
         store
-            .create_doc(project_a, DocType::Note, "A2", "content a2")
+            .create_doc(project_a, "test-user", DocType::Note, "A2", "content a2")
             .await
             .unwrap();
         store
-            .create_doc(project_b, DocType::Note, "B1", "content b1")
+            .create_doc(project_b, "test-user", DocType::Note, "B1", "content b1")
             .await
             .unwrap();
 
-        let docs_a = store.list_docs(project_a, None).await.unwrap();
+        let docs_a = store.list_docs(project_a, "test-user", None).await.unwrap();
         assert_eq!(docs_a.len(), 2);
         assert!(docs_a.iter().all(|d| d.project_id == project_a));
 
-        let docs_b = store.list_docs(project_b, None).await.unwrap();
+        let docs_b = store.list_docs(project_b, "test-user", None).await.unwrap();
         assert_eq!(docs_b.len(), 1);
         assert_eq!(docs_b[0].title, "B1");
     }
@@ -372,27 +377,27 @@ mod tests {
         let project_id = ProjectId::new();
 
         store
-            .create_doc(project_id, DocType::Summary, "S1", "summary content")
+            .create_doc(project_id, "test-user", DocType::Summary, "S1", "summary content")
             .await
             .unwrap();
         store
-            .create_doc(project_id, DocType::Lesson, "L1", "lesson content")
+            .create_doc(project_id, "test-user", DocType::Lesson, "L1", "lesson content")
             .await
             .unwrap();
         store
-            .create_doc(project_id, DocType::Summary, "S2", "another summary")
+            .create_doc(project_id, "test-user", DocType::Summary, "S2", "another summary")
             .await
             .unwrap();
 
         let summaries = store
-            .list_docs(project_id, Some(DocType::Summary))
+            .list_docs(project_id, "test-user", Some(DocType::Summary))
             .await
             .unwrap();
         assert_eq!(summaries.len(), 2);
         assert!(summaries.iter().all(|d| d.doc_type == DocType::Summary));
 
         let lessons = store
-            .list_docs(project_id, Some(DocType::Lesson))
+            .list_docs(project_id, "test-user", Some(DocType::Lesson))
             .await
             .unwrap();
         assert_eq!(lessons.len(), 1);

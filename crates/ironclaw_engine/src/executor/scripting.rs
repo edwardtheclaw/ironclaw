@@ -870,6 +870,7 @@ async fn handle_rlm_query(
         &prompt,
         crate::types::thread::ThreadType::Research,
         parent_thread.project_id,
+        &parent_thread.user_id,
         child_config,
     )
     .with_parent(parent_thread.id);

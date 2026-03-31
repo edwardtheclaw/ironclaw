@@ -73,6 +73,9 @@ pub enum EngineError {
         call_id: String,
         parameters: serde_json::Value,
     },
+
+    #[error("access denied: user '{user_id}' cannot access {entity}")]
+    AccessDenied { user_id: String, entity: String },
 }
 
 use crate::types::project::ProjectId;

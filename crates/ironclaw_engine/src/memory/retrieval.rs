@@ -29,6 +29,7 @@ impl RetrievalEngine {
     pub async fn retrieve_context(
         &self,
         project_id: ProjectId,
+        user_id: &str,
         query: &str,
         max_docs: usize,
     ) -> Result<Vec<MemoryDoc>, EngineError> {
@@ -36,7 +37,11 @@ impl RetrievalEngine {
             return Ok(Vec::new());
         }
 
-        let all_docs = self.store.list_memory_docs(project_id).await?;
+        // Include both user-owned and shared system docs for context retrieval.
+        let all_docs = self
+            .store
+            .list_memory_docs_with_shared(project_id, user_id)
+            .await?;
         if all_docs.is_empty() {
             return Ok(Vec::new());
         }
@@ -157,7 +162,7 @@ mod tests {
         async fn load_thread(&self, _: ThreadId) -> Result<Option<Thread>, EngineError> {
             Ok(None)
         }
-        async fn list_threads(&self, _: ProjectId) -> Result<Vec<Thread>, EngineError> {
+        async fn list_threads(&self, _: ProjectId, _: &str) -> Result<Vec<Thread>, EngineError> {
             Ok(vec![])
         }
         async fn update_thread_state(
@@ -194,11 +199,12 @@ mod tests {
         async fn list_memory_docs(
             &self,
             project_id: ProjectId,
+            user_id: &str,
         ) -> Result<Vec<MemoryDoc>, EngineError> {
             let docs = self.docs.lock().await;
             Ok(docs
                 .iter()
-                .filter(|d| d.project_id == project_id)
+                .filter(|d| d.project_id == project_id && d.user_id == user_id)
                 .cloned()
                 .collect())
         }
@@ -229,6 +235,7 @@ mod tests {
         async fn list_missions(
             &self,
             _: ProjectId,
+            _: &str,
         ) -> Result<Vec<crate::types::mission::Mission>, EngineError> {
             Ok(vec![])
         }
@@ -266,6 +273,7 @@ mod tests {
 
         let doc = MemoryDoc::new(
             ProjectId::new(),
+            "test-user",
             DocType::Lesson,
             "Lesson about web_search errors",
             "The tool was not found during execution.",
@@ -296,18 +304,21 @@ mod tests {
         let store = DocStore::new(vec![
             MemoryDoc::new(
                 project,
+                "test-user",
                 DocType::Lesson,
                 "web_search tool alias",
                 "Use web-search not web_search",
             ),
             MemoryDoc::new(
                 project,
+                "test-user",
                 DocType::Summary,
                 "weather query",
                 "Fetched weather data",
             ),
             MemoryDoc::new(
                 project,
+                "test-user",
                 DocType::Issue,
                 "API timeout",
                 "External API timed out",
@@ -316,7 +327,7 @@ mod tests {
         let engine = RetrievalEngine::new(store);
 
         let docs = engine
-            .retrieve_context(project, "web_search error", 5)
+            .retrieve_context(project, "test-user", "web_search error", 5)
             .await
             .unwrap();
         assert!(!docs.is_empty());
@@ -332,12 +343,14 @@ mod tests {
         let store = DocStore::new(vec![
             MemoryDoc::new(
                 project_a,
+                "test-user",
                 DocType::Lesson,
                 "Lesson for project A",
                 "Some lesson",
             ),
             MemoryDoc::new(
                 project_b,
+                "test-user",
                 DocType::Lesson,
                 "Lesson for project B",
                 "Other lesson",
@@ -346,14 +359,14 @@ mod tests {
         let engine = RetrievalEngine::new(store);
 
         let docs_a = engine
-            .retrieve_context(project_a, "lesson", 5)
+            .retrieve_context(project_a, "test-user", "lesson", 5)
             .await
             .unwrap();
         assert_eq!(docs_a.len(), 1);
         assert!(docs_a[0].title.contains("project A"));
 
         let docs_b = engine
-            .retrieve_context(project_b, "lesson", 5)
+            .retrieve_context(project_b, "test-user", "lesson", 5)
             .await
             .unwrap();
         assert_eq!(docs_b.len(), 1);
@@ -364,13 +377,13 @@ mod tests {
     async fn retrieve_respects_max_docs_limit() {
         let project = ProjectId::new();
         let store = DocStore::new(vec![
-            MemoryDoc::new(project, DocType::Lesson, "Lesson 1", "Content 1"),
-            MemoryDoc::new(project, DocType::Lesson, "Lesson 2", "Content 2"),
-            MemoryDoc::new(project, DocType::Lesson, "Lesson 3", "Content 3"),
+            MemoryDoc::new(project, "test-user", DocType::Lesson, "Lesson 1", "Content 1"),
+            MemoryDoc::new(project, "test-user", DocType::Lesson, "Lesson 2", "Content 2"),
+            MemoryDoc::new(project, "test-user", DocType::Lesson, "Lesson 3", "Content 3"),
         ]);
         let engine = RetrievalEngine::new(store);
 
-        let docs = engine.retrieve_context(project, "lesson", 2).await.unwrap();
+        let docs = engine.retrieve_context(project, "test-user", "lesson", 2).await.unwrap();
         assert_eq!(docs.len(), 2);
     }
 
@@ -381,7 +394,7 @@ mod tests {
         let engine = RetrievalEngine::new(store);
 
         let docs = engine
-            .retrieve_context(project, "anything", 5)
+            .retrieve_context(project, "test-user", "anything", 5)
             .await
             .unwrap();
         assert!(docs.is_empty());
@@ -393,12 +406,14 @@ mod tests {
         let store = DocStore::new(vec![
             MemoryDoc::new(
                 project,
+                "test-user",
                 DocType::Summary,
                 "Summary of search",
                 "searched the web",
             ),
             MemoryDoc::new(
                 project,
+                "test-user",
                 DocType::Spec,
                 "Missing search tool",
                 "ALIAS: web_search -> web-search",
@@ -406,7 +421,7 @@ mod tests {
         ]);
         let engine = RetrievalEngine::new(store);
 
-        let docs = engine.retrieve_context(project, "search", 5).await.unwrap();
+        let docs = engine.retrieve_context(project, "test-user", "search", 5).await.unwrap();
         assert_eq!(docs.len(), 2);
         // Spec should rank first due to higher type weight
         assert_eq!(docs[0].doc_type, DocType::Spec);

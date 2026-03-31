@@ -88,7 +88,10 @@ pub async fn load_orchestrator(
         return (DEFAULT_ORCHESTRATOR.to_string(), 0);
     };
 
-    let docs = match store.list_memory_docs(project_id).await {
+    // System operation: load all orchestrator docs for the project.
+    // Use list_all_threads-style approach — pass a broad user_id.
+    // The orchestrator is a system-level resource, not user-scoped.
+    let docs = match store.list_memory_docs(project_id, "system").await {
         Ok(d) => d,
         Err(_) => {
             debug!("using compiled-in default orchestrator (v0, store error)");
@@ -163,13 +166,13 @@ pub async fn record_orchestrator_failure(
 ) {
     use crate::types::memory::{DocType, MemoryDoc};
 
-    let docs = store.list_memory_docs(project_id).await.unwrap_or_default();
+    let docs = store.list_memory_docs(project_id, "system").await.unwrap_or_default();
     let existing = docs.iter().find(|d| d.title == FAILURE_TRACKER_TITLE);
 
     let mut tracker = if let Some(doc) = existing {
         doc.clone()
     } else {
-        MemoryDoc::new(project_id, DocType::Note, FAILURE_TRACKER_TITLE, "")
+        MemoryDoc::new(project_id, "system", DocType::Note, FAILURE_TRACKER_TITLE, "")
             .with_tags(vec!["orchestrator_meta".to_string()])
     };
 
@@ -201,7 +204,7 @@ pub async fn record_orchestrator_failure(
 
 /// Reset the failure counter (called after successful execution).
 pub async fn reset_orchestrator_failures(store: &Arc<dyn Store>, project_id: ProjectId) {
-    let docs = store.list_memory_docs(project_id).await.unwrap_or_default();
+    let docs = store.list_memory_docs(project_id, "system").await.unwrap_or_default();
     let existing = docs.iter().find(|d| d.title == FAILURE_TRACKER_TITLE);
 
     if let Some(doc) = existing {
@@ -567,12 +570,7 @@ async fn handle_execute_code_step(
         thread_id: thread.id,
         thread_type: thread.thread_type,
         project_id: thread.project_id,
-        user_id: thread
-            .metadata
-            .get("user_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("orchestrator")
-            .to_string(),
+        user_id: thread.user_id.clone(),
         step_id: StepId::new(),
     };
 
@@ -695,12 +693,7 @@ async fn handle_execute_action(
         thread_id: thread.id,
         thread_type: thread.thread_type,
         project_id: thread.project_id,
-        user_id: thread
-            .metadata
-            .get("user_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("orchestrator")
-            .to_string(),
+        user_id: thread.user_id.clone(),
         step_id: StepId::new(),
     };
 
@@ -1127,7 +1120,7 @@ async fn handle_retrieve_docs(
         .unwrap_or(5);
 
     match retrieval
-        .retrieve_context(thread.project_id, &goal, max_docs)
+        .retrieve_context(thread.project_id, &thread.user_id, &goal, max_docs)
         .await
     {
         Ok(docs) => {
@@ -1226,7 +1219,11 @@ async fn handle_list_skills(
         return ExtFunctionResult::Return(json_to_monty(&serde_json::json!([])));
     };
 
-    let docs = match store.list_memory_docs(thread.project_id).await {
+    // Use shared listing: user's own skills + system/admin-installed skills.
+    let docs = match store
+        .list_memory_docs_with_shared(thread.project_id, &thread.user_id)
+        .await
+    {
         Ok(docs) => docs,
         Err(e) => {
             debug!("__list_skills__: failed to load docs: {e}");
@@ -1459,6 +1456,7 @@ mod tests {
         let project_id = ProjectId::new();
         let mut doc = MemoryDoc::new(
             project_id,
+            "system",
             DocType::Note,
             ORCHESTRATOR_TITLE,
             "custom_orchestrator_code()",
@@ -1475,15 +1473,15 @@ mod tests {
     #[tokio::test]
     async fn load_orchestrator_picks_highest_version() {
         let project_id = ProjectId::new();
-        let mut doc_v1 = MemoryDoc::new(project_id, DocType::Note, ORCHESTRATOR_TITLE, "v1_code()")
+        let mut doc_v1 = MemoryDoc::new(project_id, "system", DocType::Note, ORCHESTRATOR_TITLE, "v1_code()")
             .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
         doc_v1.metadata = serde_json::json!({"version": 1});
 
-        let mut doc_v3 = MemoryDoc::new(project_id, DocType::Note, ORCHESTRATOR_TITLE, "v3_code()")
+        let mut doc_v3 = MemoryDoc::new(project_id, "system", DocType::Note, ORCHESTRATOR_TITLE, "v3_code()")
             .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
         doc_v3.metadata = serde_json::json!({"version": 3});
 
-        let mut doc_v2 = MemoryDoc::new(project_id, DocType::Note, ORCHESTRATOR_TITLE, "v2_code()")
+        let mut doc_v2 = MemoryDoc::new(project_id, "system", DocType::Note, ORCHESTRATOR_TITLE, "v2_code()")
             .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
         doc_v2.metadata = serde_json::json!({"version": 2});
 
@@ -1501,19 +1499,20 @@ mod tests {
 
         // Create v2 orchestrator
         let mut doc_v2 =
-            MemoryDoc::new(project_id, DocType::Note, ORCHESTRATOR_TITLE, "v2_buggy()")
+            MemoryDoc::new(project_id, "system", DocType::Note, ORCHESTRATOR_TITLE, "v2_buggy()")
                 .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
         doc_v2.metadata = serde_json::json!({"version": 2});
 
         // Create v1 orchestrator (fallback)
         let mut doc_v1 =
-            MemoryDoc::new(project_id, DocType::Note, ORCHESTRATOR_TITLE, "v1_stable()")
+            MemoryDoc::new(project_id, "system", DocType::Note, ORCHESTRATOR_TITLE, "v1_stable()")
                 .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
         doc_v1.metadata = serde_json::json!({"version": 1});
 
         // Create failure tracker showing v2 has 3 failures
         let tracker = MemoryDoc::new(
             project_id,
+            "system",
             DocType::Note,
             FAILURE_TRACKER_TITLE,
             r#"{"version": 2, "count": 3}"#,
@@ -1536,12 +1535,13 @@ mod tests {
 
         // Single version with 3 failures
         let mut doc_v1 =
-            MemoryDoc::new(project_id, DocType::Note, ORCHESTRATOR_TITLE, "v1_broken()")
+            MemoryDoc::new(project_id, "system", DocType::Note, ORCHESTRATOR_TITLE, "v1_broken()")
                 .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
         doc_v1.metadata = serde_json::json!({"version": 1});
 
         let tracker = MemoryDoc::new(
             project_id,
+            "system",
             DocType::Note,
             FAILURE_TRACKER_TITLE,
             r#"{"version": 1, "count": 5}"#,
@@ -1568,13 +1568,13 @@ mod tests {
         record_orchestrator_failure(&store, project_id, 2).await;
         record_orchestrator_failure(&store, project_id, 2).await;
 
-        let docs = store.list_memory_docs(project_id).await.unwrap();
+        let docs = store.list_memory_docs(project_id, "system").await.unwrap();
         let count = load_failure_count(&docs);
         assert_eq!(count, 3);
 
         // Reset
         reset_orchestrator_failures(&store, project_id).await;
-        let docs = store.list_memory_docs(project_id).await.unwrap();
+        let docs = store.list_memory_docs(project_id, "system").await.unwrap();
         let count = load_failure_count(&docs);
         assert_eq!(count, 0);
     }
@@ -1591,7 +1591,7 @@ mod tests {
         // Switch to version 2 — count should reset to 1
         record_orchestrator_failure(&store, project_id, 2).await;
 
-        let docs = store.list_memory_docs(project_id).await.unwrap();
+        let docs = store.list_memory_docs(project_id, "system").await.unwrap();
         let count = load_failure_count(&docs);
         assert_eq!(count, 1);
     }

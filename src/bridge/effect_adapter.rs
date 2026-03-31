@@ -135,7 +135,7 @@ impl EffectBridgeAdapter {
                     .and_then(|v| v.as_str())
                     .unwrap_or("manual");
                 match mgr
-                    .create_mission(context.project_id, name, goal, parse_cadence(cadence_str))
+                    .create_mission(context.project_id, &context.user_id, name, goal, parse_cadence(cadence_str))
                     .await
                 {
                     Ok(id) => {
@@ -144,7 +144,7 @@ impl EffectBridgeAdapter {
                     Err(e) => Err(e),
                 }
             }
-            "mission_list" => match mgr.list_missions(context.project_id).await {
+            "mission_list" => match mgr.list_missions(context.project_id, &context.user_id).await {
                 Ok(missions) => {
                     let list: Vec<serde_json::Value> = missions
                         .iter()
@@ -201,9 +201,9 @@ impl EffectBridgeAdapter {
                 match id {
                     Ok(id) => {
                         let res = if action_name == "mission_pause" {
-                            mgr.pause_mission(id).await
+                            mgr.pause_mission(id, &context.user_id).await
                         } else {
-                            mgr.resume_mission(id).await
+                            mgr.resume_mission(id, &context.user_id).await
                         };
                         match res {
                             Ok(()) => Ok(serde_json::json!({"status": "ok"})),

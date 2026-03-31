@@ -397,6 +397,7 @@ mod tests {
             "test goal",
             ThreadType::Foreground,
             ProjectId::new(),
+            "test-user",
             ThreadConfig::default(),
         )
     }

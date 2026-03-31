@@ -143,7 +143,7 @@ pub async fn build_codeact_system_prompt(
 
 /// Load the prompt overlay from the Store, if one exists for this project.
 async fn load_prompt_overlay(store: &Arc<dyn Store>, project_id: ProjectId) -> Option<String> {
-    let docs = store.list_memory_docs(project_id).await.ok()?;
+    let docs = store.list_memory_docs(project_id, "system").await.ok()?;
     let overlay = docs.iter().find(|d| {
         d.title == PREAMBLE_OVERLAY_TITLE && d.tags.contains(&PROMPT_OVERLAY_TAG.to_string())
     })?;
@@ -179,6 +179,7 @@ mod tests {
         let overlay = MemoryDoc {
             id: DocId::new(),
             project_id,
+            user_id: "system".into(),
             doc_type: DocType::Note,
             title: PREAMBLE_OVERLAY_TITLE.into(),
             content: "9. Never call web_fetch — use http() instead.".into(),
@@ -206,6 +207,7 @@ mod tests {
         let overlay = MemoryDoc {
             id: DocId::new(),
             project_id,
+            user_id: "system".into(),
             doc_type: DocType::Note,
             title: PREAMBLE_OVERLAY_TITLE.into(),
             content: huge_content,
@@ -232,6 +234,7 @@ mod tests {
         let overlay = MemoryDoc {
             id: DocId::new(),
             project_id: other_project,
+            user_id: "system".into(),
             doc_type: DocType::Note,
             title: PREAMBLE_OVERLAY_TITLE.into(),
             content: "Should not appear".into(),

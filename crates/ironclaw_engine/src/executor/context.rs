@@ -27,6 +27,7 @@ pub async fn build_step_context(
     effects: &Arc<dyn EffectExecutor>,
     retrieval: Option<&RetrievalEngine>,
     project_id: ProjectId,
+    user_id: &str,
     goal: &str,
 ) -> Result<(Vec<ThreadMessage>, Vec<ActionDef>), EngineError> {
     let actions = effects.available_actions(leases).await?;
@@ -39,7 +40,7 @@ pub async fn build_step_context(
     // inserting a separate one.
     if let Some(engine) = retrieval {
         let docs = engine
-            .retrieve_context(project_id, goal, MAX_CONTEXT_DOCS)
+            .retrieve_context(project_id, user_id, goal, MAX_CONTEXT_DOCS)
             .await?;
         if !docs.is_empty() {
             let context_section = format_docs_as_context(&docs);
@@ -137,7 +138,7 @@ mod tests {
         async fn load_thread(&self, _: ThreadId) -> Result<Option<Thread>, EngineError> {
             Ok(None)
         }
-        async fn list_threads(&self, _: ProjectId) -> Result<Vec<Thread>, EngineError> {
+        async fn list_threads(&self, _: ProjectId, _: &str) -> Result<Vec<Thread>, EngineError> {
             Ok(vec![])
         }
         async fn update_thread_state(
@@ -171,7 +172,7 @@ mod tests {
         async fn load_memory_doc(&self, _: DocId) -> Result<Option<MemoryDoc>, EngineError> {
             Ok(None)
         }
-        async fn list_memory_docs(&self, pid: ProjectId) -> Result<Vec<MemoryDoc>, EngineError> {
+        async fn list_memory_docs(&self, pid: ProjectId, _: &str) -> Result<Vec<MemoryDoc>, EngineError> {
             Ok(self
                 .0
                 .iter()
@@ -206,6 +207,7 @@ mod tests {
         async fn list_missions(
             &self,
             _: ProjectId,
+            _: &str,
         ) -> Result<Vec<crate::types::mission::Mission>, EngineError> {
             Ok(vec![])
         }
@@ -223,6 +225,7 @@ mod tests {
         let project = ProjectId::new();
         let store: Arc<dyn crate::traits::store::Store> = Arc::new(DocStore(vec![MemoryDoc::new(
             project,
+            "test-user",
             DocType::Lesson,
             "web tool alias",
             "Use web-search not web_search",
@@ -241,6 +244,7 @@ mod tests {
             &effects,
             Some(&retrieval),
             project,
+            "test-user",
             "search the web",
         )
         .await
@@ -265,7 +269,7 @@ mod tests {
         ];
 
         let (ctx_msgs, _) =
-            build_step_context(&messages, &[], &effects, None, ProjectId::new(), "hello")
+            build_step_context(&messages, &[], &effects, None, ProjectId::new(), "test-user", "hello")
                 .await
                 .unwrap();
 
@@ -283,7 +287,7 @@ mod tests {
         let messages = vec![ThreadMessage::user("hello")];
 
         let (ctx_msgs, _) =
-            build_step_context(&messages, &[], &effects, Some(&retrieval), project, "hello")
+            build_step_context(&messages, &[], &effects, Some(&retrieval), project, "test-user", "hello")
                 .await
                 .unwrap();
 

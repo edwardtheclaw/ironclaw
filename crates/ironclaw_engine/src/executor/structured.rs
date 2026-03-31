@@ -281,6 +281,7 @@ mod tests {
             "test",
             ThreadType::Foreground,
             ProjectId::new(),
+            "test-user",
             ThreadConfig::default(),
         );
         let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
@@ -338,6 +339,7 @@ mod tests {
             "test",
             ThreadType::Foreground,
             ProjectId::new(),
+            "test-user",
             ThreadConfig::default(),
         );
         let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
@@ -382,6 +384,7 @@ mod tests {
             "test",
             ThreadType::Foreground,
             ProjectId::new(),
+            "test-user",
             ThreadConfig::default(),
         );
         let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
@@ -418,6 +421,7 @@ mod tests {
             "test",
             ThreadType::Foreground,
             ProjectId::new(),
+            "test-user",
             ThreadConfig::default(),
         );
         let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
@@ -475,6 +479,7 @@ mod tests {
             "test",
             ThreadType::Foreground,
             ProjectId::new(),
+            "test-user",
             ThreadConfig::default(),
         );
         let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
@@ -536,6 +541,7 @@ mod tests {
             "test",
             ThreadType::Foreground,
             ProjectId::new(),
+            "test-user",
             ThreadConfig::default(),
         );
         let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
@@ -596,6 +602,7 @@ mod tests {
             "test",
             ThreadType::Foreground,
             ProjectId::new(),
+            "test-user",
             ThreadConfig::default(),
         );
         let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
@@ -656,6 +663,7 @@ mod tests {
             "test",
             ThreadType::Foreground,
             ProjectId::new(),
+            "test-user",
             ThreadConfig::default(),
         );
         let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
@@ -698,6 +706,7 @@ mod tests {
             "test",
             ThreadType::Foreground,
             ProjectId::new(),
+            "test-user",
             ThreadConfig::default(),
         );
         let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(

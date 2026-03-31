@@ -619,7 +619,7 @@ mod tests {
         config: ThreadConfig,
     ) -> (ExecutionLoop, crate::runtime::messaging::SignalSender) {
         let project_id = ProjectId::new();
-        let thread = Thread::new("test goal", ThreadType::Foreground, project_id, config);
+        let thread = Thread::new("test goal", ThreadType::Foreground, project_id, "test-user", config);
         let tid = thread.id;
 
         let llm = Arc::new(MockLlm::new(llm_responses));
@@ -1248,6 +1248,7 @@ mod tests {
             "test",
             ThreadType::Foreground,
             project_id,
+            "test-user",
             ThreadConfig::default(),
         );
         let tid = thread.id;

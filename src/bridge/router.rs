@@ -314,9 +314,15 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         policy,
     ));
 
+    // Migrate legacy records: pre-existing engine records deserialize without a
+    // user_id field and get the serde default "legacy". Stamp the owner's identity
+    // onto them so user-scoped queries find them after upgrade.
+    let owner_id = &agent.deps.owner_id;
+    migrate_legacy_user_ids(&store_dyn, owner_id).await;
+
     // Reuse the persisted default project when available.
     let project_id = match store
-        .list_projects()
+        .list_projects(owner_id)
         .await
         .map_err(|e| engine_err("store error", e))?
         .into_iter()
@@ -324,7 +330,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     {
         Some(project) => project.id,
         None => {
-            let project = Project::new("default", "Default project for engine v2");
+            let project = Project::new(owner_id, "default", "Default project for engine v2");
             let project_id = project.id;
             store
                 .save_project(&project)
@@ -365,8 +371,11 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     mission_manager.start_cron_ticker(agent.deps.owner_id.clone());
     mission_manager.start_event_listener(agent.deps.owner_id.clone());
 
-    // Ensure all learning missions exist for this project
-    if let Err(e) = mission_manager.ensure_learning_missions(project_id).await {
+    // Ensure per-user learning missions exist for the owner
+    if let Err(e) = mission_manager
+        .ensure_learning_missions(project_id, owner_id)
+        .await
+    {
         debug!("engine v2: failed to create learning missions: {e}");
     }
 
@@ -894,7 +903,7 @@ pub async fn handle_interrupt(
     let mut stopped = 0u32;
     for tid in &active_threads {
         if state.thread_manager.is_running(*tid).await {
-            if let Err(e) = state.thread_manager.stop_thread(*tid).await {
+            if let Err(e) = state.thread_manager.stop_thread(*tid, &message.user_id).await {
                 debug!(thread_id = %tid, error = %e, "engine v2: failed to stop thread");
             } else {
                 stopped += 1;
@@ -950,7 +959,10 @@ async fn clear_engine_conversation(agent: &Agent, message: &IncomingMessage) -> 
     if let Some(conv) = state.conversation_manager.get_conversation(conv_id).await {
         for tid in &conv.active_threads {
             if state.thread_manager.is_running(*tid).await {
-                let _ = state.thread_manager.stop_thread(*tid).await;
+                let _ = state
+                    .thread_manager
+                    .stop_thread(*tid, &message.user_id)
+                    .await;
             }
         }
     }
@@ -958,7 +970,7 @@ async fn clear_engine_conversation(agent: &Agent, message: &IncomingMessage) -> 
     // Clear the conversation entries and active thread list
     state
         .conversation_manager
-        .clear_conversation(conv_id)
+        .clear_conversation(conv_id, &message.user_id)
         .await
         .map_err(|e| engine_err("clear conversation error", e))?;
 
@@ -1060,7 +1072,10 @@ pub async fn handle_with_engine(
             if token.is_empty() || token.eq_ignore_ascii_case("cancel") {
                 // Stop the waiting engine thread so it doesn't leak.
                 if let Some(engine_tid) = pending.engine_thread_id {
-                    let _ = state.thread_manager.stop_thread(engine_tid).await;
+                    let _ = state
+                        .thread_manager
+                        .stop_thread(engine_tid, &message.user_id)
+                        .await;
                 }
                 let response = "Authentication cancelled.".to_string();
                 // Write to v1 DB so the history API shows the response.
@@ -1886,7 +1901,7 @@ fn thread_to_info(t: &ironclaw_engine::Thread) -> EngineThreadInfo {
 }
 
 /// List engine threads, optionally filtered by project.
-pub async fn list_engine_threads(project_id: Option<&str>) -> Result<Vec<EngineThreadInfo>, Error> {
+pub async fn list_engine_threads(project_id: Option<&str>, user_id: &str) -> Result<Vec<EngineThreadInfo>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(Vec::new());
     };
@@ -1905,7 +1920,7 @@ pub async fn list_engine_threads(project_id: Option<&str>) -> Result<Vec<EngineT
 
     let threads = state
         .store
-        .list_threads(pid)
+        .list_threads(pid, user_id)
         .await
         .map_err(|e| engine_err("list threads", e))?;
 
@@ -1913,7 +1928,7 @@ pub async fn list_engine_threads(project_id: Option<&str>) -> Result<Vec<EngineT
 }
 
 /// Get a single engine thread by ID.
-pub async fn get_engine_thread(thread_id: &str) -> Result<Option<EngineThreadDetail>, Error> {
+pub async fn get_engine_thread(thread_id: &str, user_id: &str) -> Result<Option<EngineThreadDetail>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(None);
     };
@@ -1933,6 +1948,11 @@ pub async fn get_engine_thread(thread_id: &str) -> Result<Option<EngineThreadDet
     else {
         return Ok(None);
     };
+
+    // Ownership check: only return thread if it belongs to the requesting user
+    if thread.user_id != user_id {
+        return Ok(None);
+    }
 
     let messages: Vec<serde_json::Value> = thread
         .messages
@@ -1956,7 +1976,10 @@ pub async fn get_engine_thread(thread_id: &str) -> Result<Option<EngineThreadDet
 }
 
 /// List steps for a thread.
-pub async fn list_engine_thread_steps(thread_id: &str) -> Result<Vec<EngineStepInfo>, Error> {
+pub async fn list_engine_thread_steps(
+    thread_id: &str,
+    user_id: &str,
+) -> Result<Vec<EngineStepInfo>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(Vec::new());
     };
@@ -1966,6 +1989,21 @@ pub async fn list_engine_thread_steps(thread_id: &str) -> Result<Vec<EngineStepI
     };
 
     let tid = uuid::Uuid::parse_str(thread_id).map_err(|e| engine_err("parse thread_id", e))?;
+
+    // Validate thread ownership before returning steps.
+    if let Some(thread) = state
+        .store
+        .load_thread(ironclaw_engine::ThreadId(tid))
+        .await
+        .map_err(|e| engine_err("load thread", e))?
+    {
+        if thread.user_id != user_id {
+            return Ok(Vec::new());
+        }
+    } else {
+        return Ok(Vec::new());
+    }
+
     let steps = state
         .store
         .load_steps(ironclaw_engine::ThreadId(tid))
@@ -1989,7 +2027,10 @@ pub async fn list_engine_thread_steps(thread_id: &str) -> Result<Vec<EngineStepI
 }
 
 /// List events for a thread as raw JSON values.
-pub async fn list_engine_thread_events(thread_id: &str) -> Result<Vec<serde_json::Value>, Error> {
+pub async fn list_engine_thread_events(
+    thread_id: &str,
+    user_id: &str,
+) -> Result<Vec<serde_json::Value>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(Vec::new());
     };
@@ -1999,6 +2040,21 @@ pub async fn list_engine_thread_events(thread_id: &str) -> Result<Vec<serde_json
     };
 
     let tid = uuid::Uuid::parse_str(thread_id).map_err(|e| engine_err("parse thread_id", e))?;
+
+    // Validate thread ownership before returning events.
+    if let Some(thread) = state
+        .store
+        .load_thread(ironclaw_engine::ThreadId(tid))
+        .await
+        .map_err(|e| engine_err("load thread", e))?
+    {
+        if thread.user_id != user_id {
+            return Ok(Vec::new());
+        }
+    } else {
+        return Ok(Vec::new());
+    }
+
     let events = state
         .store
         .load_events(ironclaw_engine::ThreadId(tid))
@@ -2012,7 +2068,7 @@ pub async fn list_engine_thread_events(thread_id: &str) -> Result<Vec<serde_json
 }
 
 /// List all projects.
-pub async fn list_engine_projects() -> Result<Vec<EngineProjectInfo>, Error> {
+pub async fn list_engine_projects(user_id: &str) -> Result<Vec<EngineProjectInfo>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(Vec::new());
     };
@@ -2023,7 +2079,7 @@ pub async fn list_engine_projects() -> Result<Vec<EngineProjectInfo>, Error> {
 
     let projects = state
         .store
-        .list_projects()
+        .list_projects(user_id)
         .await
         .map_err(|e| engine_err("list projects", e))?;
 
@@ -2039,7 +2095,7 @@ pub async fn list_engine_projects() -> Result<Vec<EngineProjectInfo>, Error> {
 }
 
 /// Get a single project by ID.
-pub async fn get_engine_project(project_id: &str) -> Result<Option<EngineProjectInfo>, Error> {
+pub async fn get_engine_project(project_id: &str, user_id: &str) -> Result<Option<EngineProjectInfo>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(None);
     };
@@ -2055,17 +2111,20 @@ pub async fn get_engine_project(project_id: &str) -> Result<Option<EngineProject
         .await
         .map_err(|e| engine_err("load project", e))?;
 
-    Ok(project.map(|p| EngineProjectInfo {
-        id: p.id.to_string(),
-        name: p.name,
-        description: p.description,
-        created_at: p.created_at.to_rfc3339(),
-    }))
+    Ok(project
+        .filter(|p| p.user_id == user_id)
+        .map(|p| EngineProjectInfo {
+            id: p.id.to_string(),
+            name: p.name,
+            description: p.description,
+            created_at: p.created_at.to_rfc3339(),
+        }))
 }
 
 /// List missions, optionally filtered by project.
 pub async fn list_engine_missions(
     project_id: Option<&str>,
+    user_id: &str,
 ) -> Result<Vec<EngineMissionInfo>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(Vec::new());
@@ -2085,7 +2144,7 @@ pub async fn list_engine_missions(
 
     let missions = state
         .store
-        .list_missions(pid)
+        .list_missions_with_shared(pid, user_id)
         .await
         .map_err(|e| engine_err("list missions", e))?;
 
@@ -2106,7 +2165,7 @@ pub async fn list_engine_missions(
 }
 
 /// Get a single mission by ID.
-pub async fn get_engine_mission(mission_id: &str) -> Result<Option<EngineMissionDetail>, Error> {
+pub async fn get_engine_mission(mission_id: &str, user_id: &str) -> Result<Option<EngineMissionDetail>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(None);
     };
@@ -2125,6 +2184,11 @@ pub async fn get_engine_mission(mission_id: &str) -> Result<Option<EngineMission
     let Some(m) = mission else {
         return Ok(None);
     };
+
+    // Ownership check: allow access to user's own missions and system missions.
+    if m.user_id != user_id && m.user_id != "system" {
+        return Ok(None);
+    }
 
     let cadence_json = serde_json::to_value(&m.cadence).unwrap_or(serde_json::Value::Null);
 
@@ -2184,7 +2248,14 @@ pub async fn fire_engine_mission(mission_id: &str, user_id: &str) -> Result<Opti
 }
 
 /// Pause a mission.
-pub async fn pause_engine_mission(mission_id: &str) -> Result<(), Error> {
+///
+/// For system missions, the caller must be an admin (pass `is_admin=true`).
+/// For user missions, ownership is enforced by the engine.
+pub async fn pause_engine_mission(
+    mission_id: &str,
+    user_id: &str,
+    is_admin: bool,
+) -> Result<(), Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Err(engine_err("not initialized", "engine v2 is not running"));
     };
@@ -2194,18 +2265,28 @@ pub async fn pause_engine_mission(mission_id: &str) -> Result<(), Error> {
     };
 
     let mid = uuid::Uuid::parse_str(mission_id).map_err(|e| engine_err("parse mission_id", e))?;
-    state
+    let mgr = state
         .effect_adapter
         .mission_manager()
         .await
-        .ok_or_else(|| engine_err("mission", "mission manager not available"))?
-        .pause_mission(ironclaw_engine::MissionId(mid))
+        .ok_or_else(|| engine_err("mission", "mission manager not available"))?;
+
+    // System missions require admin role; pass "system" as user_id to satisfy engine check.
+    let effective_user_id = resolve_mission_user_id(&state.store, mid, user_id, is_admin).await?;
+    mgr.pause_mission(ironclaw_engine::MissionId(mid), &effective_user_id)
         .await
         .map_err(|e| engine_err("pause mission", e))
 }
 
 /// Resume a paused mission.
-pub async fn resume_engine_mission(mission_id: &str) -> Result<(), Error> {
+///
+/// For system missions, the caller must be an admin (pass `is_admin=true`).
+/// For user missions, ownership is enforced by the engine.
+pub async fn resume_engine_mission(
+    mission_id: &str,
+    user_id: &str,
+    is_admin: bool,
+) -> Result<(), Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Err(engine_err("not initialized", "engine v2 is not running"));
     };
@@ -2215,14 +2296,99 @@ pub async fn resume_engine_mission(mission_id: &str) -> Result<(), Error> {
     };
 
     let mid = uuid::Uuid::parse_str(mission_id).map_err(|e| engine_err("parse mission_id", e))?;
-    state
+    let mgr = state
         .effect_adapter
         .mission_manager()
         .await
-        .ok_or_else(|| engine_err("mission", "mission manager not available"))?
-        .resume_mission(ironclaw_engine::MissionId(mid))
+        .ok_or_else(|| engine_err("mission", "mission manager not available"))?;
+
+    let effective_user_id = resolve_mission_user_id(&state.store, mid, user_id, is_admin).await?;
+    mgr.resume_mission(ironclaw_engine::MissionId(mid), &effective_user_id)
         .await
         .map_err(|e| engine_err("resume mission", e))
+}
+
+/// Resolve the effective user_id for mission management operations.
+///
+/// If the mission is system-owned, requires admin role and returns "system"
+/// so the engine ownership check passes. Otherwise returns the caller's user_id.
+async fn resolve_mission_user_id(
+    store: &Arc<dyn ironclaw_engine::Store>,
+    mid: uuid::Uuid,
+    user_id: &str,
+    is_admin: bool,
+) -> Result<String, Error> {
+    if let Ok(Some(mission)) = store.load_mission(ironclaw_engine::MissionId(mid)).await
+        && mission.user_id == "system"
+    {
+        if !is_admin {
+            return Err(engine_err(
+                "forbidden",
+                "system missions can only be managed by admins",
+            ));
+        }
+        return Ok("system".to_string());
+    }
+    Ok(user_id.to_string())
+}
+
+// ── Legacy migration ────────────────────────────────────────────
+
+/// One-time migration: stamp the owner's user_id onto any engine records that
+/// deserialized with the serde default `"legacy"` (pre-multi-tenancy data).
+///
+/// Runs at engine init before user-scoped queries. After migration, records
+/// are findable by the owner's identity and the "legacy" sentinel disappears.
+async fn migrate_legacy_user_ids(store: &Arc<dyn ironclaw_engine::Store>, owner_id: &str) {
+    // Projects
+    if let Ok(legacy) = store.list_projects("legacy").await {
+        for mut project in legacy {
+            project.user_id = owner_id.to_string();
+            project.updated_at = chrono::Utc::now();
+            let _ = store.save_project(&project).await;
+        }
+    }
+
+    // We need a project_id to query threads/missions/docs. Use list_projects
+    // with the now-migrated owner_id, or fall back to "legacy" in case save failed.
+    let all_projects: Vec<ironclaw_engine::Project> = store
+        .list_projects(owner_id)
+        .await
+        .unwrap_or_default();
+
+    for project in &all_projects {
+        let pid = project.id;
+
+        // Threads
+        if let Ok(legacy) = store.list_all_threads(pid).await {
+            for mut thread in legacy.into_iter().filter(|t| t.user_id == "legacy") {
+                thread.user_id = owner_id.to_string();
+                thread.updated_at = chrono::Utc::now();
+                let _ = store.save_thread(&thread).await;
+            }
+        }
+
+        // Missions
+        if let Ok(legacy) = store.list_all_missions(pid).await {
+            for mut mission in legacy.into_iter().filter(|m| m.user_id == "legacy") {
+                // System learning missions keep "system"; only stamp truly orphaned ones.
+                mission.user_id = owner_id.to_string();
+                mission.updated_at = chrono::Utc::now();
+                let _ = store.save_mission(&mission).await;
+            }
+        }
+
+        // Memory docs (use list_memory_docs directly since "legacy" is the user_id)
+        if let Ok(legacy) = store.list_memory_docs(pid, "legacy").await {
+            for mut doc in legacy {
+                doc.user_id = owner_id.to_string();
+                doc.updated_at = chrono::Utc::now();
+                let _ = store.save_memory_doc(&doc).await;
+            }
+        }
+    }
+
+    debug!("engine v2: legacy user_id migration complete for owner {owner_id}");
 }
 
 #[cfg(test)]
@@ -2262,6 +2428,7 @@ mod tests {
         async fn list_threads(
             &self,
             _project_id: ironclaw_engine::ProjectId,
+            _user_id: &str,
         ) -> Result<Vec<ironclaw_engine::Thread>, ironclaw_engine::EngineError> {
             Ok(self.threads.read().await.values().cloned().collect())
         }
@@ -2310,6 +2477,7 @@ mod tests {
         }
         async fn list_projects(
             &self,
+            _user_id: &str,
         ) -> Result<Vec<ironclaw_engine::Project>, ironclaw_engine::EngineError> {
             Ok(vec![])
         }
@@ -2364,6 +2532,7 @@ mod tests {
         async fn list_memory_docs(
             &self,
             _: ironclaw_engine::ProjectId,
+            _user_id: &str,
         ) -> Result<Vec<ironclaw_engine::MemoryDoc>, ironclaw_engine::EngineError> {
             Ok(vec![])
         }
@@ -2401,6 +2570,7 @@ mod tests {
         async fn list_missions(
             &self,
             _: ironclaw_engine::ProjectId,
+            _user_id: &str,
         ) -> Result<Vec<ironclaw_engine::Mission>, ironclaw_engine::EngineError> {
             Ok(vec![])
         }
@@ -2509,6 +2679,7 @@ mod tests {
             "goal",
             ironclaw_engine::ThreadType::Foreground,
             ironclaw_engine::ProjectId::new(),
+            "user1",
             ironclaw_engine::ThreadConfig::default(),
         );
         thread.id = thread_id;
@@ -2569,6 +2740,7 @@ mod tests {
                 "goal",
                 ironclaw_engine::ThreadType::Foreground,
                 ironclaw_engine::ProjectId::new(),
+                "user1",
                 ironclaw_engine::ThreadConfig::default(),
             );
             thread.id = thread_id;

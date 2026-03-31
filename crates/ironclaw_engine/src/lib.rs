@@ -119,7 +119,7 @@ pub(crate) mod tests {
         async fn load_thread(&self, _: ThreadId) -> Result<Option<Thread>, EngineError> {
             Ok(None)
         }
-        async fn list_threads(&self, _: ProjectId) -> Result<Vec<Thread>, EngineError> {
+        async fn list_threads(&self, _: ProjectId, _: &str) -> Result<Vec<Thread>, EngineError> {
             Ok(vec![])
         }
         async fn update_thread_state(
@@ -147,7 +147,7 @@ pub(crate) mod tests {
         async fn load_project(&self, _: ProjectId) -> Result<Option<Project>, EngineError> {
             Ok(None)
         }
-        async fn list_projects(&self) -> Result<Vec<Project>, EngineError> {
+        async fn list_projects(&self, _: &str) -> Result<Vec<Project>, EngineError> {
             Ok(vec![])
         }
         async fn save_conversation(&self, _: &ConversationSurface) -> Result<(), EngineError> {
@@ -177,6 +177,7 @@ pub(crate) mod tests {
         async fn list_memory_docs(
             &self,
             project_id: ProjectId,
+            _user_id: &str,
         ) -> Result<Vec<MemoryDoc>, EngineError> {
             Ok(self
                 .docs
@@ -214,7 +215,7 @@ pub(crate) mod tests {
                 .find(|m| m.id == id)
                 .cloned())
         }
-        async fn list_missions(&self, project_id: ProjectId) -> Result<Vec<Mission>, EngineError> {
+        async fn list_missions(&self, project_id: ProjectId, _: &str) -> Result<Vec<Mission>, EngineError> {
             Ok(self
                 .missions
                 .read()

@@ -117,15 +117,12 @@ impl ThreadManager {
         user_id: impl Into<String>,
         initial_messages: Vec<crate::types::message::ThreadMessage>,
     ) -> Result<ThreadId, EngineError> {
-        let mut thread = Thread::new(goal, thread_type, project_id, config);
+        let user_id = user_id.into();
+        let mut thread = Thread::new(goal, thread_type, project_id, &user_id, config);
         if let Some(pid) = parent_id {
             thread = thread.with_parent(pid);
         }
         let thread_id = thread.id;
-        let user_id = user_id.into();
-        if let Some(metadata) = thread.metadata.as_object_mut() {
-            metadata.insert("user_id".into(), serde_json::Value::String(user_id.clone()));
-        }
 
         // Register in tree
         if let Some(pid) = parent_id {
@@ -185,6 +182,15 @@ impl ThreadManager {
             .await?
             .ok_or(EngineError::ThreadNotFound(thread_id))?;
 
+        // Tenant isolation: verify the requesting user owns this thread.
+        let uid: String = user_id.into();
+        if thread.user_id != uid {
+            return Err(EngineError::AccessDenied {
+                user_id: uid,
+                entity: format!("thread {thread_id}"),
+            });
+        }
+
         if !matches!(
             thread.state,
             crate::types::thread::ThreadState::Waiting
@@ -213,7 +219,7 @@ impl ThreadManager {
         }
 
         self.store.save_thread(&thread).await?;
-        self.start_thread(thread, user_id.into(), true).await?;
+        self.start_thread(thread, uid, true).await?;
         Ok(())
     }
 
@@ -316,7 +322,31 @@ impl ThreadManager {
     }
 
     /// Send a stop signal to a running thread.
-    pub async fn stop_thread(&self, thread_id: ThreadId) -> Result<(), EngineError> {
+    pub async fn stop_thread(
+        &self,
+        thread_id: ThreadId,
+        user_id: &str,
+    ) -> Result<(), EngineError> {
+        // Validate ownership before allowing stop.
+        if let Some(thread) = self.store.load_thread(thread_id).await?
+            && thread.user_id != user_id
+        {
+            return Err(EngineError::AccessDenied {
+                user_id: user_id.to_string(),
+                entity: format!("thread {thread_id}"),
+            });
+        }
+        let running = self.running.read().await;
+        if let Some(rt) = running.get(&thread_id) {
+            let _ = rt.signal_tx.send(ThreadSignal::Stop).await;
+            Ok(())
+        } else {
+            Err(EngineError::ThreadNotFound(thread_id))
+        }
+    }
+
+    /// Send a stop signal without ownership check (system operations).
+    pub async fn stop_thread_system(&self, thread_id: ThreadId) -> Result<(), EngineError> {
         let running = self.running.read().await;
         if let Some(rt) = running.get(&thread_id) {
             let _ = rt.signal_tx.send(ThreadSignal::Stop).await;
@@ -328,6 +358,34 @@ impl ThreadManager {
 
     /// Inject a user message into a running thread.
     pub async fn inject_message(
+        &self,
+        thread_id: ThreadId,
+        user_id: &str,
+        message: ThreadMessage,
+    ) -> Result<(), EngineError> {
+        // Validate ownership before allowing injection.
+        if let Some(thread) = self.store.load_thread(thread_id).await?
+            && thread.user_id != user_id
+        {
+            return Err(EngineError::AccessDenied {
+                user_id: user_id.to_string(),
+                entity: format!("thread {thread_id}"),
+            });
+        }
+        let running = self.running.read().await;
+        if let Some(rt) = running.get(&thread_id) {
+            let _ = rt
+                .signal_tx
+                .send(ThreadSignal::InjectMessage(message))
+                .await;
+            Ok(())
+        } else {
+            Err(EngineError::ThreadNotFound(thread_id))
+        }
+    }
+
+    /// Inject a message without ownership check (system operations).
+    pub async fn inject_message_system(
         &self,
         thread_id: ThreadId,
         message: ThreadMessage,
@@ -409,7 +467,8 @@ impl ThreadManager {
         &self,
         project_id: ProjectId,
     ) -> Result<Vec<ThreadId>, EngineError> {
-        let threads = self.store.list_threads(project_id).await?;
+        // System operation: resume all suspended research threads regardless of user.
+        let threads = self.store.list_all_threads(project_id).await?;
         let mut resumed = Vec::new();
 
         for thread in threads {
@@ -422,16 +481,11 @@ impl ThreadManager {
             if thread.metadata.get("runtime_checkpoint").is_none() {
                 continue;
             }
-            let Some(user_id) = thread
-                .metadata
-                .get("user_id")
-                .and_then(|value| value.as_str())
-                .filter(|user_id| !user_id.is_empty())
-            else {
+            if thread.user_id.is_empty() {
                 continue;
-            };
+            }
 
-            self.resume_thread(thread.id, user_id.to_string(), None, None)
+            self.resume_thread(thread.id, thread.user_id.clone(), None, None)
                 .await?;
             resumed.push(thread.id);
         }
@@ -449,7 +503,8 @@ impl ThreadManager {
     ) -> Result<Vec<ThreadId>, EngineError> {
         const PENDING_APPROVAL_METADATA_KEY: &str = "pending_approval";
         const RUNTIME_CHECKPOINT_METADATA_KEY: &str = "runtime_checkpoint";
-        let threads = self.store.list_threads(project_id).await?;
+        // System operation: recover all non-terminal threads regardless of user.
+        let threads = self.store.list_all_threads(project_id).await?;
         let mut recovered = Vec::new();
 
         for mut thread in threads {
@@ -603,7 +658,17 @@ mod tests {
         async fn load_thread(&self, id: ThreadId) -> Result<Option<Thread>, EngineError> {
             Ok(self.threads.read().await.get(&id).cloned())
         }
-        async fn list_threads(&self, project_id: ProjectId) -> Result<Vec<Thread>, EngineError> {
+        async fn list_threads(&self, project_id: ProjectId, user_id: &str) -> Result<Vec<Thread>, EngineError> {
+            Ok(self
+                .threads
+                .read()
+                .await
+                .values()
+                .filter(|thread| thread.project_id == project_id && thread.user_id == user_id)
+                .cloned()
+                .collect())
+        }
+        async fn list_all_threads(&self, project_id: ProjectId) -> Result<Vec<Thread>, EngineError> {
             Ok(self
                 .threads
                 .read()
@@ -657,7 +722,7 @@ mod tests {
         async fn load_memory_doc(&self, _: DocId) -> Result<Option<MemoryDoc>, EngineError> {
             Ok(None)
         }
-        async fn list_memory_docs(&self, _: ProjectId) -> Result<Vec<MemoryDoc>, EngineError> {
+        async fn list_memory_docs(&self, _: ProjectId, _: &str) -> Result<Vec<MemoryDoc>, EngineError> {
             Ok(vec![])
         }
         async fn save_lease(&self, _: &CapabilityLease) -> Result<(), EngineError> {
@@ -691,6 +756,7 @@ mod tests {
         async fn list_missions(
             &self,
             _: ProjectId,
+            _: &str,
         ) -> Result<Vec<crate::types::mission::Mission>, EngineError> {
             Ok(vec![])
         }
@@ -814,7 +880,7 @@ mod tests {
 
         // Give it a moment to start, then stop
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let _ = mgr.stop_thread(tid).await;
+        let _ = mgr.stop_thread(tid, "test-user").await;
 
         let outcome = mgr.join_thread(tid).await.unwrap();
         assert!(matches!(
@@ -865,6 +931,7 @@ mod tests {
             "running",
             ThreadType::Foreground,
             project,
+            "test-user",
             ThreadConfig::default(),
         );
         running.transition_to(ThreadState::Running, None).unwrap();
@@ -874,6 +941,7 @@ mod tests {
             "done",
             ThreadType::Foreground,
             project,
+            "test-user",
             ThreadConfig::default(),
         );
         completed
@@ -900,6 +968,7 @@ mod tests {
             "awaiting approval",
             ThreadType::Foreground,
             project,
+            "test-user",
             ThreadConfig::default(),
         );
         waiting.transition_to(ThreadState::Running, None).unwrap();
@@ -932,6 +1001,7 @@ mod tests {
             "resume me",
             ThreadType::Foreground,
             project,
+            "test-user",
             ThreadConfig::default(),
         );
         running.transition_to(ThreadState::Running, None).unwrap();
@@ -962,6 +1032,7 @@ mod tests {
             "background research",
             ThreadType::Research,
             project,
+            "test-user",
             ThreadConfig::default(),
         );
         research.transition_to(ThreadState::Running, None).unwrap();
