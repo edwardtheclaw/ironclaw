@@ -1225,18 +1225,16 @@ fn strip_internal_tool_call_text(text: &str) -> String {
 /// Strip `<attachments>...</attachments>` blocks from text.
 /// Used to remove LLM-internal attachment metadata that should not be shown to users.
 fn strip_attachment_block(content: &str) -> String {
-    if let Some(start) = content.find("<attachments>")
-        && let Some(end) = content.find("</attachments>")
-    {
-        let end = end + "</attachments>".len();
-        let mut result = String::with_capacity(content.len());
-        result.push_str(&content[..start]);
-        if end < content.len() {
-            result.push_str(&content[end..]);
+    let mut result = content.to_string();
+    while let Some(start) = result.find("<attachments>") {
+        if let Some(end) = result[start..].find("</attachments>") {
+            let end = start + end + "</attachments>".len();
+            result.replace_range(start..end, "");
+        } else {
+            break;
         }
-        return result;
     }
-    content.to_string()
+    result
 }
 
 /// Extract `<suggestions>["...","..."]</suggestions>` from a response string.

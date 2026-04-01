@@ -470,8 +470,9 @@ impl Agent {
             thread.messages()
         };
 
-        // Persist the *original* user content to DB (without the <attachments> augmentation).
-        // The augmented form is only needed for the LLM context, not for storage/display.
+        // Persist the augmented content (with attachment context) so that
+        // rebuild_chat_messages_from_db can reconstruct full LLM context after restart.
+        // The <attachments> block is stripped only when rendering for the UI.
         tracing::debug!(
             message_id = %message.id,
             thread_id = %thread_id,
@@ -481,7 +482,7 @@ impl Agent {
             thread_id,
             &message.channel,
             &message.user_id,
-            content,
+            effective_content,
         )
         .await;
 

@@ -757,7 +757,7 @@ function sendMessage() {
   if (!content && stagedImages.length === 0) return;
 
   const imagesToDisplay = stagedImages.slice(); // snapshot before clearing
-  addMessage('user', content, imagesToDisplay);
+  const userMsg = addMessage('user', content, imagesToDisplay);
   input.value = '';
   autoResizeTextarea(input);
   input.focus();
