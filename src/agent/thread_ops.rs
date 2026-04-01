@@ -135,13 +135,52 @@ impl Agent {
             msg_count = 0;
         }
 
-        // Create thread with the historical ID and restore messages
+        // Create thread with the historical ID and restore messages.
+        // Read source_channel from DB so the authorization check uses the
+        // original creator's channel, not the requesting message's channel.
+        //
+        // Fail-closed policy: if the DB lookup fails or the conversation has
+        // no stored source_channel (legacy row), the thread is hydrated with
+        // source_channel = None.  `is_approval_authorized(None, _)` returns
+        // false, so approvals are denied until the conversation is backfilled
+        // with a source_channel via an explicit migration or re-creation.
+        let db_source_channel = if let Some(store) = self.store() {
+            match store.get_conversation_source_channel(thread_uuid).await {
+                Ok(sc) => {
+                    if sc.is_none() {
+                        tracing::warn!(
+                            thread_id = %thread_uuid,
+                            "Legacy thread has no stored source_channel; \
+                             cross-channel approvals will be denied (fail-closed)"
+                        );
+                    }
+                    sc
+                }
+                Err(e) => {
+                    tracing::error!(
+                        thread_id = %thread_uuid,
+                        error = %e,
+                        "Failed to read source_channel from DB; \
+                         cross-channel approvals will be denied (fail-closed)"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let effective_source_channel = db_source_channel.as_deref();
+
         let session_id = {
             let sess = session.lock().await;
             sess.id
         };
 
-        let mut thread = crate::agent::session::Thread::with_id(thread_uuid, session_id);
+        let mut thread = crate::agent::session::Thread::with_id(
+            thread_uuid,
+            session_id,
+            effective_source_channel,
+        );
         if !chat_messages.is_empty() {
             thread.restore_from_messages(chat_messages);
         }
@@ -175,6 +214,7 @@ impl Agent {
     pub(super) async fn process_user_input(
         &self,
         message: &IncomingMessage,
+        tenant: crate::tenant::TenantCtx,
         session: Arc<Mutex<Session>>,
         thread_id: Uuid,
         content: &str,
@@ -351,7 +391,7 @@ impl Agent {
 
         if let Some(intent) = self.router.route_command(&temp_message) {
             // Explicit command like /status, /job, /list - handle directly
-            return self.handle_job_or_command(intent, message).await;
+            return self.handle_job_or_command(intent, message, &tenant).await;
         }
 
         // Natural language goes through the agentic loop
@@ -462,7 +502,7 @@ impl Agent {
 
         // Run the agentic tool execution loop
         let result = self
-            .run_agentic_loop(message, session.clone(), thread_id, turn_messages)
+            .run_agentic_loop(message, tenant, session.clone(), thread_id, turn_messages)
             .await;
 
         // Re-acquire lock and check if interrupted
@@ -635,7 +675,7 @@ impl Agent {
         user_id: &str,
     ) -> bool {
         match store
-            .ensure_conversation(thread_id, channel, user_id, None)
+            .ensure_conversation(thread_id, channel, user_id, None, Some(channel))
             .await
         {
             Ok(true) => true,
@@ -1530,7 +1570,13 @@ impl Agent {
 
             // Continue the agentic loop (a tool was already executed this turn)
             let result = self
-                .run_agentic_loop(message, session.clone(), thread_id, context_messages)
+                .run_agentic_loop(
+                    message,
+                    self.tenant_ctx(&message.user_id).await,
+                    session.clone(),
+                    thread_id,
+                    context_messages,
+                )
                 .await;
 
             // Handle the result
@@ -1878,7 +1924,7 @@ impl Agent {
             .get_or_create_session(&message.user_id)
             .await;
         let mut sess = session.lock().await;
-        let thread = sess.create_thread();
+        let thread = sess.create_thread(Some(&message.channel));
         let thread_id = thread.id;
         Ok(SubmissionResult::ok_with_message(format!(
             "New thread: {}",
@@ -2004,7 +2050,10 @@ fn rebuild_chat_messages_from_db(
                             let name = c["name"].as_str().unwrap_or("unknown").to_string();
                             let content = if let Some(err) = c.get("error").and_then(|v| v.as_str())
                             {
-                                format!("Error: {}", err)
+                                // Both wrapped (new) and legacy (plain) errors pass
+                                // through as-is. Legacy errors are already descriptive
+                                // (e.g. "Tool 'http' failed: timeout"), so no prefix needed.
+                                err.to_string()
                             } else if let Some(res) = c.get("result").and_then(|v| v.as_str()) {
                                 res.to_string()
                             } else if let Some(preview) =
@@ -2090,11 +2139,36 @@ mod tests {
 
         assert_eq!(result[3].role, crate::llm::Role::Tool);
         assert_eq!(result[3].tool_call_id, Some("call_1".to_string()));
-        assert!(result[3].content.contains("Error: timeout"));
+        assert!(result[3].content.contains("timeout"));
 
         // final assistant
         assert_eq!(result[4].role, crate::llm::Role::Assistant);
         assert_eq!(result[4].content, "I found some results.");
+    }
+
+    #[test]
+    fn test_rebuild_chat_messages_preserves_wrapped_tool_error() {
+        let wrapped_error =
+            "<tool_output name=\"http\">\nTool 'http' failed: timeout\n</tool_output>";
+        let tool_json = serde_json::json!([
+            {
+                "name": "http",
+                "call_id": "call_1",
+                "parameters": {"url": "https://example.com"},
+                "error": wrapped_error
+            }
+        ]);
+        let messages = vec![
+            make_db_msg("user", "Fetch example"),
+            make_db_msg("tool_calls", &tool_json.to_string()),
+        ];
+
+        let result = rebuild_chat_messages_from_db(&messages);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[2].role, crate::llm::Role::Tool);
+        assert_eq!(result[2].tool_call_id, Some("call_1".to_string()));
+        assert_eq!(result[2].content, wrapped_error);
     }
 
     #[test]
@@ -2186,7 +2260,7 @@ mod tests {
 
         let session_id = Uuid::new_v4();
         let thread_id = Uuid::new_v4();
-        let mut thread = Thread::with_id(thread_id, session_id);
+        let mut thread = Thread::with_id(thread_id, session_id, None);
 
         // Set thread to AwaitingApproval with a pending tool approval
         let pending = PendingApproval {
@@ -2318,7 +2392,7 @@ mod tests {
         use crate::agent::session::{MAX_PENDING_MESSAGES, Thread, ThreadState};
         use uuid::Uuid;
 
-        let mut thread = Thread::new(Uuid::new_v4());
+        let mut thread = Thread::new(Uuid::new_v4(), None);
         thread.start_turn("processing something");
         assert_eq!(thread.state, ThreadState::Processing);
 
@@ -2344,7 +2418,7 @@ mod tests {
         use crate::agent::session::{Thread, ThreadState};
         use uuid::Uuid;
 
-        let mut thread = Thread::new(Uuid::new_v4());
+        let mut thread = Thread::new(Uuid::new_v4(), None);
         thread.start_turn("processing");
 
         thread.queue_message("pending-1".to_string());
@@ -2374,7 +2448,7 @@ mod tests {
 
         let thread_id = Uuid::new_v4();
         let session_id = Uuid::new_v4();
-        let mut thread = Thread::with_id(thread_id, session_id);
+        let mut thread = Thread::with_id(thread_id, session_id, None);
         thread.start_turn("working");
         assert_eq!(thread.state, ThreadState::Processing);
 
@@ -2401,7 +2475,7 @@ mod tests {
 
         let thread_id = Uuid::new_v4();
         let session_id = Uuid::new_v4();
-        let mut thread = Thread::with_id(thread_id, session_id);
+        let mut thread = Thread::with_id(thread_id, session_id, None);
         thread.start_turn("working");
         assert_eq!(thread.state, ThreadState::Processing);
 
