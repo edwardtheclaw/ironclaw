@@ -59,6 +59,7 @@ pub mod import;
 pub mod llm;
 pub mod observability;
 pub mod orchestrator;
+pub mod ownership;
 pub mod pairing;
 pub mod profile;
 pub mod registry;
