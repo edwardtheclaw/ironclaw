@@ -144,6 +144,14 @@ pub async fn execute_action_calls(
                     early_events.push(EventKind::ApprovalRequested {
                         action_name: call.action_name.clone(),
                         call_id: call.id.clone(),
+                        parameters: Some(call.parameters.clone()),
+                        description: None,
+                        allow_always: None,
+                        gate_name: None,
+                        params_summary: crate::types::event::summarize_params(
+                            &call.action_name,
+                            &call.parameters,
+                        ),
                     });
                     return Ok(ActionBatchResult {
                         results: early_results,
@@ -197,10 +205,20 @@ pub async fn execute_action_calls(
     if runnable_indices.len() == 1 {
         let (idx, lease) = runnable_indices.into_iter().next().unwrap(); // safety: len()==1 checked above
         let call = &calls[idx];
+        let mut exec_ctx = context.clone();
+        exec_ctx.current_call_id = Some(call.id.clone());
         let exec_result = effects
-            .execute_action(&call.action_name, call.parameters.clone(), &lease, context)
+            .execute_action(
+                &call.action_name,
+                call.parameters.clone(),
+                &lease,
+                &exec_ctx,
+            )
             .await;
-        slot_results[idx] = Some(classify_exec_result(exec_result, call, context));
+        if interrupted_call_needs_refund(&exec_result) {
+            let _ = leases.refund_use(lease.id).await;
+        }
+        slot_results[idx] = Some(classify_exec_result(exec_result, call, &exec_ctx));
     } else if runnable_indices.len() > 1 {
         // Multiple calls: execute in parallel via JoinSet
         let mut join_set = tokio::task::JoinSet::new();
@@ -208,7 +226,8 @@ pub async fn execute_action_calls(
 
         for (idx, lease) in runnable_indices {
             let call = calls[idx].clone();
-            let ctx = context.clone();
+            let mut ctx = context.clone();
+            ctx.current_call_id = Some(call.id.clone());
             let effects = effects.clone();
             let lease = lease.clone();
 
@@ -216,14 +235,17 @@ pub async fn execute_action_calls(
                 let result = effects
                     .execute_action(&call.action_name, call.parameters.clone(), &lease, &ctx)
                     .await;
-                (idx, classify_exec_result(result, &call, &ctx))
+                (idx, lease.id, result, call, ctx)
             });
         }
 
         while let Some(join_result) = join_set.join_next().await {
             match join_result {
-                Ok((idx, classified)) => {
-                    slot_results[idx] = Some(classified);
+                Ok((idx, lease_id, result, call, ctx)) => {
+                    if interrupted_call_needs_refund(&result) {
+                        let _ = leases.refund_use(lease_id).await;
+                    }
+                    slot_results[idx] = Some(classify_exec_result(result, &call, &ctx));
                 }
                 Err(e) => {
                     // Task panicked — should not happen, but handle gracefully
@@ -262,6 +284,7 @@ pub async fn execute_action_calls(
                 } else if let EventKind::ApprovalRequested {
                     ref action_name,
                     ref call_id,
+                    ..
                 } = event
                     && result.output.get("status").and_then(|v| v.as_str()) == Some("gate_paused")
                 {
@@ -343,7 +366,8 @@ fn classify_exec_result(
             gate_name,
             action_name,
             call_id,
-            ..
+            parameters,
+            resume_kind,
         }) => {
             let _error_msg = format!("gate paused: {gate_name}");
             let error_result = ActionResult {
@@ -356,6 +380,17 @@ fn classify_exec_result(
             let event = EventKind::ApprovalRequested {
                 action_name,
                 call_id,
+                parameters: Some((*parameters).clone()),
+                description: None,
+                allow_always: match *resume_kind {
+                    crate::gate::ResumeKind::Approval { allow_always } => Some(allow_always),
+                    _ => None,
+                },
+                gate_name: Some(gate_name.clone()),
+                params_summary: crate::types::event::summarize_params(
+                    &call.action_name,
+                    &parameters,
+                ),
             };
             (error_result, event)
         }
@@ -377,6 +412,15 @@ fn classify_exec_result(
             (error_result, event)
         }
     }
+}
+
+fn interrupted_call_needs_refund(result: &Result<ActionResult, EngineError>) -> bool {
+    matches!(
+        result,
+        Err(EngineError::NeedApproval { .. }
+            | EngineError::NeedAuthentication { .. }
+            | EngineError::GatePaused { .. })
+    )
 }
 
 #[cfg(test)]
@@ -453,6 +497,7 @@ mod tests {
             project_id: thread.project_id,
             user_id: "test".into(),
             step_id: StepId::new(),
+            current_call_id: None,
         }
     }
 

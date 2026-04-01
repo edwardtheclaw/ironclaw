@@ -8,7 +8,7 @@
 //! - Sensitive parameter redaction
 //! - Rate limiting (per-user, per-tool)
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -31,6 +31,35 @@ use ironclaw_safety::SafetyLayer;
 /// The router sets this to emit SSE events; mission threads may have a no-op.
 pub type AuthRequiredCallback = Box<dyn Fn(&str, &str) + Send + Sync>;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OneShotApproval {
+    tool_name: String,
+    call_id: Option<String>,
+    params_fingerprint: Option<String>,
+}
+
+fn normalize_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(normalize_json).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let mut normalized = serde_json::Map::new();
+            for (key, value) in entries {
+                normalized.insert(key.clone(), normalize_json(value));
+            }
+            serde_json::Value::Object(normalized)
+        }
+        other => other.clone(),
+    }
+}
+
+fn params_fingerprint(parameters: &serde_json::Value) -> String {
+    serde_json::to_string(&normalize_json(parameters)).unwrap_or_else(|_| parameters.to_string())
+}
+
 /// Wraps the existing tool pipeline to implement the engine's `EffectExecutor`.
 ///
 /// Enforces all v1 security controls at the adapter boundary:
@@ -41,6 +70,8 @@ pub struct EffectBridgeAdapter {
     hooks: Arc<HookRegistry>,
     /// Tools the user has approved with "always" (persists within session).
     auto_approved: RwLock<HashSet<String>>,
+    /// One-shot approvals scoped to a thread, tool name, and optionally call id and params.
+    one_shot_approvals: RwLock<HashMap<ironclaw_engine::ThreadId, HashSet<OneShotApproval>>>,
     /// Per-step tool call counter (reset externally between steps).
     call_count: std::sync::atomic::AtomicU32,
     /// Per-user per-tool sliding window rate limiter.
@@ -64,6 +95,7 @@ impl EffectBridgeAdapter {
             safety,
             hooks,
             auto_approved: RwLock::new(HashSet::new()),
+            one_shot_approvals: RwLock::new(HashMap::new()),
             call_count: std::sync::atomic::AtomicU32::new(0),
             rate_limiter: RateLimiter::new(),
             mission_manager: RwLock::new(None),
@@ -95,6 +127,145 @@ impl EffectBridgeAdapter {
     /// Revoke auto-approve for a tool (rollback on resume failure).
     pub async fn revoke_auto_approve(&self, tool_name: &str) {
         self.auto_approved.write().await.remove(tool_name);
+    }
+
+    /// Grant a one-shot approval for the next matching tool execution on a thread.
+    pub async fn approve_next_tool_call(
+        &self,
+        thread_id: ironclaw_engine::ThreadId,
+        tool_name: &str,
+    ) {
+        self.approve_next_tool_call_for_call(thread_id, tool_name, None)
+            .await;
+    }
+
+    /// Grant a one-shot approval for a specific pending tool call on a thread.
+    pub async fn approve_next_tool_call_for_call(
+        &self,
+        thread_id: ironclaw_engine::ThreadId,
+        tool_name: &str,
+        call_id: Option<&str>,
+    ) {
+        self.approve_next_tool_call_for_call_with_params(thread_id, tool_name, call_id, None)
+            .await;
+    }
+
+    /// Grant a one-shot approval scoped to a specific pending tool call and params.
+    pub async fn approve_next_tool_call_for_call_with_params(
+        &self,
+        thread_id: ironclaw_engine::ThreadId,
+        tool_name: &str,
+        call_id: Option<&str>,
+        parameters: Option<&serde_json::Value>,
+    ) {
+        self.one_shot_approvals
+            .write()
+            .await
+            .entry(thread_id)
+            .or_default()
+            .insert(OneShotApproval {
+                tool_name: tool_name.to_string(),
+                call_id: call_id.map(str::to_string),
+                params_fingerprint: parameters.map(params_fingerprint),
+            });
+    }
+
+    pub async fn revoke_next_tool_call(
+        &self,
+        thread_id: ironclaw_engine::ThreadId,
+        tool_name: &str,
+    ) {
+        self.revoke_next_tool_call_for_call(thread_id, tool_name, None)
+            .await;
+    }
+
+    pub async fn revoke_next_tool_call_for_call(
+        &self,
+        thread_id: ironclaw_engine::ThreadId,
+        tool_name: &str,
+        call_id: Option<&str>,
+    ) {
+        self.revoke_next_tool_call_for_call_with_params(thread_id, tool_name, call_id, None)
+            .await;
+    }
+
+    pub async fn revoke_next_tool_call_for_call_with_params(
+        &self,
+        thread_id: ironclaw_engine::ThreadId,
+        tool_name: &str,
+        call_id: Option<&str>,
+        parameters: Option<&serde_json::Value>,
+    ) {
+        let mut guard = self.one_shot_approvals.write().await;
+        if let Some(approvals) = guard.get_mut(&thread_id) {
+            approvals.remove(&OneShotApproval {
+                tool_name: tool_name.to_string(),
+                call_id: call_id.map(str::to_string),
+                params_fingerprint: parameters.map(params_fingerprint),
+            });
+            if approvals.is_empty() {
+                guard.remove(&thread_id);
+            }
+        }
+    }
+
+    async fn consume_one_shot_approval(
+        &self,
+        thread_id: ironclaw_engine::ThreadId,
+        action_name: &str,
+        lookup_name: &str,
+        current_call_id: Option<&str>,
+        parameters: &serde_json::Value,
+    ) -> bool {
+        let mut guard = self.one_shot_approvals.write().await;
+        let Some(approvals) = guard.get_mut(&thread_id) else {
+            return false;
+        };
+
+        let fingerprint = params_fingerprint(parameters);
+        let tool_matches = |entry: &OneShotApproval| {
+            entry.tool_name == action_name || entry.tool_name == lookup_name
+        };
+        let call_matches = |entry: &OneShotApproval| entry.call_id.as_deref() == current_call_id;
+        let params_match = |entry: &OneShotApproval| {
+            entry.params_fingerprint.as_deref() == Some(fingerprint.as_str())
+        };
+
+        let matched = approvals
+            .iter()
+            .find(|entry| tool_matches(entry) && call_matches(entry) && params_match(entry))
+            .cloned()
+            .or_else(|| {
+                approvals
+                    .iter()
+                    .find(|entry| tool_matches(entry) && params_match(entry))
+                    .cloned()
+            })
+            .or_else(|| {
+                approvals
+                    .iter()
+                    .find(|entry| tool_matches(entry) && call_matches(entry))
+                    .cloned()
+            })
+            .or_else(|| {
+                approvals
+                    .iter()
+                    .find(|entry| {
+                        tool_matches(entry)
+                            && entry.call_id.is_none()
+                            && entry.params_fingerprint.is_none()
+                    })
+                    .cloned()
+            });
+
+        if let Some(ref candidate) = matched {
+            approvals.remove(candidate);
+        }
+
+        if matched.is_some() && approvals.is_empty() {
+            guard.remove(&thread_id);
+        }
+        matched.is_some()
     }
 
     /// Access the underlying tool registry (for param redaction, etc.).
@@ -362,7 +533,16 @@ impl EffectExecutor for EffectBridgeAdapter {
                 }
                 ApprovalRequirement::UnlessAutoApproved => {
                     let is_approved = self.auto_approved.read().await.contains(lookup_name);
-                    if !is_approved {
+                    let one_shot_approved = self
+                        .consume_one_shot_approval(
+                            context.thread_id,
+                            action_name,
+                            lookup_name,
+                            context.current_call_id.as_deref(),
+                            &parameters,
+                        )
+                        .await;
+                    if !is_approved && !one_shot_approved {
                         // In v2, credential-backed HTTP calls are auto-approved.
                         // The user authorized by storing the credential — the v1
                         // interactive approval flow doesn't exist in v2.
@@ -375,7 +555,7 @@ impl EffectExecutor for EffectBridgeAdapter {
                         if !has_credential_backing {
                             return Err(EngineError::NeedApproval {
                                 action_name: action_name.to_string(),
-                                call_id: String::new(),
+                                call_id: context.current_call_id.clone().unwrap_or_default(),
                                 parameters,
                             });
                         }
@@ -655,22 +835,17 @@ impl EffectExecutor for EffectBridgeAdapter {
 
             let python_name = td.name.replace('-', "_");
 
-            // Check default approval requirement (with empty params)
-            let requires_approval = if let Some(tool) = self.tools.get(&td.name).await {
-                !matches!(
-                    tool.requires_approval(&serde_json::json!({})),
-                    ApprovalRequirement::Never
-                )
-            } else {
-                false
-            };
-
             actions.push(ActionDef {
                 name: python_name,
                 description: td.description,
                 parameters_schema: td.parameters,
                 effects: vec![],
-                requires_approval,
+                // Approval is enforced at execute-time inside this adapter so
+                // thread-scoped one-shot approvals and auth-aware bypasses can
+                // participate. Advertising approval here would cause the engine
+                // policy preflight to interrupt before the adapter can apply
+                // those runtime checks.
+                requires_approval: false,
             });
         }
 
@@ -762,6 +937,9 @@ fn is_v1_auth_tool(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::JobContext;
+    use crate::tools::{Tool, ToolError, ToolOutput};
+    use async_trait::async_trait;
 
     fn make_adapter() -> EffectBridgeAdapter {
         use ironclaw_safety::SafetyConfig;
@@ -813,6 +991,208 @@ mod tests {
         assert!(!adapter.auto_approved.read().await.contains("shell"));
         adapter.auto_approve_tool("shell").await;
         assert!(adapter.auto_approved.read().await.contains("shell"));
+    }
+
+    struct ApprovalTestTool;
+
+    #[async_trait]
+    impl Tool for ApprovalTestTool {
+        fn name(&self) -> &str {
+            "approval_test"
+        }
+
+        fn description(&self) -> &str {
+            "Test tool that requires approval"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::success(
+                serde_json::json!({ "echo": params }),
+                std::time::Duration::from_millis(1),
+            ))
+        }
+
+        fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+            ApprovalRequirement::UnlessAutoApproved
+        }
+    }
+
+    fn lease() -> ironclaw_engine::CapabilityLease {
+        ironclaw_engine::CapabilityLease {
+            id: ironclaw_engine::types::capability::LeaseId::new(),
+            thread_id: ironclaw_engine::ThreadId::new(),
+            capability_name: "tools".into(),
+            granted_actions: vec![],
+            granted_at: chrono::Utc::now(),
+            expires_at: None,
+            max_uses: None,
+            uses_remaining: None,
+            revoked: false,
+            revoked_reason: None,
+        }
+    }
+
+    fn exec_ctx(
+        thread_id: ironclaw_engine::ThreadId,
+        call_id: Option<&str>,
+    ) -> ironclaw_engine::ThreadExecutionContext {
+        ironclaw_engine::ThreadExecutionContext {
+            thread_id,
+            thread_type: ironclaw_engine::types::thread::ThreadType::Foreground,
+            project_id: ironclaw_engine::ProjectId::new(),
+            user_id: "test_user".to_string(),
+            step_id: ironclaw_engine::StepId::new(),
+            current_call_id: call_id.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn need_approval_preserves_current_call_id() {
+        use ironclaw_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(ApprovalTestTool)).await;
+
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+
+        let thread_id = ironclaw_engine::ThreadId::new();
+        let result = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"value": "x"}),
+                &lease(),
+                &exec_ctx(thread_id, Some("call_approve_1")),
+            )
+            .await;
+
+        match result {
+            Err(EngineError::NeedApproval { call_id, .. }) => {
+                assert_eq!(call_id, "call_approve_1");
+            }
+            other => panic!("expected NeedApproval, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn one_shot_approval_allows_only_matching_call_id_once() {
+        use ironclaw_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(ApprovalTestTool)).await;
+
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+
+        let thread_id = ironclaw_engine::ThreadId::new();
+        adapter
+            .approve_next_tool_call_for_call(thread_id, "approval_test", Some("call_once_1"))
+            .await;
+
+        let first = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"value": "x"}),
+                &lease(),
+                &exec_ctx(thread_id, Some("wrong_call")),
+            )
+            .await;
+        assert!(matches!(first, Err(EngineError::NeedApproval { .. })));
+
+        let second = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"value": "x"}),
+                &lease(),
+                &exec_ctx(thread_id, Some("call_once_1")),
+            )
+            .await
+            .expect("one-shot approval should allow first call");
+        assert!(!second.is_error);
+
+        let third = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"value": "y"}),
+                &lease(),
+                &exec_ctx(thread_id, Some("call_once_2")),
+            )
+            .await;
+        assert!(matches!(third, Err(EngineError::NeedApproval { .. })));
+    }
+
+    #[tokio::test]
+    async fn one_shot_approval_allows_same_params_with_new_call_id_once() {
+        use ironclaw_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(ApprovalTestTool)).await;
+
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+
+        let thread_id = ironclaw_engine::ThreadId::new();
+        let params = serde_json::json!({"value": "x", "nested": {"b": 2, "a": 1}});
+        adapter
+            .approve_next_tool_call_for_call_with_params(
+                thread_id,
+                "approval_test",
+                Some("call_once_1"),
+                Some(&params),
+            )
+            .await;
+
+        let first = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"nested": {"a": 1, "b": 2}, "value": "x"}),
+                &lease(),
+                &exec_ctx(thread_id, Some("call_once_2")),
+            )
+            .await
+            .expect("same params on the same thread should consume the approval once");
+        assert!(!first.is_error);
+
+        let second = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"value": "x"}),
+                &lease(),
+                &exec_ctx(thread_id, Some("call_once_3")),
+            )
+            .await;
+        assert!(matches!(second, Err(EngineError::NeedApproval { .. })));
     }
 
     // ── extract_credential_name tests ──────────────────────────
@@ -988,6 +1368,7 @@ mod tests {
             project_id: ironclaw_engine::ProjectId::new(),
             user_id: "test_user".to_string(),
             step_id: ironclaw_engine::StepId::new(),
+            current_call_id: None,
         };
 
         let result = adapter.execute_action("http", params, &lease, &ctx).await;

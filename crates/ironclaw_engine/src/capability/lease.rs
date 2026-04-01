@@ -88,6 +88,19 @@ impl LeaseManager {
         Ok(())
     }
 
+    /// Refund one lease use after an execution was interrupted before the
+    /// action completed.
+    pub async fn refund_use(&self, lease_id: LeaseId) -> Result<(), EngineError> {
+        let mut leases = self.active.write().await;
+        let lease = leases
+            .get_mut(&lease_id)
+            .ok_or_else(|| EngineError::LeaseExpired {
+                capability_name: format!("lease {lease_id:?} not found"),
+            })?;
+        lease.refund_use();
+        Ok(())
+    }
+
     /// Revoke a lease by ID with a reason for audit trail.
     pub async fn revoke(&self, lease_id: LeaseId, reason: &str) {
         let mut leases = self.active.write().await;
@@ -270,6 +283,19 @@ mod tests {
         assert!(mgr.consume_use(lease.id).await.is_ok());
         assert!(mgr.consume_use(lease.id).await.is_ok());
         assert!(mgr.consume_use(lease.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn refund_use_restores_consumed_budget() {
+        let mgr = LeaseManager::new();
+        let tid = ThreadId::new();
+        let lease = mgr.grant(tid, "github", vec![], None, Some(2)).await;
+        mgr.consume_use(lease.id).await.unwrap();
+        let consumed = mgr.check(lease.id).await.unwrap();
+        assert_eq!(consumed.uses_remaining, Some(1));
+        mgr.refund_use(lease.id).await.unwrap();
+        let restored = mgr.check(lease.id).await.unwrap();
+        assert_eq!(restored.uses_remaining, Some(2));
     }
 
     #[tokio::test]

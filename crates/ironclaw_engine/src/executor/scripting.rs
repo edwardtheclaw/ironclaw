@@ -544,7 +544,8 @@ pub async fn execute_code_with_skills(
                         let name = action_name.clone();
                         let params_clone = params.clone();
                         let lease_clone = lease.clone();
-                        let ctx = context.clone();
+                        let mut ctx = context.clone();
+                        ctx.current_call_id = Some(str_call_id.clone());
                         let ps = crate::types::event::summarize_params(&name, &params);
 
                         let handle = tokio::spawn(async move {
@@ -559,6 +560,8 @@ pub async fn execute_code_with_skills(
                                 handle,
                                 action_name,
                                 call_id: str_call_id,
+                                lease_id: lease.id,
+                                parameters: params.clone(),
                                 params_summary: ps,
                             },
                         );
@@ -649,13 +652,18 @@ pub async fn execute_code_with_skills(
                                 handle,
                                 action_name,
                                 call_id,
+                                lease_id,
+                                parameters,
                                 params_summary,
                             } => {
                                 resolve_tool_future(
                                     handle,
                                     &action_name,
                                     &call_id,
+                                    lease_id,
+                                    parameters,
                                     params_summary,
+                                    leases,
                                     context,
                                     &mut action_results,
                                     &mut events,
@@ -792,6 +800,8 @@ enum PendingFuture {
         handle: tokio::task::JoinHandle<Result<ActionResult, EngineError>>,
         action_name: String,
         call_id: String,
+        lease_id: crate::types::capability::LeaseId,
+        parameters: serde_json::Value,
         params_summary: Option<String>,
     },
     /// LLM call (llm_query / llm_query_batched / rlm_query).
@@ -866,6 +876,11 @@ async fn preflight_action(
                 events.push(EventKind::ApprovalRequested {
                     action_name: action_name.into(),
                     call_id: call_id.into(),
+                    parameters: Some(params.clone()),
+                    description: None,
+                    allow_always: None,
+                    gate_name: None,
+                    params_summary: crate::types::event::summarize_params(action_name, params),
                 });
                 return PreflightResult::NeedApproval(
                     crate::runtime::messaging::ThreadOutcome::NeedApproval {
@@ -1232,7 +1247,10 @@ async fn resolve_tool_future(
     handle: tokio::task::JoinHandle<Result<ActionResult, EngineError>>,
     action_name: &str,
     call_id: &str,
+    lease_id: crate::types::capability::LeaseId,
+    parameters: serde_json::Value,
     params_summary: Option<String>,
+    leases: &LeaseManager,
     context: &ThreadExecutionContext,
     action_results: &mut Vec<ActionResult>,
     events: &mut Vec<EventKind>,
@@ -1256,6 +1274,7 @@ async fn resolve_tool_future(
             call_id,
             ..
         })) => {
+            let _ = leases.refund_use(lease_id).await;
             events.push(EventKind::ActionFailed {
                 step_id: context.step_id,
                 action_name: action_name.clone(),
@@ -1275,13 +1294,40 @@ async fn resolve_tool_future(
             call_id,
             ..
         })) => {
+            let _ = leases.refund_use(lease_id).await;
             events.push(EventKind::ApprovalRequested {
                 action_name,
                 call_id,
+                parameters: Some(parameters),
+                description: None,
+                allow_always: None,
+                gate_name: None,
+                params_summary,
             });
             ExtFunctionResult::Error(MontyException::new(
                 ExcType::RuntimeError,
                 Some("action requires approval".into()),
+            ))
+        }
+        Ok(Err(EngineError::GatePaused {
+            gate_name,
+            action_name,
+            call_id,
+            ..
+        })) => {
+            let _ = leases.refund_use(lease_id).await;
+            events.push(EventKind::ApprovalRequested {
+                action_name,
+                call_id,
+                parameters: Some(parameters),
+                description: None,
+                allow_always: None,
+                gate_name: Some(gate_name.clone()),
+                params_summary,
+            });
+            ExtFunctionResult::Error(MontyException::new(
+                ExcType::RuntimeError,
+                Some(format!("execution paused by gate '{gate_name}'")),
             ))
         }
         Ok(Err(e)) => {
@@ -1532,6 +1578,7 @@ mod tests {
             project_id: thread.project_id,
             user_id: "test".into(),
             step_id: StepId::new(),
+            current_call_id: None,
         }
     }
 

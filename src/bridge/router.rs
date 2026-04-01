@@ -833,24 +833,58 @@ pub async fn resolve_gate(
                 // Also approve hyphenated variant
                 let registry_name = pending.action_name.replace('_', "-");
                 state.effect_adapter.auto_approve_tool(&registry_name).await;
+            } else {
+                // Preferred match: same tool and same params on this thread.
+                state
+                    .effect_adapter
+                    .approve_next_tool_call_for_call_with_params(
+                        pending.thread_id,
+                        &pending.action_name,
+                        Some(&pending.call_id),
+                        Some(&pending.parameters),
+                    )
+                    .await;
+                // Fallback: the current engine resume path may replay the paused
+                // step without preserving the original approval call metadata
+                // exactly. Keep a single thread-scoped approval so the approved
+                // retry still executes once.
+                state
+                    .effect_adapter
+                    .approve_next_tool_call(pending.thread_id, &pending.action_name)
+                    .await;
+                let registry_name = pending.action_name.replace('_', "-");
+                if registry_name != pending.action_name {
+                    state
+                        .effect_adapter
+                        .approve_next_tool_call_for_call_with_params(
+                            pending.thread_id,
+                            &registry_name,
+                            Some(&pending.call_id),
+                            Some(&pending.parameters),
+                        )
+                        .await;
+                    state
+                        .effect_adapter
+                        .approve_next_tool_call(pending.thread_id, &registry_name)
+                        .await;
+                }
             }
 
-            let resume_msg = ironclaw_engine::ThreadMessage::user(format!(
-                "User approved action '{}'. Continue from the pending step \
-                 and reuse the approved action if still needed.",
+            let approved_msg = ironclaw_engine::ThreadMessage::user(format!(
+                "User approved action '{}'. Retry the exact same action with the same parameters now.",
                 pending.action_name
             ));
 
-            state.effect_adapter.reset_call_count();
             match state
                 .thread_manager
                 .resume_thread(
                     pending.thread_id,
                     message.user_id.clone(),
-                    Some(resume_msg),
+                    Some(approved_msg),
                     Some((pending.call_id.clone(), true)),
                 )
                 .await
+                .map_err(|e| engine_err("resume error", e))
             {
                 Ok(()) => {}
                 Err(e) => {
@@ -866,8 +900,38 @@ pub async fn resolve_gate(
                             .effect_adapter
                             .revoke_auto_approve(&registry_name)
                             .await;
+                    } else {
+                        state
+                            .effect_adapter
+                            .revoke_next_tool_call_for_call_with_params(
+                                pending.thread_id,
+                                &pending.action_name,
+                                Some(&pending.call_id),
+                                Some(&pending.parameters),
+                            )
+                            .await;
+                        state
+                            .effect_adapter
+                            .revoke_next_tool_call(pending.thread_id, &pending.action_name)
+                            .await;
+                        let registry_name = pending.action_name.replace('_', "-");
+                        if registry_name != pending.action_name {
+                            state
+                                .effect_adapter
+                                .revoke_next_tool_call_for_call_with_params(
+                                    pending.thread_id,
+                                    &registry_name,
+                                    Some(&pending.call_id),
+                                    Some(&pending.parameters),
+                                )
+                                .await;
+                            state
+                                .effect_adapter
+                                .revoke_next_tool_call(pending.thread_id, &registry_name)
+                                .await;
+                        }
                     }
-                    return Err(engine_err("resume error", e));
+                    return Err(e);
                 }
             }
         }
@@ -981,18 +1045,16 @@ pub async fn resolve_gate(
                 }
 
                 let resume_msg = ironclaw_engine::ThreadMessage::user(format!(
-                    "Credential '{}' stored. Retrying action '{}'.",
+                    "Credential stored for '{}'. Retry the pending action '{}' now.",
                     credential_name, pending.action_name
                 ));
-
-                state.effect_adapter.reset_call_count();
                 state
                     .thread_manager
                     .resume_thread(
                         pending.thread_id,
                         message.user_id.clone(),
                         Some(resume_msg),
-                        Some((pending.call_id.clone(), true)),
+                        None,
                     )
                     .await
                     .map_err(|e| engine_err("resume error", e))?;
@@ -1006,11 +1068,9 @@ pub async fn resolve_gate(
 
         ironclaw_engine::GateResolution::ExternalCallback { .. } => {
             let resume_msg = ironclaw_engine::ThreadMessage::user(format!(
-                "External confirmation received for action '{}'.",
-                pending.action_name
+                "External authentication completed for '{}'. Retry the pending action '{}' now.",
+                pending.gate_name, pending.action_name
             ));
-
-            state.effect_adapter.reset_call_count();
             state
                 .thread_manager
                 .resume_thread(

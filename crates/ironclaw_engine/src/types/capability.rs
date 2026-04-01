@@ -172,6 +172,16 @@ impl CapabilityLease {
         }
         true
     }
+
+    /// Refund one previously consumed use when execution was interrupted
+    /// before the action actually completed.
+    pub fn refund_use(&mut self) {
+        if let (Some(max_uses), Some(remaining)) = (self.max_uses, self.uses_remaining.as_mut())
+            && *remaining < max_uses
+        {
+            *remaining += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -239,6 +249,19 @@ mod tests {
         for _ in 0..100 {
             assert!(lease.consume_use());
         }
+    }
+
+    #[test]
+    fn refund_use_restores_budget_up_to_max() {
+        let mut lease = make_lease();
+        lease.max_uses = Some(2);
+        lease.uses_remaining = Some(2);
+        assert!(lease.consume_use());
+        assert_eq!(lease.uses_remaining, Some(1));
+        lease.refund_use();
+        assert_eq!(lease.uses_remaining, Some(2));
+        lease.refund_use();
+        assert_eq!(lease.uses_remaining, Some(2));
     }
 
     #[test]

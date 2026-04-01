@@ -11,6 +11,7 @@ mod router;
 pub mod skill_migration;
 mod store_adapter;
 
+pub use effect_adapter::EffectBridgeAdapter;
 pub use router::{
     // DTO types
     EngineMissionDetail,

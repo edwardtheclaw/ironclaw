@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use chrono::Utc;
 use tokio::sync::RwLock;
 
@@ -26,8 +27,13 @@ use ironclaw_engine::{
     ThreadOutcome, ThreadState, ThreadType, TokenUsage,
 };
 
+use ironclaw::bridge::EffectBridgeAdapter;
+use ironclaw::context::JobContext;
 use ironclaw::gate::pending::{PendingGate, PendingGateKey};
 use ironclaw::gate::store::{GateStoreError, PendingGateStore, TRUSTED_GATE_CHANNELS};
+use ironclaw::hooks::HookRegistry;
+use ironclaw::tools::{ApprovalRequirement, Tool, ToolError, ToolOutput, ToolRegistry};
+use ironclaw_safety::{SafetyConfig, SafetyLayer};
 
 // ── Scripted LLM ─────────────────────────────────────────────
 
@@ -75,19 +81,70 @@ struct GateMockEffects {
     gate_approval_tools: Vec<String>,
     /// Tools that trigger GatePaused with Authentication resume kind.
     gate_auth_tools: Vec<String>,
+    /// Tools that require approval first, then authentication on retry.
+    chained_approval_then_auth_tools: Vec<String>,
     /// Recorded calls (including gated ones that were retried after approval).
     calls: RwLock<Vec<(String, serde_json::Value)>>,
-    /// After approval, the tool succeeds on the next call.
+    /// Actions cleared through the approval gate.
     approved: RwLock<std::collections::HashSet<String>>,
+    /// Actions cleared through the auth gate.
+    authenticated: RwLock<std::collections::HashSet<String>>,
+}
+
+struct ApprovalTool;
+
+#[async_trait]
+impl Tool for ApprovalTool {
+    fn name(&self) -> &str {
+        "approval_test"
+    }
+
+    fn description(&self) -> &str {
+        "Integration test approval tool"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "value": { "type": "string" }
+            }
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        _ctx: &JobContext,
+    ) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::success(
+            serde_json::json!({"ok": true, "params": params}),
+            Duration::from_millis(1),
+        ))
+    }
+
+    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+        ApprovalRequirement::UnlessAutoApproved
+    }
 }
 
 impl GateMockEffects {
     fn new(gate_approval_tools: Vec<String>, gate_auth_tools: Vec<String>) -> Arc<Self> {
+        Self::new_with_chain(gate_approval_tools, gate_auth_tools, Vec::new())
+    }
+
+    fn new_with_chain(
+        gate_approval_tools: Vec<String>,
+        gate_auth_tools: Vec<String>,
+        chained_approval_then_auth_tools: Vec<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             gate_approval_tools,
             gate_auth_tools,
+            chained_approval_then_auth_tools,
             calls: RwLock::new(Vec::new()),
             approved: RwLock::new(std::collections::HashSet::new()),
+            authenticated: RwLock::new(std::collections::HashSet::new()),
         })
     }
 
@@ -99,6 +156,14 @@ impl GateMockEffects {
     #[allow(dead_code)]
     async fn mark_approved(&self, tool_name: &str) {
         self.approved.write().await.insert(tool_name.to_string());
+    }
+
+    #[allow(dead_code)]
+    async fn mark_authenticated(&self, tool_name: &str) {
+        self.authenticated
+            .write()
+            .await
+            .insert(tool_name.to_string());
     }
 }
 
@@ -117,6 +182,36 @@ impl EffectExecutor for GateMockEffects {
             .push((action_name.to_string(), parameters.clone()));
 
         let already_approved = self.approved.read().await.contains(action_name);
+        let already_authenticated = self.authenticated.read().await.contains(action_name);
+
+        if self
+            .chained_approval_then_auth_tools
+            .contains(&action_name.to_string())
+        {
+            if !already_approved {
+                return Err(EngineError::GatePaused {
+                    gate_name: "approval".into(),
+                    action_name: action_name.to_string(),
+                    call_id: "call_gate_1".into(),
+                    parameters: Box::new(parameters),
+                    resume_kind: Box::new(ResumeKind::Approval { allow_always: true }),
+                });
+            }
+
+            if !already_authenticated {
+                return Err(EngineError::GatePaused {
+                    gate_name: "authentication".into(),
+                    action_name: action_name.to_string(),
+                    call_id: "call_gate_2".into(),
+                    parameters: Box::new(parameters),
+                    resume_kind: Box::new(ResumeKind::Authentication {
+                        credential_name: "notion".into(),
+                        instructions: "Authenticate your Notion workspace".into(),
+                        auth_url: None,
+                    }),
+                });
+            }
+        }
 
         // Gate: approval required
         if self.gate_approval_tools.contains(&action_name.to_string()) && !already_approved {
@@ -130,7 +225,7 @@ impl EffectExecutor for GateMockEffects {
         }
 
         // Gate: authentication required
-        if self.gate_auth_tools.contains(&action_name.to_string()) && !already_approved {
+        if self.gate_auth_tools.contains(&action_name.to_string()) && !already_authenticated {
             return Err(EngineError::GatePaused {
                 gate_name: "authentication".into(),
                 action_name: action_name.to_string(),
@@ -172,6 +267,13 @@ impl EffectExecutor for GateMockEffects {
                 description: "Echo input".into(),
                 parameters_schema: serde_json::json!({"type": "object"}),
                 effects: vec![EffectType::ReadLocal],
+                requires_approval: false,
+            },
+            ActionDef {
+                name: "tool_install".into(),
+                description: "Install an extension".into(),
+                parameters_schema: serde_json::json!({"type": "object"}),
+                effects: vec![EffectType::WriteExternal],
                 requires_approval: false,
             },
         ])
@@ -372,6 +474,24 @@ fn make_caps(require_approval: bool) -> CapabilityRegistry {
                 requires_approval: false,
             },
         ],
+        knowledge: vec![],
+        policies: vec![],
+    });
+    caps
+}
+
+fn make_caps_with_approval_tool() -> CapabilityRegistry {
+    let mut caps = CapabilityRegistry::new();
+    caps.register(Capability {
+        name: "tools".into(),
+        description: "test tools".into(),
+        actions: vec![ActionDef {
+            name: "approval_test".into(),
+            description: "Approval test tool".into(),
+            parameters_schema: serde_json::json!({"type": "object"}),
+            effects: vec![EffectType::WriteExternal],
+            requires_approval: false,
+        }],
         knowledge: vec![],
         policies: vec![],
     });
@@ -600,7 +720,9 @@ async fn gate_paused_thread_resumes_to_completion() {
     .expect("resume_thread");
 
     let resumed = mgr.join_thread(tid).await.expect("second join");
-    assert!(matches!(resumed, ThreadOutcome::Completed { .. }));
+    if !matches!(resumed, ThreadOutcome::Completed { .. }) {
+        panic!("expected Completed after approved retry, got {:?}", resumed);
+    }
     let saved = store.load_thread(tid).await.unwrap().unwrap();
     assert_eq!(saved.state, ThreadState::Done);
     assert!(
@@ -609,6 +731,367 @@ async fn gate_paused_thread_resumes_to_completion() {
             ironclaw_engine::types::event::EventKind::ApprovalReceived { .. }
         )),
         "resume should record ApprovalReceived"
+    );
+}
+
+#[tokio::test]
+async fn effect_adapter_approval_resolution_replays_pending_call() {
+    let project_id = ProjectId::new();
+    let tools = Arc::new(ToolRegistry::new());
+    tools.register(Arc::new(ApprovalTool)).await;
+
+    let effects = Arc::new(EffectBridgeAdapter::new(
+        tools,
+        Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 10_000,
+            injection_check_enabled: false,
+        })),
+        Arc::new(HookRegistry::default()),
+    ));
+
+    let llm = ScriptedLlm::new(vec![
+        LlmOutput {
+            response: LlmResponse::ActionCalls {
+                calls: vec![ironclaw_engine::ActionCall {
+                    id: "call_approval_1".into(),
+                    action_name: "approval_test".into(),
+                    parameters: serde_json::json!({"value": "hello"}),
+                }],
+                content: None,
+            },
+            usage: TokenUsage::default(),
+        },
+        LlmOutput {
+            response: LlmResponse::ActionCalls {
+                calls: vec![ironclaw_engine::ActionCall {
+                    id: "call_approval_2".into(),
+                    action_name: "approval_test".into(),
+                    parameters: serde_json::json!({"value": "hello"}),
+                }],
+                content: None,
+            },
+            usage: TokenUsage::default(),
+        },
+        LlmOutput {
+            response: LlmResponse::Text("done".into()),
+            usage: TokenUsage::default(),
+        },
+    ]);
+
+    let store = TestStore::new();
+    let mgr = ThreadManager::new(
+        llm,
+        effects.clone(),
+        store.clone() as Arc<dyn Store>,
+        Arc::new(make_caps_with_approval_tool()),
+        Arc::new(LeaseManager::new()),
+        Arc::new(PolicyEngine::new()),
+    );
+
+    let tid = mgr
+        .spawn_thread(
+            "run the approval tool",
+            ThreadType::Foreground,
+            project_id,
+            ThreadConfig::default(),
+            None,
+            "test-user",
+        )
+        .await
+        .expect("spawn_thread");
+
+    let first = mgr.join_thread(tid).await.expect("first join");
+    match first {
+        ThreadOutcome::NeedApproval {
+            action_name,
+            call_id,
+            parameters,
+        } => {
+            assert_eq!(action_name, "approval_test");
+            assert_eq!(call_id, "call_approval_1");
+            assert_eq!(parameters["value"], "hello");
+        }
+        other => panic!("expected NeedApproval, got {other:?}"),
+    }
+    assert_eq!(
+        store.load_thread(tid).await.unwrap().unwrap().state,
+        ThreadState::Waiting
+    );
+
+    effects
+        .approve_next_tool_call_for_call_with_params(
+            tid,
+            "approval_test",
+            Some("call_approval_1"),
+            Some(&serde_json::json!({"value": "hello"})),
+        )
+        .await;
+    effects.approve_next_tool_call(tid, "approval_test").await;
+    mgr.resume_thread(
+        tid,
+        "test-user",
+        Some(ThreadMessage::user(
+            "User approved action 'approval_test'. Retry the exact same action with the same parameters now.",
+        )),
+        Some(("call_approval_1".into(), true)),
+    )
+    .await
+    .expect("resume_thread");
+
+    let resumed = mgr.join_thread(tid).await.expect("second join");
+    assert!(
+        matches!(resumed, ThreadOutcome::Completed { .. }),
+        "expected Completed after approval retry, got {resumed:?}"
+    );
+
+    let saved = store.load_thread(tid).await.unwrap().unwrap();
+    assert_eq!(saved.state, ThreadState::Done);
+    let approval_requests = saved
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                ironclaw_engine::types::event::EventKind::ApprovalRequested { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        approval_requests, 1,
+        "resumed execution should not prompt for approval again"
+    );
+    assert!(
+        saved.events.iter().any(|event| matches!(
+            event.kind,
+            ironclaw_engine::types::event::EventKind::ApprovalReceived { .. }
+        )),
+        "resume should record ApprovalReceived"
+    );
+}
+
+#[tokio::test]
+async fn auth_resolution_retries_same_pending_action_without_second_pause() {
+    let project_id = ProjectId::new();
+    let effects = GateMockEffects::new(vec![], vec!["http".into()]);
+
+    let llm = ScriptedLlm::new(vec![
+        LlmOutput {
+            response: LlmResponse::ActionCalls {
+                calls: vec![ironclaw_engine::ActionCall {
+                    id: "call_auth_1".into(),
+                    action_name: "http".into(),
+                    parameters: serde_json::json!({"url": "https://example.com/private"}),
+                }],
+                content: None,
+            },
+            usage: TokenUsage::default(),
+        },
+        LlmOutput {
+            response: LlmResponse::ActionCalls {
+                calls: vec![ironclaw_engine::ActionCall {
+                    id: "call_auth_2".into(),
+                    action_name: "http".into(),
+                    parameters: serde_json::json!({"url": "https://example.com/private"}),
+                }],
+                content: None,
+            },
+            usage: TokenUsage::default(),
+        },
+        LlmOutput {
+            response: LlmResponse::Text("done".into()),
+            usage: TokenUsage::default(),
+        },
+    ]);
+
+    let store = TestStore::new();
+    let mgr = ThreadManager::new(
+        llm,
+        effects.clone(),
+        store.clone() as Arc<dyn Store>,
+        Arc::new(make_caps(false)),
+        Arc::new(LeaseManager::new()),
+        Arc::new(PolicyEngine::new()),
+    );
+
+    let tid = mgr
+        .spawn_thread(
+            "call the authenticated endpoint",
+            ThreadType::Foreground,
+            project_id,
+            ThreadConfig::default(),
+            None,
+            "test-user",
+        )
+        .await
+        .expect("spawn_thread");
+
+    let first = mgr.join_thread(tid).await.expect("first join");
+    assert!(matches!(first, ThreadOutcome::GatePaused { .. }));
+    assert_eq!(
+        store.load_thread(tid).await.unwrap().unwrap().state,
+        ThreadState::Waiting
+    );
+
+    effects.mark_authenticated("http").await;
+    mgr.resume_thread(
+        tid,
+        "test-user",
+        Some(ThreadMessage::user(
+            "Credential stored for 'test_api_key'. Retry the pending action 'http' now.",
+        )),
+        None,
+    )
+    .await
+    .expect("resume_thread");
+
+    let resumed = mgr.join_thread(tid).await.expect("second join");
+    assert!(
+        matches!(resumed, ThreadOutcome::Completed { .. }),
+        "expected Completed after auth retry, got {resumed:?}"
+    );
+
+    let saved = store.load_thread(tid).await.unwrap().unwrap();
+    let auth_pauses = saved
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                ironclaw_engine::types::event::EventKind::ApprovalRequested { .. }
+            )
+        })
+        .count();
+    assert_eq!(auth_pauses, 1, "resumed auth should not pause again");
+}
+
+#[tokio::test]
+async fn approval_chains_directly_into_auth_for_install_flow() {
+    let project_id = ProjectId::new();
+    let effects = GateMockEffects::new_with_chain(vec![], vec![], vec!["tool_install".into()]);
+
+    let llm = ScriptedLlm::new(vec![
+        LlmOutput {
+            response: LlmResponse::ActionCalls {
+                calls: vec![ironclaw_engine::ActionCall {
+                    id: "call_install_1".into(),
+                    action_name: "tool_install".into(),
+                    parameters: serde_json::json!({"kind": "mcp_server", "name": "notion"}),
+                }],
+                content: None,
+            },
+            usage: TokenUsage::default(),
+        },
+        LlmOutput {
+            response: LlmResponse::ActionCalls {
+                calls: vec![ironclaw_engine::ActionCall {
+                    id: "call_install_2".into(),
+                    action_name: "tool_install".into(),
+                    parameters: serde_json::json!({"name": "notion", "kind": "mcp_server"}),
+                }],
+                content: None,
+            },
+            usage: TokenUsage::default(),
+        },
+        LlmOutput {
+            response: LlmResponse::ActionCalls {
+                calls: vec![ironclaw_engine::ActionCall {
+                    id: "call_install_3".into(),
+                    action_name: "tool_install".into(),
+                    parameters: serde_json::json!({"kind": "mcp_server", "name": "notion"}),
+                }],
+                content: None,
+            },
+            usage: TokenUsage::default(),
+        },
+        LlmOutput {
+            response: LlmResponse::Text("notion connected".into()),
+            usage: TokenUsage::default(),
+        },
+    ]);
+
+    let store = TestStore::new();
+    let mgr = ThreadManager::new(
+        llm,
+        effects.clone(),
+        store.clone() as Arc<dyn Store>,
+        Arc::new(make_caps(false)),
+        Arc::new(LeaseManager::new()),
+        Arc::new(PolicyEngine::new()),
+    );
+
+    let tid = mgr
+        .spawn_thread(
+            "install notion",
+            ThreadType::Foreground,
+            project_id,
+            ThreadConfig::default(),
+            None,
+            "test-user",
+        )
+        .await
+        .expect("spawn_thread");
+
+    let first = mgr.join_thread(tid).await.expect("first join");
+    assert!(matches!(first, ThreadOutcome::GatePaused { .. }));
+
+    effects.mark_approved("tool_install").await;
+    mgr.resume_thread(
+        tid,
+        "test-user",
+        Some(ThreadMessage::user(
+            "User approved action 'tool_install'. Retry the exact same action with the same parameters now.",
+        )),
+        Some(("call_gate_1".into(), true)),
+    )
+    .await
+    .expect("resume after approval");
+
+    let second = mgr.join_thread(tid).await.expect("second join");
+    match second {
+        ThreadOutcome::GatePaused {
+            gate_name,
+            action_name,
+            resume_kind,
+            ..
+        } => {
+            assert_eq!(gate_name, "authentication");
+            assert_eq!(action_name, "tool_install");
+            match resume_kind {
+                ResumeKind::Authentication {
+                    credential_name, ..
+                } => assert_eq!(credential_name, "notion"),
+                other => panic!("expected auth gate after install approval, got {other:?}"),
+            }
+        }
+        other => panic!("expected auth gate immediately after install approval, got {other:?}"),
+    }
+
+    effects.mark_authenticated("tool_install").await;
+    mgr.resume_thread(
+        tid,
+        "test-user",
+        Some(ThreadMessage::user(
+            "Credential stored for 'notion'. Retry the pending action 'tool_install' now.",
+        )),
+        None,
+    )
+    .await
+    .expect("resume after auth");
+
+    let final_outcome = mgr.join_thread(tid).await.expect("third join");
+    assert!(
+        matches!(final_outcome, ThreadOutcome::Completed { .. }),
+        "expected completion after auth, got {final_outcome:?}"
+    );
+
+    let calls = effects.recorded_calls().await;
+    let install_calls = calls
+        .iter()
+        .filter(|(name, _)| name == "tool_install")
+        .count();
+    assert_eq!(
+        install_calls, 3,
+        "install flow should retry once for approval and once for auth"
     );
 }
 

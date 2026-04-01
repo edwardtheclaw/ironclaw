@@ -21,6 +21,7 @@ pub struct ThreadExecutionContext {
     pub project_id: ProjectId,
     pub user_id: String,
     pub step_id: StepId,
+    pub current_call_id: Option<String>,
 }
 
 /// Abstraction over capability action execution.
