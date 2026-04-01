@@ -60,3 +60,17 @@ pub(crate) fn media_type_from_path(path: &str) -> String {
         .unwrap_or("image/jpeg")
         .to_string()
 }
+
+/// Build an OpenAI-style image endpoint from a provider base URL.
+///
+/// Some providers already include `/v1` in their configured base URL while
+/// others expect clients to append it. Keep this logic shared so image tools
+/// do not drift.
+pub(crate) fn image_api_endpoint_url(api_base_url: &str, path: &str) -> String {
+    let base = api_base_url.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}{path}")
+    } else {
+        format!("{base}/v1{path}")
+    }
+}

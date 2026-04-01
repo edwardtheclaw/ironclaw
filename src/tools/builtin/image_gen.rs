@@ -6,6 +6,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
 use crate::context::JobContext;
+use crate::tools::builtin::image_api_endpoint_url;
 use crate::tools::{Tool, ToolError, ToolOutput};
 
 /// Tool for generating images using FLUX or compatible image generation APIs.
@@ -57,12 +58,7 @@ impl ImageGenerateTool {
     }
 
     fn endpoint_url(&self, path: &str) -> String {
-        let base = self.api_base_url.trim_end_matches('/');
-        if base.ends_with("/v1") {
-            format!("{base}{path}")
-        } else {
-            format!("{base}/v1{path}")
-        }
+        image_api_endpoint_url(&self.api_base_url, path)
     }
 }
 

@@ -96,6 +96,8 @@ let authFlowPending = false;
 let _ghostSuggestion = '';
 let currentSettingsSubtab = 'inference';
 let generatedImagesByThread = new Map();
+const GENERATED_IMAGE_THREAD_CACHE_CAP = 20;
+const GENERATED_IMAGES_PER_THREAD_CAP = 8;
 
 // --- Streaming Debounce State ---
 let _streamBuffer = '';
@@ -936,33 +938,41 @@ function hasRenderedGeneratedImage(container, dataUrl, path) {
   });
 }
 
-function addGeneratedImage(dataUrl, path) {
+function addGeneratedImage(dataUrl, path, shouldScroll = true) {
   const container = document.getElementById('chat-messages');
   if (hasRenderedGeneratedImage(container, dataUrl, path || null)) {
     return;
   }
   const card = createGeneratedImageElement(dataUrl, path);
   container.appendChild(card);
-  container.scrollTop = container.scrollHeight;
+  if (shouldScroll) {
+    container.scrollTop = container.scrollHeight;
+  }
 }
 
 function rememberGeneratedImage(threadId, dataUrl, path) {
   if (!threadId || !dataUrl) return;
-  if (!generatedImagesByThread.has(threadId)) {
-    generatedImagesByThread.set(threadId, []);
+  let images = generatedImagesByThread.get(threadId);
+  if (!images) {
+    if (generatedImagesByThread.size >= GENERATED_IMAGE_THREAD_CACHE_CAP) {
+      const oldestThreadId = generatedImagesByThread.keys().next().value;
+      if (oldestThreadId) {
+        generatedImagesByThread.delete(oldestThreadId);
+      }
+    }
+    images = [];
+    generatedImagesByThread.set(threadId, images);
+  } else {
+    // Refresh insertion order so recently viewed/updated threads stay cached.
+    generatedImagesByThread.delete(threadId);
+    generatedImagesByThread.set(threadId, images);
   }
-  const images = generatedImagesByThread.get(threadId);
   if (images.some(img => img.dataUrl === dataUrl && img.path === path)) {
     return;
   }
   images.push({ dataUrl, path: path || null });
-}
-
-function renderGeneratedImagesForCurrentThread() {
-  if (!currentThreadId) return;
-  const images = generatedImagesByThread.get(currentThreadId) || [];
-  for (const image of images) {
-    addGeneratedImage(image.dataUrl, image.path);
+  while (images.length > GENERATED_IMAGES_PER_THREAD_CAP) {
+    images.shift();
   }
 }
 
@@ -1831,14 +1841,14 @@ function loadHistory(before) {
         if (turn.generated_images && turn.generated_images.length > 0) {
           for (const image of turn.generated_images) {
             rememberGeneratedImage(currentThreadId, image.data_url, image.path);
-            addGeneratedImage(image.data_url, image.path);
+            addGeneratedImage(image.data_url, image.path, false);
           }
         }
         if (turn.response) {
           addMessage('assistant', turn.response);
         }
       }
-      renderGeneratedImagesForCurrentThread();
+      container.scrollTop = container.scrollHeight;
       // Show welcome card when history is empty
       if (data.turns.length === 0) {
         showWelcomeCard();
@@ -1866,6 +1876,7 @@ function loadHistory(before) {
         }
         if (turn.generated_images && turn.generated_images.length > 0) {
           for (const image of turn.generated_images) {
+            rememberGeneratedImage(currentThreadId, image.data_url, image.path);
             fragment.appendChild(createGeneratedImageElement(image.data_url, image.path));
           }
         }

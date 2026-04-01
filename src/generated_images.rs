@@ -37,6 +37,10 @@ impl GeneratedImageSentinel {
 
 fn normalize_embedded_json(value: &serde_json::Value) -> Option<serde_json::Value> {
     let mut current = value.clone();
+    // Generated-image sentinels may be serialized more than once as they flow
+    // through tool output, DB persistence, and history reconstruction. Unwrap a
+    // few layers to tolerate that pipeline, but stop after a small fixed number
+    // of rounds so malformed input cannot trigger unbounded reparsing.
     for _ in 0..3 {
         match current {
             serde_json::Value::String(ref s) => {

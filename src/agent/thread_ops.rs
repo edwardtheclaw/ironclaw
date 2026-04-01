@@ -25,6 +25,7 @@ use crate::tools::redact_params;
 use ironclaw_common::truncate_preview;
 
 const FORGED_THREAD_ID_ERROR: &str = "Invalid or unauthorized thread ID.";
+const MAX_PERSISTED_IMAGE_SENTINEL_BYTES: usize = 8 * 1024 * 1024;
 
 fn tool_result_preview_for_persistence(result: &serde_json::Value) -> String {
     if GeneratedImageSentinel::from_value(result).is_some() {
@@ -38,7 +39,17 @@ fn tool_result_preview_for_persistence(result: &serde_json::Value) -> String {
 
 fn tool_result_content_for_persistence(result: &serde_json::Value) -> String {
     if let Some(sentinel) = GeneratedImageSentinel::from_value(result) {
-        return sentinel.value.to_string();
+        // Persist the full image sentinel so web history can reconstruct the
+        // generated image on refresh without any schema changes. Keep a hard
+        // cap so unexpectedly large data URLs do not grow DB rows without bound.
+        let serialized = sentinel.value.to_string();
+        if serialized.len() <= MAX_PERSISTED_IMAGE_SENTINEL_BYTES {
+            return serialized;
+        }
+        return format!(
+            "Generated image omitted from persistence because it exceeded the {} MiB cap",
+            MAX_PERSISTED_IMAGE_SENTINEL_BYTES / (1024 * 1024)
+        );
     }
     match result {
         serde_json::Value::String(s) => truncate_preview(s, 1000),
@@ -2174,6 +2185,35 @@ mod tests {
 
         assert_eq!(preview, "Generated image");
         assert_eq!(rebuilt, "Generated image (image/jpeg)");
+    }
+
+    #[test]
+    fn test_tool_result_content_for_persistence_preserves_image_sentinel_under_cap() {
+        let result = serde_json::json!({
+            "type": "image_generated",
+            "data": "data:image/jpeg;base64,abc123",
+            "media_type": "image/jpeg"
+        });
+
+        let persisted = tool_result_content_for_persistence(&result);
+
+        assert!(persisted.contains("\"type\":\"image_generated\""));
+        assert!(persisted.contains("data:image/jpeg;base64,abc123"));
+    }
+
+    #[test]
+    fn test_tool_result_content_for_persistence_caps_oversized_image_sentinel() {
+        let oversized = "a".repeat(MAX_PERSISTED_IMAGE_SENTINEL_BYTES);
+        let result = serde_json::json!({
+            "type": "image_generated",
+            "data": format!("data:image/jpeg;base64,{oversized}"),
+            "media_type": "image/jpeg"
+        });
+
+        let persisted = tool_result_content_for_persistence(&result);
+
+        assert!(persisted.contains("Generated image omitted from persistence"));
+        assert!(!persisted.contains("data:image/jpeg;base64"));
     }
 
     fn make_db_msg(role: &str, content: &str) -> crate::history::ConversationMessage {

@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::context::JobContext;
+use crate::tools::builtin::image_api_endpoint_url;
 use crate::tools::builtin::path_utils::validate_path;
 use crate::tools::tool::{Tool, ToolError, ToolOutput};
 
@@ -45,12 +46,7 @@ impl ImageEditTool {
     }
 
     fn endpoint_url(&self, path: &str) -> String {
-        let base = self.api_base_url.trim_end_matches('/');
-        if base.ends_with("/v1") {
-            format!("{base}{path}")
-        } else {
-            format!("{base}/v1{path}")
-        }
+        image_api_endpoint_url(&self.api_base_url, path)
     }
 
     /// Read binary image bytes from filesystem.
