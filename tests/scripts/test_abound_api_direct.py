@@ -1,0 +1,128 @@
+"""Direct tests against Abound's dev API — verifies endpoints work independently of IronClaw.
+
+Usage:
+    python tests/scripts/test_abound_api_direct.py
+"""
+
+import os
+
+import requests
+
+# Credentials from env or defaults (dev environment)
+ABOUND_BEARER_TOKEN = os.environ.get(
+    "ABOUND_BEARER_TOKEN",
+    "eyJhbGciOiJIUzM4NCJ9.eyJleHAiOjE3Nzc2MzM3MjUsImN1c3RvbWVyLWlkIjoiYTk0MTkyNTAtZWRlNy00MWEwLWE0MjItN2Y0ZTZmNDMzNjVmLTE3Njg0NjgzODUzMTgifQ.g3SDYkF2ns4GI3eo-l2f1OI23QN6gtoKNdUrNZfiVLvyOROEIivZ7pkp_NQDylZ4",
+)
+ABOUND_API_KEY = os.environ.get("ABOUND_API_KEY", "a105acd4-74f6-46b6-b429-c2b764462b99")
+
+HEADERS = {
+    "Authorization": f"Bearer {ABOUND_BEARER_TOKEN}",
+    "Content-Type": "application/json",
+    "X-API-KEY": ABOUND_API_KEY,
+    "device-type": "WEB",
+}
+
+passed = 0
+failed = 0
+
+
+def check(name: str, condition: bool, detail: str = ""):
+    global passed, failed
+    if condition:
+        print(f"  PASS: {name}")
+        passed += 1
+    else:
+        print(f"  FAIL: {name}")
+        if detail:
+            print(f"    {detail[:500]}")
+        failed += 1
+
+
+# -----------------------------------------------------------
+# 1. Get Account Info
+# -----------------------------------------------------------
+print("--- 1. Get Account Info ---")
+r = requests.get(
+    "https://devneobank.timesclub.co/times/bank/remittance/agent/account/info",
+    headers=HEADERS,
+    timeout=15,
+)
+check("status 200", r.status_code == 200, f"got {r.status_code}: {r.text[:300]}")
+if r.status_code == 200:
+    data = r.json()
+    check("status success", data.get("status") == "success", str(data)[:300])
+    acct = data.get("data", {})
+    check("has user_id", "user_id" in acct, str(acct.keys()))
+    check("has limits", "limits" in acct)
+    check("has payment_reasons", "payment_reasons" in acct)
+    check("has recipients", "recipients" in acct)
+    check("has funding_sources", "funding_sources" in acct)
+    print(f"  Account: {acct.get('user_name', 'N/A')} ({acct.get('user_id', 'N/A')})")
+    if acct.get("recipients"):
+        print(f"  Recipients: {[r['name'] for r in acct['recipients']]}")
+    if acct.get("funding_sources"):
+        print(f"  Funding sources: {[f['bank_name'] for f in acct['funding_sources']]}")
+print()
+
+# -----------------------------------------------------------
+# 2. Get Exchange Rate
+# -----------------------------------------------------------
+print("--- 2. Get Exchange Rate ---")
+r = requests.get(
+    "https://devneobank.timesclub.co/times/bank/remittance/agent/exchange-rate",
+    params={"from_currency": "USD", "to_currency": "INR"},
+    headers=HEADERS,
+    timeout=15,
+)
+check("status 200", r.status_code == 200, f"got {r.status_code}: {r.text[:300]}")
+if r.status_code == 200:
+    data = r.json()
+    check("status success", data.get("status") == "success", str(data)[:300])
+    rates = data.get("data", {})
+    check("has current_exchange_rate", "current_exchange_rate" in rates)
+    check("has effective_exchange_rate", "effective_exchange_rate" in rates)
+    current = rates.get("current_exchange_rate", {})
+    effective = rates.get("effective_exchange_rate", {})
+    print(f"  Current rate: {current.get('formatted_value', 'N/A')}")
+    print(f"  Effective rate: {effective.get('formatted_value', 'N/A')}")
+print()
+
+# -----------------------------------------------------------
+# 3. Create Notification
+# -----------------------------------------------------------
+print("--- 3. Create Notification ---")
+r = requests.post(
+    "https://dev.timesclub.co/times/users/agent/create-notification",
+    headers=HEADERS,
+    json={
+        "message_id": "test_notif_001",
+        "action_type": "notification",
+        "meta_data": {
+            "score": 72,
+            "rate": 85.42,
+            "ma50": 84.50,
+            "month_bias": 0.65,
+        },
+    },
+    timeout=15,
+)
+check("status 2xx", r.status_code in (200, 202), f"got {r.status_code}: {r.text[:300]}")
+if r.status_code in (200, 202):
+    data = r.json()
+    check("status accepted", data.get("status") in ("accepted", "success"), str(data)[:300])
+print()
+
+# -----------------------------------------------------------
+# 4. Send Wire (DRY RUN — only validate request shape, don't actually send)
+# -----------------------------------------------------------
+print("--- 4. Send Wire (skipped — real money) ---")
+print("  SKIP: Not executing send-wire against dev to avoid real transfers")
+print("  Endpoint: POST https://devneobank.timesclub.co/times/bank/remittance/agent/send-wire")
+print("  Body: {funding_source_id, beneficiary_ref_id, amount, payment_reason_key}")
+print()
+
+# -----------------------------------------------------------
+# Summary
+# -----------------------------------------------------------
+print(f"=== Results: {passed} passed, {failed} failed ===")
+exit(0 if failed == 0 else 1)
