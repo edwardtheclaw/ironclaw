@@ -133,6 +133,33 @@ impl LeaseManager {
             .find(|l| l.thread_id == thread_id && l.is_valid() && l.covers_action(action_name))
             .cloned()
     }
+
+    /// Atomically find the lease for an action and consume one use.
+    ///
+    /// Avoids the TOCTOU race between `find_lease_for_action` (read lock) and
+    /// `consume_use` (write lock) — both happen under a single write lock.
+    /// Returns the lease snapshot (post-consume) if found and valid.
+    pub async fn find_and_consume(
+        &self,
+        thread_id: ThreadId,
+        action_name: &str,
+    ) -> Result<CapabilityLease, EngineError> {
+        let mut leases = self.active.write().await;
+        let lease = leases
+            .values_mut()
+            .find(|l| l.thread_id == thread_id && l.is_valid() && l.covers_action(action_name))
+            .ok_or_else(|| EngineError::LeaseNotFound {
+                lease_id: format!("no valid lease for action '{action_name}'"),
+            })?;
+
+        if !lease.consume_use() {
+            return Err(EngineError::LeaseExpired {
+                capability_name: lease.capability_name.clone(),
+            });
+        }
+
+        Ok(lease.clone())
+    }
 }
 
 impl Default for LeaseManager {

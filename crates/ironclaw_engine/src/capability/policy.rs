@@ -179,7 +179,7 @@ impl Default for PolicyEngine {
 fn rule_matches(rule: &PolicyRule, action: &ActionDef) -> bool {
     match &rule.condition {
         PolicyCondition::Always => true,
-        PolicyCondition::ActionMatches { pattern } => action.name.contains(pattern.as_str()),
+        PolicyCondition::ActionMatches { pattern } => action.name == *pattern,
         PolicyCondition::EffectTypeIs(effect) => action.effects.contains(effect),
     }
 }
@@ -371,7 +371,7 @@ mod tests {
         engine.add_global_policy(PolicyRule {
             name: "approve deletes".into(),
             condition: PolicyCondition::ActionMatches {
-                pattern: "delete".into(),
+                pattern: "delete_repo".into(),
             },
             effect: PolicyEffect::RequireApproval,
         });

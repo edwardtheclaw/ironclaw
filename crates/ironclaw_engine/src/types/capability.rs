@@ -97,7 +97,7 @@ pub struct PolicyRule {
 pub enum PolicyCondition {
     /// Always applies.
     Always,
-    /// Applies when the action name matches the pattern.
+    /// Applies when the action name exactly matches the pattern.
     ActionMatches { pattern: String },
     /// Applies when the action has a specific effect type.
     EffectTypeIs(EffectType),
