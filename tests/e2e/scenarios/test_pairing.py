@@ -87,6 +87,7 @@ async def test_pairing_response_structure(ironclaw_server):
             headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
             timeout=10,
         )
+    assert r.status_code in (200, 404), f"Unexpected status: {r.status_code} {r.text[:200]}"
     if r.status_code == 200:
         data = r.json()
         assert "requests" in data or isinstance(data, list), (

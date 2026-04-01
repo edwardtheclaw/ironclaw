@@ -7,7 +7,6 @@ Verifies:
 - Regression: existing owner-scope behaviour is preserved.
 """
 
-import asyncio
 import uuid
 
 import httpx
