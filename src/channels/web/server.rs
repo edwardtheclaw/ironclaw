@@ -1022,7 +1022,42 @@ async fn oauth_callback_handler(
             flow.secrets
                 .create(&flow.user_id, params)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| {
+                    tracing::warn!(
+                        extension = %flow.extension_name,
+                        secret_name = %client_id_secret,
+                        error = %e,
+                        "Failed to store OAuth client_id secret after callback"
+                    );
+                    "failed to store client credentials".to_string()
+                })?;
+        }
+
+        if let (Some(client_secret_name), Some(client_secret)) = (
+            flow.client_secret_secret_name.as_ref(),
+            flow.client_secret.as_deref(),
+        ) {
+            let mut params =
+                crate::secrets::CreateSecretParams::new(client_secret_name, client_secret)
+                    .with_provider(flow.provider.as_ref().cloned().unwrap_or_default());
+            if let Some(expires_at) = flow.client_secret_expires_at
+                && let Some(dt) =
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(expires_at as i64, 0)
+            {
+                params = params.with_expiry(dt);
+            }
+            flow.secrets
+                .create(&flow.user_id, params)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(
+                        extension = %flow.extension_name,
+                        secret_name = %client_secret_name,
+                        error = %e,
+                        "Failed to store OAuth client_secret secret after callback"
+                    );
+                    "failed to store client credentials".to_string()
+                })?;
         }
 
         Ok(())
@@ -2036,7 +2071,7 @@ async fn chat_new_thread_handler(
     let session = session_manager.get_or_create_session(&user.user_id).await;
     let (thread_id, info) = {
         let mut sess = session.lock().await;
-        let thread = sess.create_thread();
+        let thread = sess.create_thread(Some("gateway"));
         let id = thread.id;
         let info = ThreadInfo {
             id: thread.id,
@@ -2055,7 +2090,7 @@ async fn chat_new_thread_handler(
     // so that the subsequent loadThreads() call from the frontend sees it.
     if let Some(ref store) = state.store {
         match store
-            .ensure_conversation(thread_id, "gateway", &user.user_id, None)
+            .ensure_conversation(thread_id, "gateway", &user.user_id, None, Some("gateway"))
             .await
         {
             Ok(true) => {}
@@ -3301,6 +3336,8 @@ mod tests {
             gateway_token: oauth_proxy_auth_token,
             token_exchange_extra_params: std::collections::HashMap::new(),
             client_id_secret_name: None,
+            client_secret_secret_name: None,
+            client_secret_expires_at: None,
             created_at: std::time::Instant::now(),
         }
     }
@@ -3960,6 +3997,8 @@ mod tests {
             gateway_token: None,
             token_exchange_extra_params: std::collections::HashMap::new(),
             client_id_secret_name: None,
+            client_secret_secret_name: None,
+            client_secret_expires_at: None,
             created_at,
         };
 
@@ -4029,6 +4068,8 @@ mod tests {
             gateway_token: None,
             token_exchange_extra_params: std::collections::HashMap::new(),
             client_id_secret_name: None,
+            client_secret_secret_name: None,
+            client_secret_expires_at: None,
             created_at,
         };
 
@@ -4132,6 +4173,8 @@ mod tests {
             gateway_token: None,
             token_exchange_extra_params: std::collections::HashMap::new(),
             client_id_secret_name: None,
+            client_secret_secret_name: None,
+            client_secret_expires_at: None,
             // Expired — handler will reject after lookup (no network I/O)
             created_at,
         };
@@ -4219,6 +4262,8 @@ mod tests {
             gateway_token: None,
             token_exchange_extra_params: std::collections::HashMap::new(),
             client_id_secret_name: None,
+            client_secret_secret_name: None,
+            client_secret_expires_at: None,
             created_at,
         };
 
@@ -4300,6 +4345,8 @@ mod tests {
             gateway_token: None,
             token_exchange_extra_params: std::collections::HashMap::new(),
             client_id_secret_name: None,
+            client_secret_secret_name: None,
+            client_secret_expires_at: None,
             created_at,
         };
 
