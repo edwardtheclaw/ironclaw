@@ -2196,7 +2196,6 @@ async fn extensions_list_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let pairing_store = crate::pairing::PairingStore::new();
     let mut owner_bound_channels = std::collections::HashSet::new();
     for ext in &installed {
         if ext.kind == crate::extensions::ExtensionKind::WasmChannel
@@ -2211,7 +2210,6 @@ async fn extensions_list_handler(
             let activation_status =
                 crate::channels::web::handlers::extensions::derive_activation_status(
                     &ext,
-                    &pairing_store,
                     owner_bound_channels.contains(&ext.name),
                 );
             ExtensionInfo {
@@ -2680,20 +2678,27 @@ async fn extensions_setup_submit_handler(
 // --- Pairing handlers ---
 
 async fn pairing_list_handler(
+    State(state): State<Arc<GatewayState>>,
     Path(channel): Path<String>,
 ) -> Result<Json<PairingListResponse>, (StatusCode, String)> {
-    let store = crate::pairing::PairingStore::new();
-    let requests = store
+    let db = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let cache = Arc::new(crate::ownership::OwnershipCache::new());
+    let store = crate::pairing::PairingStore::new(Arc::clone(db), cache);
+    let requests: Vec<crate::db::PairingRequestRecord> = store
         .list_pending(&channel)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let infos = requests
         .into_iter()
         .map(|r| PairingRequestInfo {
             code: r.code,
-            sender_id: r.id,
-            meta: r.meta,
-            created_at: r.created_at,
+            sender_id: r.external_id,
+            meta: None,
+            created_at: r.created_at.to_rfc3339(),
         })
         .collect();
 
@@ -2704,22 +2709,20 @@ async fn pairing_list_handler(
 }
 
 async fn pairing_approve_handler(
-    Path(channel): Path<String>,
+    State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Path(_channel): Path<String>,
     Json(req): Json<PairingApproveRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    let store = crate::pairing::PairingStore::new();
-    match store.approve(&channel, &req.code) {
-        Ok(Some(approved)) => Ok(Json(ActionResponse::ok(format!(
-            "Pairing approved for sender '{}'",
-            approved.id
-        )))),
-        Ok(None) => Ok(Json(ActionResponse::fail(
-            "Invalid or expired pairing code".to_string(),
-        ))),
-        Err(crate::pairing::PairingStoreError::ApproveRateLimited) => Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many failed approve attempts; try again later".to_string(),
-        )),
+    let db = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let cache = Arc::new(crate::ownership::OwnershipCache::new());
+    let store = crate::pairing::PairingStore::new(Arc::clone(db), cache);
+    let owner_id = crate::ownership::OwnerId::from(user.user_id.clone());
+    match store.approve(&req.code, &owner_id).await {
+        Ok(()) => Ok(Json(ActionResponse::ok("Pairing approved.".to_string()))),
         Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
     }
 }

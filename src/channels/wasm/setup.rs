@@ -44,7 +44,13 @@ pub async fn setup_wasm_channels(
         }
     };
 
-    let pairing_store = Arc::new(PairingStore::new());
+    let pairing_store = if let Some(db) = database {
+        let ownership_cache = Arc::new(crate::ownership::OwnershipCache::new());
+        Arc::new(PairingStore::new(Arc::clone(db), ownership_cache))
+    } else {
+        tracing::warn!("No database available for WASM channels; DM pairing will not persist");
+        Arc::new(PairingStore::new_noop())
+    };
     let settings_store: Option<Arc<dyn crate::db::SettingsStore>> =
         database.map(|db| Arc::clone(db) as Arc<dyn crate::db::SettingsStore>);
     let mut loader = WasmChannelLoader::new(

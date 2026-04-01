@@ -7140,7 +7140,7 @@ mod tests {
             )
             .map_err(|e| format!("runtime init failed: {e}"))?,
         );
-        let pairing_store = Arc::new(crate::pairing::PairingStore::new());
+        let pairing_store = Arc::new(crate::pairing::PairingStore::new_noop());
         let router = Arc::new(crate::channels::wasm::WasmChannelRouter::new());
         let mut owner_ids = std::collections::HashMap::new();
         owner_ids.insert("telegram".to_string(), 12345_i64);
@@ -7230,9 +7230,7 @@ mod tests {
             WasmChannelRuntime::new(WasmChannelRuntimeConfig::for_testing())
                 .map_err(|err| format!("runtime: {err}"))?,
         );
-        let pairing_store = Arc::new(PairingStore::with_base_dir(
-            dir.path().join("pairing-state"),
-        ));
+        let pairing_store = Arc::new(PairingStore::new_noop());
         let router = Arc::new(WasmChannelRouter::new());
         manager
             .set_channel_runtime(
@@ -7509,7 +7507,7 @@ mod tests {
             )
             .map_err(|e| format!("runtime init failed: {e}"))?,
         );
-        let pairing_store = Arc::new(crate::pairing::PairingStore::new());
+        let pairing_store = Arc::new(crate::pairing::PairingStore::new_noop());
         let router = Arc::new(crate::channels::wasm::WasmChannelRouter::new());
         let mut owner_ids = std::collections::HashMap::new();
         owner_ids.insert("telegram".to_string(), 12345_i64);
@@ -7550,7 +7548,7 @@ mod tests {
                     WasmChannelRuntime::new(WasmChannelRuntimeConfig::for_testing())
                         .map_err(|err| format!("runtime: {err}"))?,
                 ),
-                pairing_store: Arc::new(PairingStore::with_base_dir(dir.path().join("pairing"))),
+                pairing_store: Arc::new(PairingStore::new_noop()),
                 wasm_channel_router: Arc::new(WasmChannelRouter::new()),
                 wasm_channel_owner_ids: std::collections::HashMap::new(),
             });
@@ -7600,7 +7598,7 @@ mod tests {
                     WasmChannelRuntime::new(WasmChannelRuntimeConfig::for_testing())
                         .map_err(|err| format!("runtime: {err}"))?,
                 ),
-                pairing_store: Arc::new(PairingStore::with_base_dir(dir.path().join("pairing"))),
+                pairing_store: Arc::new(PairingStore::new_noop()),
                 wasm_channel_router: Arc::new(WasmChannelRouter::new()),
                 wasm_channel_owner_ids: std::collections::HashMap::new(),
             });
