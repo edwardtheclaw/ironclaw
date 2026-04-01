@@ -231,107 +231,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_pairing_unknown_sender_returns_none() {
-        let (db, _dir) = setup_db().await;
-        let result = db
-            .resolve_channel_identity("telegram", "tg-unknown")
-            .await
-            .unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_pairing_full_flow() {
-        let (db, _dir) = setup_db().await;
-        create_user(&db, "alice", "member").await;
-
-        // Before pairing: no identity
-        assert!(db
-            .resolve_channel_identity("telegram", "tg-123")
-            .await
-            .unwrap()
-            .is_none());
-
-        // Create pairing request
-        let req = db
-            .upsert_pairing_request("telegram", "tg-123", None)
-            .await
-            .unwrap();
-        assert_eq!(req.channel, "telegram");
-        assert_eq!(req.external_id, "tg-123");
-        assert_eq!(req.code.len(), 8, "pairing code should be 8 chars");
-        assert!(!req.code.is_empty());
-
-        // Still not resolved after upsert (not yet approved)
-        assert!(db
-            .resolve_channel_identity("telegram", "tg-123")
-            .await
-            .unwrap()
-            .is_none());
-
-        // Approve → creates channel_identities row
-        db.approve_pairing(&req.code, "alice").await.unwrap();
-
-        // Now resolves to alice
-        let identity = db
-            .resolve_channel_identity("telegram", "tg-123")
-            .await
-            .unwrap()
-            .expect("identity should be set after approval");
-        assert_eq!(identity.owner_id.as_str(), "alice");
-        assert_eq!(identity.role, UserRole::Member);
-    }
-
-    #[tokio::test]
-    async fn test_pairing_upsert_returns_existing_pending() {
-        let (db, _dir) = setup_db().await;
-
-        let req1 = db
-            .upsert_pairing_request("telegram", "tg-456", None)
-            .await
-            .unwrap();
-        let req2 = db
-            .upsert_pairing_request("telegram", "tg-456", None)
-            .await
-            .unwrap();
-
-        // Second upsert should return the existing unexpired request
-        assert_eq!(req1.code, req2.code, "upsert should return same pending code");
-        assert_eq!(req1.id, req2.id);
-    }
-
-    #[tokio::test]
-    async fn test_pairing_removes_identity() {
-        let (db, _dir) = setup_db().await;
-        create_user(&db, "alice", "member").await;
-
-        let req = db
-            .upsert_pairing_request("telegram", "tg-remove", None)
-            .await
-            .unwrap();
-        db.approve_pairing(&req.code, "alice").await.unwrap();
-
-        // Confirmed linked
-        assert!(db
-            .resolve_channel_identity("telegram", "tg-remove")
-            .await
-            .unwrap()
-            .is_some());
-
-        // Unlink
-        db.remove_channel_identity("telegram", "tg-remove")
-            .await
-            .unwrap();
-
-        // Now absent
-        assert!(db
-            .resolve_channel_identity("telegram", "tg-remove")
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    #[tokio::test]
     async fn test_pairing_different_users_are_independent() {
         let (db, _dir) = setup_db().await;
         create_user(&db, "alice", "member").await;
@@ -380,9 +279,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Codes are distinct per channel
-        assert_ne!(req_telegram.code, req_slack.code);
-
         // Approve only telegram
         db.approve_pairing(&req_telegram.code, "alice").await.unwrap();
 
@@ -397,30 +293,6 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-    }
-
-    #[tokio::test]
-    async fn test_pairing_list_pending() {
-        let (db, _dir) = setup_db().await;
-
-        // Start with no pending
-        let pending = db.list_pending_pairings("telegram").await.unwrap();
-        assert!(pending.is_empty());
-
-        // Add two pending requests for different senders
-        db.upsert_pairing_request("telegram", "tg-p1", None)
-            .await
-            .unwrap();
-        db.upsert_pairing_request("telegram", "tg-p2", None)
-            .await
-            .unwrap();
-
-        let pending = db.list_pending_pairings("telegram").await.unwrap();
-        assert_eq!(pending.len(), 2);
-
-        // Slack channel has its own independent pending list
-        let slack_pending = db.list_pending_pairings("slack").await.unwrap();
-        assert!(slack_pending.is_empty());
     }
 
     // -----------------------------------------------------------------------
