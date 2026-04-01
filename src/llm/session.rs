@@ -74,7 +74,7 @@ impl SessionManager {
             store: RwLock::new(None),
             // Placeholder; overwritten by attach_store() with the real owner_id at startup.
             // TODO(ownership): thread owner_id through SessionManager constructors
-            user_id: RwLock::new("default".to_string()),
+            user_id: RwLock::new("<unset>".to_string()),
         };
 
         // Try to load existing session synchronously during construction
@@ -107,7 +107,7 @@ impl SessionManager {
             store: RwLock::new(None),
             // Placeholder; overwritten by attach_store() with the real owner_id at startup.
             // TODO(ownership): thread owner_id through SessionManager constructors
-            user_id: RwLock::new("default".to_string()),
+            user_id: RwLock::new("<unset>".to_string()),
         };
 
         if let Err(e) = manager.load_session().await {
