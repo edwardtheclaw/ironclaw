@@ -2360,7 +2360,7 @@ mod tests {
         // between lock acquisitions -- the TOCTOU window this fix addresses)
         {
             let mut sess = session.lock().await;
-            let mut thread = Thread::with_id(thread_id, session_id);
+            let mut thread = Thread::with_id(thread_id, session_id, None);
             thread.start_turn("pending approval");
             thread.state = ThreadState::AwaitingApproval;
             sess.threads.insert(thread_id, thread);
@@ -2502,7 +2502,7 @@ mod tests {
 
         let session_id = Uuid::new_v4();
         let thread_id = Uuid::new_v4();
-        let mut thread = Thread::with_id(thread_id, session_id);
+        let mut thread = Thread::with_id(thread_id, session_id, None);
 
         let correct_request_id = Uuid::new_v4();
         let pending = PendingApproval {
@@ -2611,7 +2611,7 @@ mod tests {
         use crate::agent::session::Session;
 
         let mut session = Session::new("test-user");
-        let thread = session.create_thread();
+        let thread = session.create_thread(Some("test"));
         let thread_id = thread.id;
 
         // Set up a pending approval on the thread
@@ -2641,7 +2641,7 @@ mod tests {
         use crate::agent::session::Session;
 
         let mut session = Session::new("test-user");
-        let thread = session.create_thread();
+        let thread = session.create_thread(Some("test"));
         let thread_id = thread.id;
 
         // Set up a pending approval on the thread
@@ -2674,7 +2674,7 @@ mod tests {
         use crate::agent::session::Session;
 
         let mut session = Session::new("test-user");
-        let thread = session.create_thread();
+        let thread = session.create_thread(Some("test"));
         let thread_id = thread.id;
 
         // Set up a pending approval
