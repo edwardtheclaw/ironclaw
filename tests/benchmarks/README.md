@@ -26,7 +26,7 @@ cd tests/e2e
 pip install -e .
 ```
 
-The benchmark driver reuses `aiohttp` and `httpx`, plus the existing mock LLM server in [`tests/e2e/mock_llm.py`](/Users/henry/near_ai/near_claw/ironclaw/.worktrees/bench-shared-instance-baseline/tests/e2e/mock_llm.py).
+The benchmark driver reuses `aiohttp` and `httpx`, plus the existing mock LLM server in [tests/e2e/mock_llm.py](../e2e/mock_llm.py).
 
 ## Baseline Run
 
@@ -44,7 +44,7 @@ python tests/benchmarks/shared_instance_benchmark.py \
 
 The script will:
 
-1. build `ironclaw` if needed
+1. build `ironclaw` with the benchmark runtime feature if needed
 2. start the mock LLM server
 3. start one IronClaw gateway instance with libSQL
 4. create benchmark users through `POST /api/admin/users`
@@ -52,7 +52,7 @@ The script will:
 6. open `user_count * sse_connections_per_user` SSE streams
 7. run the measured chat workload against `POST /api/chat/send`
 
-Results are written to `/tmp/ironclaw-benchmarks/` by default.
+Results are written to the system temp directory under `ironclaw-benchmarks/` by default.
 
 ## Variant Runs
 

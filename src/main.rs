@@ -48,12 +48,14 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
+#[cfg(feature = "bench-runtime")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchRuntimeMode {
     MultiThread,
     CurrentThread,
 }
 
+#[cfg(feature = "bench-runtime")]
 fn parse_bench_runtime_mode(value: Option<&str>) -> anyhow::Result<BenchRuntimeMode> {
     match value.unwrap_or("multi_thread") {
         "multi_thread" => Ok(BenchRuntimeMode::MultiThread),
@@ -64,6 +66,7 @@ fn parse_bench_runtime_mode(value: Option<&str>) -> anyhow::Result<BenchRuntimeM
     }
 }
 
+#[cfg(feature = "bench-runtime")]
 fn build_runtime_from_env() -> anyhow::Result<tokio::runtime::Runtime> {
     let value = env::var("IRONCLAW_BENCH_RUNTIME_MODE").ok();
     let mode = parse_bench_runtime_mode(value.as_deref())?;
@@ -71,6 +74,13 @@ fn build_runtime_from_env() -> anyhow::Result<tokio::runtime::Runtime> {
         BenchRuntimeMode::MultiThread => tokio::runtime::Builder::new_multi_thread(),
         BenchRuntimeMode::CurrentThread => tokio::runtime::Builder::new_current_thread(),
     };
+    builder.enable_all();
+    builder.build().map_err(Into::into)
+}
+
+#[cfg(not(feature = "bench-runtime"))]
+fn build_runtime_from_env() -> anyhow::Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
     builder.build().map_err(Into::into)
 }
@@ -1242,7 +1252,7 @@ async fn async_main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "bench-runtime"))]
 mod tests {
     use super::{BenchRuntimeMode, parse_bench_runtime_mode};
 

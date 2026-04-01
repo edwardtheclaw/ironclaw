@@ -378,7 +378,7 @@ def percentile(values: list[float], pct: float) -> float | None:
 
 
 def utc_timestamp() -> str:
-    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
 
 
 def json_default(value: Any) -> Any:
@@ -901,10 +901,17 @@ async def async_main(args: argparse.Namespace) -> int:
     main_root = primary_worktree_root(root)
     default_binary = main_root / "target" / "debug" / "ironclaw"
     binary = Path(args.ironclaw_binary) if args.ironclaw_binary else default_binary
-    if not args.skip_build and binary_needs_rebuild(binary, root):
-        build_cmd = ["cargo", "build", "--no-default-features", "--features", "libsql"]
+    build_root = main_root if args.ironclaw_binary is None else root
+    if not args.skip_build and binary_needs_rebuild(binary, build_root):
+        build_cmd = [
+            "cargo",
+            "build",
+            "--no-default-features",
+            "--features",
+            "libsql,bench-runtime",
+        ]
         print(f"building ironclaw: {build_command_for_display(build_cmd)}")
-        subprocess.run(build_cmd, cwd=root, check=True, timeout=900)
+        subprocess.run(build_cmd, cwd=build_root, check=True, timeout=900)
 
     if not binary.exists():
         raise FileNotFoundError(
