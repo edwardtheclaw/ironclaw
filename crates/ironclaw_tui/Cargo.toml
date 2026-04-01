@@ -23,6 +23,8 @@ unicode-width = "0.2"
 pulldown-cmark = { version = "0.12", default-features = false }
 thiserror = "2"
 tracing = "0.1"
+arboard = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -11,10 +11,15 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
-use ironclaw_tui::{SkillCategory, ToolCategory, TuiAppConfig, TuiEvent, TuiLayout, start_tui};
+use ironclaw_tui::{
+    SkillCategory, ToolCategory, TuiAppConfig, TuiEvent, TuiLayout, TuiUserMessage, start_tui,
+};
 
 use crate::channels::web::log_layer::LogBroadcaster;
-use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
+use crate::channels::{
+    AttachmentKind, Channel, IncomingAttachment, IncomingMessage, MessageStream, OutgoingResponse,
+    StatusUpdate,
+};
 use crate::error::ChannelError;
 use crate::llm::infer_context_length;
 
@@ -226,8 +231,28 @@ impl Channel for TuiChannel {
         let sys_tz = crate::timezone::detect_system_timezone().name().to_string();
 
         tokio::spawn(async move {
-            while let Some(text) = msg_rx.recv().await {
-                let msg = IncomingMessage::new("tui", &user_id, &text).with_timezone(&sys_tz);
+            while let Some(user_msg) = msg_rx.recv().await {
+                let attachments: Vec<IncomingAttachment> = user_msg
+                    .attachments
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, a)| IncomingAttachment {
+                        id: format!("tui-paste-{i}"),
+                        kind: AttachmentKind::Image,
+                        mime_type: a.mime_type,
+                        filename: Some(format!("{}.png", a.label)),
+                        size_bytes: Some(a.data.len() as u64),
+                        source_url: None,
+                        storage_key: None,
+                        extracted_text: None,
+                        data: a.data,
+                        duration_secs: None,
+                    })
+                    .collect();
+
+                let msg = IncomingMessage::new("tui", &user_id, &user_msg.text)
+                    .with_timezone(&sys_tz)
+                    .with_attachments(attachments);
                 if incoming_tx.send(msg).await.is_err() {
                     break;
                 }

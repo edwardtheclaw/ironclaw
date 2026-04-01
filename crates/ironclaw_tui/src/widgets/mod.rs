@@ -159,6 +159,9 @@ pub struct AppState {
 
     /// Tool detail modal (Ctrl+E).
     pub tool_detail_modal: Option<ToolDetailModal>,
+
+    /// Images pasted via Ctrl+V, pending submission with the next message.
+    pub pending_attachments: Vec<crate::event::TuiAttachment>,
 }
 
 impl Default for AppState {
@@ -206,6 +209,7 @@ impl Default for AppState {
             log_level_filter: LogLevelFilter::default(),
             toasts: Vec::new(),
             tool_detail_modal: None,
+            pending_attachments: Vec::new(),
         }
     }
 }

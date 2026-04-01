@@ -162,16 +162,18 @@ fn main() {
                 .await;
 
             // Echo user messages back as mock agent responses
-            while let Some(msg) = msg_rx.recv().await {
+            while let Some(user_msg) = msg_rx.recv().await {
+                let msg = &user_msg.text;
                 // Simulate thinking
                 let _ = sim_tx.send(TuiEvent::Thinking("Processing...".into())).await;
                 tokio::time::sleep(Duration::from_millis(300)).await;
 
                 // Simulate tool call
+                let truncated: String = msg.chars().take(40).collect();
                 let _ = sim_tx
                     .send(TuiEvent::ToolStarted {
                         name: "echo".into(),
-                        detail: Some(format!("\"{}\"", &msg[..msg.len().min(40)])),
+                        detail: Some(format!("\"{truncated}\"")),
                     })
                     .await;
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -192,9 +194,8 @@ fn main() {
                 // Simulate streaming response
                 let _ = sim_tx.send(TuiEvent::Thinking(String::new())).await;
                 let response = format!(
-                    "You said: **{}**\n\nThis is a mock response from the dev harness. \
+                    "You said: **{msg}**\n\nThis is a mock response from the dev harness. \
                      Edit `crates/ironclaw_tui/src/` and watch it reload.",
-                    msg
                 );
                 for chunk in response.as_bytes().chunks(20) {
                     let _ = sim_tx

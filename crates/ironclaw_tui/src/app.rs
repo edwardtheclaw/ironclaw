@@ -15,7 +15,8 @@ use std::time::Duration;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    self, Event as CtEvent, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event as CtEvent, KeyCode, KeyEventKind,
+    KeyModifiers, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -24,7 +25,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use tokio::sync::mpsc;
 
-use crate::event::{TuiEvent, TuiLogEntry};
+use crate::event::{TuiAttachment, TuiEvent, TuiLogEntry, TuiUserMessage};
 use crate::input::{InputAction, map_key};
 use crate::layout::TuiLayout;
 use crate::widgets::approval::{ApprovalAction, ApprovalWidget};
@@ -45,7 +46,7 @@ pub struct TuiAppHandle {
     /// Send events (status updates, responses) into the TUI.
     pub event_tx: mpsc::Sender<TuiEvent>,
     /// Receive user messages from the TUI input.
-    pub msg_rx: mpsc::Receiver<String>,
+    pub msg_rx: mpsc::Receiver<TuiUserMessage>,
     /// Join handle for the TUI thread.
     pub join_handle: std::thread::JoinHandle<()>,
 }
@@ -75,7 +76,7 @@ pub struct TuiAppConfig {
 /// exclusive stdin access.
 pub fn start_tui(config: TuiAppConfig) -> TuiAppHandle {
     let (event_tx, event_rx) = mpsc::channel::<TuiEvent>(256);
-    let (msg_tx, msg_rx) = mpsc::channel::<String>(32);
+    let (msg_tx, msg_rx) = mpsc::channel::<TuiUserMessage>(32);
 
     // Clone event_tx for the crossterm polling task
     let input_event_tx = event_tx.clone();
@@ -106,7 +107,7 @@ async fn run_tui(
     config: TuiAppConfig,
     mut event_rx: mpsc::Receiver<TuiEvent>,
     input_event_tx: mpsc::Sender<TuiEvent>,
-    msg_tx: mpsc::Sender<String>,
+    msg_tx: mpsc::Sender<TuiUserMessage>,
 ) -> io::Result<()> {
     // Terminal setup
     enable_raw_mode()?;
@@ -114,7 +115,8 @@ async fn run_tui(
     execute!(
         stdout,
         EnterAlternateScreen,
-        ratatui::crossterm::event::EnableMouseCapture
+        ratatui::crossterm::event::EnableMouseCapture,
+        EnableBracketedPaste
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -179,6 +181,11 @@ async fn run_tui(
                         break;
                     }
                 }
+                Ok(Some(CtEvent::Paste(text))) => {
+                    if poll_tx.send(TuiEvent::Paste(text)).await.is_err() {
+                        break;
+                    }
+                }
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -216,6 +223,7 @@ async fn run_tui(
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         ratatui::crossterm::event::DisableMouseCapture,
         LeaveAlternateScreen
     )?;
@@ -243,9 +251,42 @@ async fn handle_event(
     event: TuiEvent,
     state: &mut AppState,
     widgets: &mut BuiltinWidgets,
-    msg_tx: &mpsc::Sender<String>,
+    msg_tx: &mpsc::Sender<TuiUserMessage>,
 ) {
     match event {
+        TuiEvent::Paste(text) => {
+            let approval_active = state.pending_approval.is_some();
+            let help_active = state.help_visible;
+            let tool_detail_active = state.tool_detail_modal.is_some();
+
+            if !approval_active && !help_active && !tool_detail_active {
+                widgets.input_box.insert_text(&text);
+
+                if state.history_index.is_some() {
+                    state.history_index = None;
+                    state.history_draft = widgets.input_box.current_text();
+                }
+
+                if !state.command_palette.visible {
+                    if let Some(cmd) = crate::input::parse_slash_command(&widgets.input_box.current_text()) {
+                        state.command_palette.open(cmd);
+                    }
+                } else {
+                    let input = widgets.input_box.current_text();
+                    if input.starts_with('/') {
+                        state.command_palette.open(input.trim());
+                    } else {
+                        state.command_palette.close();
+                    }
+                }
+
+                if state.search.active {
+                    state.search.query = widgets.input_box.current_text();
+                    state.search.match_count = count_search_matches(&state.messages, &state.search.query);
+                    state.search.current_match = 0;
+                }
+            }
+        }
         TuiEvent::Key(key) => {
             let approval_active = state.pending_approval.is_some();
             let palette_active = state.command_palette.visible;
@@ -269,27 +310,47 @@ async fn handle_event(
                     state.command_palette.close();
                     let text = widgets.input_box.take_input();
                     let trimmed = text.trim().to_string();
-                    if !trimmed.is_empty() {
+                    let attachments = std::mem::take(&mut state.pending_attachments);
+                    if !trimmed.is_empty() || !attachments.is_empty() {
                         // Push to input history
-                        state.input_history.push(trimmed.clone());
+                        if !trimmed.is_empty() {
+                            state.input_history.push(trimmed.clone());
+                        }
                         state.history_index = None;
                         state.history_draft.clear();
                         // Clear follow-up suggestions from previous turn
                         state.suggestions.clear();
+                        // Build display content with attachment labels
+                        let display_content = if attachments.is_empty() {
+                            trimmed.clone()
+                        } else {
+                            let labels: Vec<&str> =
+                                attachments.iter().map(|a| a.label.as_str()).collect();
+                            if trimmed.is_empty() {
+                                format!("[{}]", labels.join("] ["))
+                            } else {
+                                format!("{trimmed} [{}]", labels.join("] ["))
+                            }
+                        };
                         // Add user message to conversation
                         state.messages.push(ChatMessage {
                             role: MessageRole::User,
-                            content: trimmed.clone(),
+                            content: display_content,
                             timestamp: chrono::Utc::now(),
                             cost_summary: None,
                         });
                         state.scroll_offset = 0;
                         // Send to agent
-                        let _ = msg_tx.send(trimmed).await;
+                        let _ = msg_tx
+                            .send(TuiUserMessage {
+                                text: trimmed,
+                                attachments,
+                            })
+                            .await;
                     }
                 }
                 InputAction::Quit => {
-                    let _ = msg_tx.send("/quit".to_string()).await;
+                    let _ = msg_tx.send(TuiUserMessage::text_only("/quit")).await;
                     state.should_quit = true;
                 }
                 InputAction::ToggleSidebar => {
@@ -318,7 +379,7 @@ async fn handle_event(
                     }
                 },
                 InputAction::Interrupt => {
-                    let _ = msg_tx.send("/interrupt".to_string()).await;
+                    let _ = msg_tx.send(TuiUserMessage::text_only("/interrupt")).await;
                     state.status_text.clear();
                 }
                 InputAction::ApprovalUp => {
@@ -344,35 +405,37 @@ async fn handle_event(
                             .get(ap.selected)
                             .copied()
                             .unwrap_or(ApprovalAction::Deny);
-                        let _ = msg_tx.send(action.as_response().to_string()).await;
+                        let _ = msg_tx
+                            .send(TuiUserMessage::text_only(action.as_response()))
+                            .await;
                         state.pending_approval = None;
                     }
                 }
                 InputAction::ApprovalCancel => {
                     if state.pending_approval.is_some() {
-                        let _ = msg_tx.send("n".to_string()).await;
+                        let _ = msg_tx.send(TuiUserMessage::text_only("n")).await;
                         state.pending_approval = None;
                     }
                 }
                 InputAction::QuickApprove => {
                     if state.pending_approval.is_some() {
-                        let _ = msg_tx.send("y".to_string()).await;
+                        let _ = msg_tx.send(TuiUserMessage::text_only("y")).await;
                         state.pending_approval = None;
                     }
                 }
                 InputAction::QuickAlways => {
                     if let Some(ref ap) = state.pending_approval {
                         if ap.allow_always {
-                            let _ = msg_tx.send("a".to_string()).await;
+                            let _ = msg_tx.send(TuiUserMessage::text_only("a")).await;
                         } else {
-                            let _ = msg_tx.send("y".to_string()).await;
+                            let _ = msg_tx.send(TuiUserMessage::text_only("y")).await;
                         }
                         state.pending_approval = None;
                     }
                 }
                 InputAction::QuickDeny => {
                     if state.pending_approval.is_some() {
-                        let _ = msg_tx.send("n".to_string()).await;
+                        let _ = msg_tx.send(TuiUserMessage::text_only("n")).await;
                         state.pending_approval = None;
                     }
                 }
@@ -483,6 +546,16 @@ async fn handle_event(
                 }
                 InputAction::LogFilter(level) => {
                     state.log_level_filter = level;
+                }
+                InputAction::ClipboardPaste => {
+                    if let Some(attachment) = try_paste_clipboard_image(state) {
+                        state.toasts.push(Toast {
+                            message: format!("Pasted: {}", attachment.label),
+                            kind: ToastKind::Info,
+                            created_at: chrono::Utc::now(),
+                        });
+                        state.pending_attachments.push(attachment);
+                    }
                 }
                 InputAction::Forward => {
                     if state.search.active {
@@ -937,7 +1010,11 @@ fn render_frame(
     let header_height = if layout.header.visible { 1 } else { 0 };
     let status_height = if layout.status_bar.visible { 1 } else { 0 };
     let tab_bar_height = 1u16;
-    let input_height = 3u16;
+    let input_height = if state.pending_attachments.is_empty() {
+        3u16
+    } else {
+        4u16
+    };
 
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -1243,5 +1320,76 @@ fn render_toasts(
         ]);
         let paragraph = Paragraph::new(line);
         paragraph.render(inner, frame.buffer_mut());
+    }
+}
+
+/// Try to read an image from the system clipboard and return it as a PNG-encoded
+/// [`TuiAttachment`]. Returns `None` if the clipboard has no image data or if
+/// encoding fails.
+fn try_paste_clipboard_image(state: &AppState) -> Option<TuiAttachment> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let img_data = clipboard.get_image().ok()?;
+
+    let png_bytes = encode_rgba_to_png(
+        &img_data.bytes,
+        img_data.width as u32,
+        img_data.height as u32,
+    )?;
+
+    let n = state.pending_attachments.len() + 1;
+    Some(TuiAttachment {
+        data: png_bytes,
+        mime_type: "image/png".to_string(),
+        label: format!("Image {n}"),
+    })
+}
+
+/// Encode raw RGBA pixel data to PNG. Returns `None` on invalid dimensions or
+/// encoding failure.
+fn encode_rgba_to_png(rgba: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    let expected_len = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)?;
+    if rgba.len() != expected_len {
+        return None;
+    }
+
+    let buf: image::ImageBuffer<image::Rgba<u8>, &[u8]> =
+        image::ImageBuffer::from_raw(width, height, rgba)?;
+    let mut png_bytes: Vec<u8> = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut png_bytes);
+    buf.write_to(&mut cursor, image::ImageFormat::Png).ok()?;
+    Some(png_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_rgba_to_png_valid() {
+        // 2x2 red image
+        let rgba = vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255];
+        let png = encode_rgba_to_png(&rgba, 2, 2);
+        assert!(png.is_some());
+        let bytes = png.unwrap();
+        // PNG signature starts with 0x89 'P' 'N' 'G'
+        assert!(bytes.len() > 8);
+        assert_eq!(&bytes[..4], &[0x89, b'P', b'N', b'G']);
+    }
+
+    #[test]
+    fn encode_rgba_to_png_bad_dimensions() {
+        let rgba = vec![0u8; 16]; // 4 pixels
+        // Claim 3x2 = 6 pixels, but only 4 are provided
+        let png = encode_rgba_to_png(&rgba, 3, 2);
+        assert!(png.is_none());
+    }
+
+    #[test]
+    fn encode_rgba_to_png_zero_size() {
+        // 0x0 image: the image crate rejects zero-dimension buffers
+        let png = encode_rgba_to_png(&[], 0, 0);
+        assert!(png.is_none());
     }
 }

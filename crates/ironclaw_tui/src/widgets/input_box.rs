@@ -60,6 +60,11 @@ impl InputBoxWidget {
         self.textarea.cut();
         self.textarea.insert_str(text);
     }
+
+    /// Insert text at the current cursor position.
+    pub fn insert_text(&mut self, text: &str) {
+        self.textarea.insert_str(text);
+    }
 }
 
 impl TuiWidget for InputBoxWidget {
@@ -76,6 +81,44 @@ impl TuiWidget for InputBoxWidget {
             return;
         }
 
+        // If there are pending attachments, render a chip row on the first line
+        let (attachment_row_height, input_start_y) = if !state.pending_attachments.is_empty() {
+            (1u16, area.y + 1)
+        } else {
+            (0u16, area.y)
+        };
+
+        if attachment_row_height > 0 {
+            let chip_area = Rect {
+                x: area.x + 4,
+                y: area.y,
+                width: area.width.saturating_sub(4),
+                height: 1,
+            };
+            let chips: Vec<Span<'_>> = state
+                .pending_attachments
+                .iter()
+                .flat_map(|a| {
+                    vec![
+                        Span::styled(
+                            format!(" [{}] ", a.label),
+                            self.theme.accent_style().add_modifier(Modifier::BOLD),
+                        ),
+                    ]
+                })
+                .collect();
+            let chip_line = Line::from(chips);
+            let chip_paragraph = ratatui::widgets::Paragraph::new(chip_line);
+            chip_paragraph.render(chip_area, buf);
+        }
+
+        let remaining_area = Rect {
+            x: area.x,
+            y: input_start_y,
+            width: area.width,
+            height: area.height.saturating_sub(attachment_row_height),
+        };
+
         // Render prompt character
         let prompt = if state.pending_approval.is_some() {
             "\u{25C6}"
@@ -91,24 +134,24 @@ impl TuiWidget for InputBoxWidget {
         let prompt_widget = ratatui::widgets::Paragraph::new(prompt_line);
 
         // Split area: prompt (4 chars) + textarea
-        if area.width > 5 {
+        if remaining_area.width > 5 {
             let prompt_area = Rect {
-                x: area.x,
-                y: area.y,
+                x: remaining_area.x,
+                y: remaining_area.y,
                 width: 4,
-                height: area.height,
+                height: remaining_area.height,
             };
             let input_area = Rect {
-                x: area.x + 4,
-                y: area.y,
-                width: area.width - 4,
-                height: area.height,
+                x: remaining_area.x + 4,
+                y: remaining_area.y,
+                width: remaining_area.width - 4,
+                height: remaining_area.height,
             };
 
             prompt_widget.render(prompt_area, buf);
             (&self.textarea).render(input_area, buf);
         } else {
-            prompt_widget.render(area, buf);
+            prompt_widget.render(remaining_area, buf);
         }
     }
 

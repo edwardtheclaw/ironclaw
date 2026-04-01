@@ -65,6 +65,8 @@ pub enum InputAction {
     ToolDetailScrollDown,
     /// Close the tool detail modal.
     ToolDetailClose,
+    /// Paste image from system clipboard (Ctrl+V).
+    ClipboardPaste,
     /// No recognized action — pass to input box.
     Forward,
 }
@@ -113,6 +115,7 @@ pub fn map_key(
         (KeyCode::Char('l'), KeyModifiers::CONTROL) => InputAction::ToggleLogs,
         (KeyCode::Char('f'), KeyModifiers::CONTROL) => InputAction::SearchToggle,
         (KeyCode::Char('e'), KeyModifiers::CONTROL) => InputAction::ExpandTool,
+        (KeyCode::Char('v'), KeyModifiers::CONTROL) => InputAction::ClipboardPaste,
         (KeyCode::F(1), _) => InputAction::ToggleHelp,
         (KeyCode::Esc, _) => InputAction::Interrupt,
         (KeyCode::PageUp, _) => InputAction::ScrollUp,
@@ -428,6 +431,12 @@ mod tests {
         assert_eq!(map_tool_detail(up), InputAction::ToolDetailScrollUp);
         let down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
         assert_eq!(map_tool_detail(down), InputAction::ToolDetailScrollDown);
+    }
+
+    #[test]
+    fn ctrl_v_clipboard_paste() {
+        let key = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        assert_eq!(map_default(key), InputAction::ClipboardPaste);
     }
 
     #[test]

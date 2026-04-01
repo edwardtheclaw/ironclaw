@@ -55,11 +55,44 @@ impl LogRingBuffer {
     }
 }
 
+/// A single image or file attachment pasted into the TUI.
+#[derive(Debug, Clone)]
+pub struct TuiAttachment {
+    /// Raw file bytes (e.g. PNG-encoded image).
+    pub data: Vec<u8>,
+    /// MIME type (e.g. "image/png").
+    pub mime_type: String,
+    /// Display label shown in the input area (e.g. "Image 1").
+    pub label: String,
+}
+
+/// A user message with optional attachments, sent from the TUI to the channel bridge.
+#[derive(Debug, Clone)]
+pub struct TuiUserMessage {
+    /// The text content of the message.
+    pub text: String,
+    /// Pasted image attachments.
+    pub attachments: Vec<TuiAttachment>,
+}
+
+impl TuiUserMessage {
+    /// Create a text-only message with no attachments.
+    pub fn text_only(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            attachments: Vec::new(),
+        }
+    }
+}
+
 /// Events consumed by the TUI run loop.
 #[derive(Debug, Clone)]
 pub enum TuiEvent {
     /// A keyboard event from crossterm.
     Key(KeyEvent),
+
+    /// Bracketed paste text from the terminal.
+    Paste(String),
 
     /// Terminal was resized to (cols, rows).
     Resize(u16, u16),

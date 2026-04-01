@@ -21,6 +21,7 @@ const KEYBINDINGS: &[(&str, &str)] = &[
     ("Ctrl-F", "Search conversation"),
     ("Ctrl-P / Ctrl-N", "Input history"),
     ("Ctrl-E", "Expand tool output"),
+    ("Ctrl-V", "Paste image from clipboard"),
     ("PgUp / PgDn", "Scroll"),
     ("Esc", "Interrupt / cancel"),
     ("y / n / a", "Approval shortcuts"),
