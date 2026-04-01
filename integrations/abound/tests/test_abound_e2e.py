@@ -16,16 +16,13 @@ import uuid
 import requests
 from openai import OpenAI
 
-# IronClaw deployment
-BASE_URL = os.environ.get("BASE_URL", "https://ironclaw-production-e3b1.up.railway.app")
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "39a5644953ff8edf2df5c56fcfc7027e3392000381d5d8157552c1a51bee4cca")
+# IronClaw deployment — set these env vars before running
+BASE_URL = os.environ["BASE_URL"]
+ADMIN_TOKEN = os.environ["ADMIN_TOKEN"]
 
-# Abound dev credentials (injected via admin API, not hardcoded in agent)
-ABOUND_BEARER_TOKEN = os.environ.get(
-    "ABOUND_BEARER_TOKEN",
-    "eyJhbGciOiJIUzM4NCJ9.eyJleHAiOjE3Nzc2MzM3MjUsImN1c3RvbWVyLWlkIjoiYTk0MTkyNTAtZWRlNy00MWEwLWE0MjItN2Y0ZTZmNDMzNjVmLTE3Njg0NjgzODUzMTgifQ.g3SDYkF2ns4GI3eo-l2f1OI23QN6gtoKNdUrNZfiVLvyOROEIivZ7pkp_NQDylZ4",
-)
-ABOUND_API_KEY = os.environ.get("ABOUND_API_KEY", "a105acd4-74f6-46b6-b429-c2b764462b99")
+# Abound dev credentials (injected via admin API)
+ABOUND_BEARER_TOKEN = os.environ["ABOUND_BEARER_TOKEN"]
+ABOUND_API_KEY = os.environ["ABOUND_API_KEY"]
 
 admin = requests.Session()
 admin.headers.update({

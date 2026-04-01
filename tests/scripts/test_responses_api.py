@@ -8,13 +8,14 @@ Usage:
 """
 
 import atexit
+import os
 import uuid
 
 import requests
 from openai import OpenAI
 
-BASE_URL = "https://ironclaw-production-e3b1.up.railway.app"
-ADMIN_TOKEN = "39a5644953ff8edf2df5c56fcfc7027e3392000381d5d8157552c1a51bee4cca"
+BASE_URL = os.environ["BASE_URL"]
+ADMIN_TOKEN = os.environ["ADMIN_TOKEN"]
 
 admin = requests.Session()
 admin.headers.update({

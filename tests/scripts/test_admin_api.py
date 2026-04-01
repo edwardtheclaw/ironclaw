@@ -4,12 +4,13 @@ Usage:
     python tests/scripts/test_admin_api.py
 """
 
+import os
 import uuid
 
 import requests
 
-BASE_URL = "https://ironclaw-production-e3b1.up.railway.app"
-ADMIN_TOKEN = "39a5644953ff8edf2df5c56fcfc7027e3392000381d5d8157552c1a51bee4cca"
+BASE_URL = os.environ["BASE_URL"]
+ADMIN_TOKEN = os.environ["ADMIN_TOKEN"]
 
 session = requests.Session()
 session.headers.update({

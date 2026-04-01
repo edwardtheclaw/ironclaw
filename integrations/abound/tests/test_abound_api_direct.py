@@ -8,12 +8,9 @@ import os
 
 import requests
 
-# Credentials from env or defaults (dev environment)
-ABOUND_BEARER_TOKEN = os.environ.get(
-    "ABOUND_BEARER_TOKEN",
-    "eyJhbGciOiJIUzM4NCJ9.eyJleHAiOjE3Nzc2MzM3MjUsImN1c3RvbWVyLWlkIjoiYTk0MTkyNTAtZWRlNy00MWEwLWE0MjItN2Y0ZTZmNDMzNjVmLTE3Njg0NjgzODUzMTgifQ.g3SDYkF2ns4GI3eo-l2f1OI23QN6gtoKNdUrNZfiVLvyOROEIivZ7pkp_NQDylZ4",
-)
-ABOUND_API_KEY = os.environ.get("ABOUND_API_KEY", "a105acd4-74f6-46b6-b429-c2b764462b99")
+# Credentials — set these env vars before running
+ABOUND_BEARER_TOKEN = os.environ["ABOUND_BEARER_TOKEN"]
+ABOUND_API_KEY = os.environ["ABOUND_API_KEY"]
 
 HEADERS = {
     "Authorization": f"Bearer {ABOUND_BEARER_TOKEN}",

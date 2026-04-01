@@ -7,9 +7,6 @@
 #   export ADMIN_TOKEN=your-admin-token
 #   bash tests/scripts/test_responses_api.sh
 
-export BASE_URL=https://ironclaw-production-e3b1.up.railway.app                                                                                                                                      
-export ADMIN_TOKEN=39a5644953ff8edf2df5c56fcfc7027e3392000381d5d8157552c1a51bee4cca
-
 set -euo pipefail
 
 : "${BASE_URL:?Set BASE_URL to the Railway deployment URL}"
