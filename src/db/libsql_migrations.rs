@@ -240,9 +240,9 @@ CREATE TABLE IF NOT EXISTS memory_chunks (
 
 CREATE INDEX IF NOT EXISTS idx_memory_chunks_document ON memory_chunks(document_id);
 
--- No vector index: BLOB column accepts any embedding dimension.
--- Vector search uses brute-force cosine distance (fast enough for
--- personal assistant workspaces). Matches PostgreSQL after V9 migration.
+-- No vector index in base schema: BLOB column accepts any embedding dimension.
+-- Vector index is created dynamically by ensure_vector_index() during
+-- run_migrations() when embeddings are configured (EMBEDDING_ENABLED=true).
 
 -- FTS5 virtual table for full-text search
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_chunks_fts USING fts5(
@@ -462,7 +462,7 @@ CREATE TABLE IF NOT EXISTS routines (
     max_concurrent INTEGER NOT NULL DEFAULT 1,
     dedup_window_secs INTEGER,
     notify_channel TEXT,
-    notify_user TEXT NOT NULL DEFAULT 'default',
+    notify_user TEXT,
     notify_on_success INTEGER NOT NULL DEFAULT 0,
     notify_on_failure INTEGER NOT NULL DEFAULT 1,
     notify_on_attention INTEGER NOT NULL DEFAULT 1,
@@ -546,7 +546,9 @@ CREATE INDEX IF NOT EXISTS idx_tool_failures_unrepaired ON tool_failures(tool_na
 
 -- routines
 CREATE INDEX IF NOT EXISTS idx_routines_next_fire ON routines(next_fire_at);
-CREATE INDEX IF NOT EXISTS idx_routines_event_triggers ON routines(user_id);
+CREATE INDEX IF NOT EXISTS idx_routines_event_triggers
+    ON routines(trigger_type, user_id)
+    WHERE enabled = 1 AND trigger_type IN ('event', 'system_event');
 
 -- routine_runs
 CREATE INDEX IF NOT EXISTS idx_routine_runs_status ON routine_runs(status);
@@ -577,6 +579,36 @@ INSERT OR IGNORE INTO leak_detection_patterns (id, name, pattern, severity, acti
     ('550e8400-e29b-41d4-a716-446655440011', 'mailchimp_api_key', '[a-f0-9]{32}-us[0-9]{1,2}', 'medium', 'block', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     ('550e8400-e29b-41d4-a716-446655440012', 'high_entropy_hex', '(?<![a-fA-F0-9])[a-fA-F0-9]{64}(?![a-fA-F0-9])', 'medium', 'warn', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 
+
+-- ==================== User management (V14) ====================
+
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    email TEXT UNIQUE,
+    display_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    role TEXT NOT NULL DEFAULT 'member',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    last_login_at TEXT,
+    created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash BLOB NOT NULL,
+    token_prefix TEXT NOT NULL,
+    name TEXT NOT NULL,
+    expires_at TEXT,
+    last_used_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
+
 "#;
 
 /// Incremental migrations applied after the base schema.
@@ -591,10 +623,9 @@ pub const INCREMENTAL_MIGRATIONS: &[(i64, &str, &str)] = &[
         // constraint so any embedding dimension works. Existing embeddings
         // are preserved; users only need to re-embed if they change models.
         //
-        // The vector index (libsql_vector_idx) requires a fixed-dimension
-        // F32_BLOB(N), so we drop it entirely. Vector search falls back to
-        // brute-force cosine distance which is fast enough for personal
-        // assistant workspaces. This matches PostgreSQL after its V9 migration.
+        // The vector index is dropped here; ensure_vector_index() recreates
+        // it with the correct F32_BLOB(N) dimension during run_migrations()
+        // when embeddings are configured.
         //
         // SQLite cannot ALTER COLUMN types, so we recreate the table.
         r#"
@@ -656,7 +687,145 @@ ALTER TABLE agent_jobs ADD COLUMN max_tokens INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE agent_jobs ADD COLUMN total_tokens_used INTEGER NOT NULL DEFAULT 0;
 "#,
     ),
+    (
+        13,
+        "routine_notify_user_nullable",
+        // Remove the legacy 'default' sentinel from routine notify_user.
+        // SQLite cannot drop NOT NULL / DEFAULT constraints in place, so we
+        // rebuild the table and normalize existing 'default' values to NULL.
+        r#"
+PRAGMA foreign_keys=OFF;
+
+CREATE TABLE IF NOT EXISTS routines_new (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    trigger_type TEXT NOT NULL,
+    trigger_config TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    action_config TEXT NOT NULL,
+    cooldown_secs INTEGER NOT NULL DEFAULT 300,
+    max_concurrent INTEGER NOT NULL DEFAULT 1,
+    dedup_window_secs INTEGER,
+    notify_channel TEXT,
+    notify_user TEXT,
+    notify_on_success INTEGER NOT NULL DEFAULT 0,
+    notify_on_failure INTEGER NOT NULL DEFAULT 1,
+    notify_on_attention INTEGER NOT NULL DEFAULT 1,
+    state TEXT NOT NULL DEFAULT '{}',
+    last_run_at TEXT,
+    next_fire_at TEXT,
+    run_count INTEGER NOT NULL DEFAULT 0,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (user_id, name)
+);
+
+INSERT INTO routines_new (
+    id, name, description, user_id, enabled,
+    trigger_type, trigger_config, action_type, action_config,
+    cooldown_secs, max_concurrent, dedup_window_secs,
+    notify_channel, notify_user, notify_on_success, notify_on_failure, notify_on_attention,
+    state, last_run_at, next_fire_at, run_count, consecutive_failures,
+    created_at, updated_at
+)
+SELECT
+    id, name, description, user_id, enabled,
+    trigger_type, trigger_config, action_type, action_config,
+    cooldown_secs, max_concurrent, dedup_window_secs,
+    notify_channel,
+    CASE WHEN notify_user = 'default' THEN NULL ELSE notify_user END,
+    notify_on_success, notify_on_failure, notify_on_attention,
+    state, last_run_at, next_fire_at, run_count, consecutive_failures,
+    created_at, updated_at
+FROM routines;
+
+DROP TABLE routines;
+ALTER TABLE routines_new RENAME TO routines;
+
+CREATE INDEX IF NOT EXISTS idx_routines_user ON routines(user_id);
+CREATE INDEX IF NOT EXISTS idx_routines_next_fire ON routines(next_fire_at);
+CREATE INDEX IF NOT EXISTS idx_routines_event_triggers
+    ON routines(trigger_type, user_id)
+    WHERE enabled = 1 AND trigger_type IN ('event', 'system_event');
+
+PRAGMA foreign_keys=ON;
+"#,
+    ),
+    (
+        14,
+        "users",
+        r#"
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    email TEXT UNIQUE,
+    display_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    role TEXT NOT NULL DEFAULT 'member',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    last_login_at TEXT,
+    created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash BLOB NOT NULL,
+    token_prefix TEXT NOT NULL,
+    name TEXT NOT NULL,
+    expires_at TEXT,
+    last_used_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
+"#,
+    ),
+    (
+        16,
+        "conversation_source_channel",
+        // Add source_channel to conversations for cross-channel approval authorization.
+        // Marked as idempotent (see IDEMPOTENT_ADD_COLUMN_MIGRATIONS below)
+        // because SQLite does not support IF NOT EXISTS for ADD COLUMN.
+        // The runner checks pragma_table_info before executing the ALTER.
+        r#"
+ALTER TABLE conversations ADD COLUMN source_channel TEXT;
+"#,
+    ),
 ];
+
+/// Migrations whose ADD COLUMN should be skipped when the column already
+/// exists (e.g. because the base SCHEMA was updated to include it).
+/// Each entry is `(version, table_name, column_name)`.
+const IDEMPOTENT_ADD_COLUMN_MIGRATIONS: &[(i64, &str, &str)] =
+    &[(16, "conversations", "source_channel")];
+
+/// Check whether `table` already contains `column` via `pragma_table_info`.
+async fn column_exists(
+    conn: &libsql::Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, crate::error::DatabaseError> {
+    use crate::error::DatabaseError;
+
+    let sql = format!(
+        "SELECT 1 FROM pragma_table_info('{}') WHERE name = ?1",
+        table
+    );
+    let mut rows = conn
+        .query(&sql, libsql::params![column])
+        .await
+        .map_err(|e| {
+            DatabaseError::Migration(format!("Failed to check column {table}.{column}: {e}"))
+        })?;
+    Ok(rows.next().await.ok().flatten().is_some())
+}
 
 /// Run incremental migrations that haven't been applied yet.
 ///
@@ -682,6 +851,18 @@ pub async fn run_incremental(conn: &libsql::Connection) -> Result<(), crate::err
             continue; // Already applied
         }
 
+        // For ADD COLUMN migrations, skip the ALTER if the column already
+        // exists (e.g. because the base SCHEMA was updated to include it)
+        // and just record the migration as applied.
+        let skip_sql = if let Some(&(_, table, column)) = IDEMPOTENT_ADD_COLUMN_MIGRATIONS
+            .iter()
+            .find(|(v, _, _)| *v == version)
+        {
+            column_exists(conn, table, column).await?
+        } else {
+            false
+        };
+
         // Wrap migration + recording in a transaction for atomicity.
         // If the process crashes mid-migration, the transaction rolls back
         // and the migration will be retried on next startup.
@@ -691,9 +872,19 @@ pub async fn run_incremental(conn: &libsql::Connection) -> Result<(), crate::err
             ))
         })?;
 
-        tx.execute_batch(sql).await.map_err(|e| {
-            DatabaseError::Migration(format!("libSQL migration V{version} ({name}) failed: {e}"))
-        })?;
+        if skip_sql {
+            tracing::debug!(
+                version,
+                name,
+                "libSQL: column already exists, recording migration as applied"
+            );
+        } else {
+            tx.execute_batch(sql).await.map_err(|e| {
+                DatabaseError::Migration(format!(
+                    "libSQL migration V{version} ({name}) failed: {e}"
+                ))
+            })?;
+        }
 
         // Record as applied (inside the same transaction)
         tx.execute(

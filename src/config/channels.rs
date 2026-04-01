@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use secrecy::SecretString;
-
 use crate::bootstrap::ironclaw_base_dir;
 use crate::config::helpers::{optional_env, parse_bool_env, parse_optional_env};
 use crate::error::ConfigError;
 use crate::settings::Settings;
+use secrecy::SecretString;
 
 /// Channel configurations.
 #[derive(Debug, Clone)]
@@ -44,7 +43,35 @@ pub struct GatewayConfig {
     pub port: u16,
     /// Bearer token for authentication. Random hex generated at startup if unset.
     pub auth_token: Option<String>,
-    pub user_id: String,
+    /// Additional user scopes for workspace reads.
+    ///
+    /// When set, the workspace will be able to read (search, read, list) from
+    /// these additional user scopes while writes remain isolated to the
+    /// authenticated user's own scope.
+    /// Parsed from `WORKSPACE_READ_SCOPES` (comma-separated).
+    pub workspace_read_scopes: Vec<String>,
+    /// Memory layer definitions (JSON in env var, or from external config).
+    pub memory_layers: Vec<crate::workspace::layer::MemoryLayer>,
+    /// OIDC JWT authentication (e.g., behind AWS ALB with Okta).
+    pub oidc: Option<GatewayOidcConfig>,
+}
+
+/// OIDC JWT authentication configuration for the web gateway.
+///
+/// When enabled, the gateway accepts signed JWTs from a configurable HTTP
+/// header (e.g., `x-amzn-oidc-data` from AWS ALB). Keys are fetched from
+/// a JWKS endpoint and cached for 1 hour.
+#[derive(Debug, Clone)]
+pub struct GatewayOidcConfig {
+    /// HTTP header containing the JWT (default: `x-amzn-oidc-data`).
+    pub header: String,
+    /// JWKS URL for key discovery. Supports `{kid}` placeholder for
+    /// ALB-style per-key PEM endpoints, and standard `/.well-known/jwks.json`.
+    pub jwks_url: String,
+    /// Expected `iss` claim. Validated if set.
+    pub issuer: Option<String>,
+    /// Expected `aud` claim. Validated if set.
+    pub audience: Option<String>,
 }
 
 /// Signal channel configuration (signal-cli daemon HTTP/JSON-RPC).
@@ -91,54 +118,168 @@ pub struct SignalConfig {
 }
 
 impl ChannelsConfig {
-    pub(crate) fn resolve(settings: &Settings) -> Result<Self, ConfigError> {
-        let http = if optional_env("HTTP_PORT")?.is_some() || optional_env("HTTP_HOST")?.is_some() {
+    pub(crate) fn resolve(settings: &Settings, owner_id: &str) -> Result<Self, ConfigError> {
+        let cs = &settings.channels;
+
+        let http_enabled_by_env =
+            optional_env("HTTP_PORT")?.is_some() || optional_env("HTTP_HOST")?.is_some();
+        let http = if http_enabled_by_env || cs.http_enabled {
             Some(HttpConfig {
-                host: optional_env("HTTP_HOST")?.unwrap_or_else(|| "0.0.0.0".to_string()),
-                port: parse_optional_env("HTTP_PORT", 8080)?,
+                host: optional_env("HTTP_HOST")?
+                    .or_else(|| cs.http_host.clone())
+                    .unwrap_or_else(|| "0.0.0.0".to_string()),
+                port: parse_optional_env("HTTP_PORT", cs.http_port.unwrap_or(8080))?,
                 webhook_secret: optional_env("HTTP_WEBHOOK_SECRET")?.map(SecretString::from),
-                user_id: optional_env("HTTP_USER_ID")?.unwrap_or_else(|| "http".to_string()),
+                user_id: owner_id.to_string(),
             })
         } else {
             None
         };
 
-        let gateway_enabled = parse_bool_env("GATEWAY_ENABLED", true)?;
+        let gateway_enabled = parse_bool_env("GATEWAY_ENABLED", cs.gateway_enabled)?;
         let gateway = if gateway_enabled {
-            Some(GatewayConfig {
-                host: optional_env("GATEWAY_HOST")?.unwrap_or_else(|| "127.0.0.1".to_string()),
-                port: parse_optional_env("GATEWAY_PORT", 3000)?,
-                auth_token: optional_env("GATEWAY_AUTH_TOKEN")?,
-                user_id: optional_env("GATEWAY_USER_ID")?.unwrap_or_else(|| "default".to_string()),
-            })
-        } else {
-            None
-        };
+            let memory_layers: Vec<crate::workspace::layer::MemoryLayer> =
+                match optional_env("MEMORY_LAYERS")? {
+                    Some(json_str) => {
+                        serde_json::from_str(&json_str).map_err(|e| ConfigError::InvalidValue {
+                            key: "MEMORY_LAYERS".to_string(),
+                            message: format!("must be valid JSON array of layer objects: {e}"),
+                        })?
+                    }
+                    None => crate::workspace::layer::MemoryLayer::default_for_user(owner_id),
+                };
 
-        let signal = if let Some(http_url) = optional_env("SIGNAL_HTTP_URL")? {
-            let account = optional_env("SIGNAL_ACCOUNT")?.ok_or(ConfigError::InvalidValue {
-                key: "SIGNAL_ACCOUNT".to_string(),
-                message: "SIGNAL_ACCOUNT is required when SIGNAL_HTTP_URL is set".to_string(),
-            })?;
-            let allow_from = match std::env::var_os("SIGNAL_ALLOW_FROM") {
-                None => vec![account.clone()],
-                Some(val) => {
-                    let s = val.to_string_lossy();
+            // Validate layer names and scopes
+            for layer in &memory_layers {
+                if layer.name.trim().is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        key: "MEMORY_LAYERS".to_string(),
+                        message: "layer name must not be empty".to_string(),
+                    });
+                }
+                if layer.name.len() > 64 {
+                    return Err(ConfigError::InvalidValue {
+                        key: "MEMORY_LAYERS".to_string(),
+                        message: format!("layer name '{}' exceeds 64 characters", layer.name),
+                    });
+                }
+                if !layer
+                    .name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    return Err(ConfigError::InvalidValue {
+                        key: "MEMORY_LAYERS".to_string(),
+                        message: format!(
+                            "layer name '{}' contains invalid characters \
+                             (allowed: a-z, A-Z, 0-9, _, -)",
+                            layer.name
+                        ),
+                    });
+                }
+                if layer.scope.trim().is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        key: "MEMORY_LAYERS".to_string(),
+                        message: format!("layer '{}' has an empty scope", layer.name),
+                    });
+                }
+            }
+
+            // Check for duplicate layer names
+            {
+                let mut seen = std::collections::HashSet::new();
+                for layer in &memory_layers {
+                    if !seen.insert(&layer.name) {
+                        return Err(ConfigError::InvalidValue {
+                            key: "MEMORY_LAYERS".to_string(),
+                            message: format!("duplicate layer name '{}'", layer.name),
+                        });
+                    }
+                }
+            }
+
+            let workspace_read_scopes: Vec<String> = optional_env("WORKSPACE_READ_SCOPES")?
+                .map(|s| {
                     s.split(',')
-                        .map(|e| e.trim().to_string())
+                        .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect()
+                })
+                .unwrap_or_default();
+
+            for scope in &workspace_read_scopes {
+                if scope.len() > 128 {
+                    return Err(ConfigError::InvalidValue {
+                        key: "WORKSPACE_READ_SCOPES".to_string(),
+                        message: format!("scope '{}...' exceeds 128 characters", &scope[..32]),
+                    });
                 }
+            }
+            let oidc_enabled = parse_bool_env("GATEWAY_OIDC_ENABLED", false)?;
+            let oidc = if oidc_enabled {
+                let jwks_url =
+                    optional_env("GATEWAY_OIDC_JWKS_URL")?.ok_or(ConfigError::InvalidValue {
+                        key: "GATEWAY_OIDC_JWKS_URL".to_string(),
+                        message: "required when GATEWAY_OIDC_ENABLED=true".to_string(),
+                    })?;
+                Some(GatewayOidcConfig {
+                    header: optional_env("GATEWAY_OIDC_HEADER")?
+                        .unwrap_or_else(|| "x-amzn-oidc-data".to_string()),
+                    jwks_url,
+                    issuer: optional_env("GATEWAY_OIDC_ISSUER")?,
+                    audience: optional_env("GATEWAY_OIDC_AUDIENCE")?,
+                })
+            } else {
+                None
             };
-            let dm_policy =
-                optional_env("SIGNAL_DM_POLICY")?.unwrap_or_else(|| "pairing".to_string());
-            let group_policy =
-                optional_env("SIGNAL_GROUP_POLICY")?.unwrap_or_else(|| "allowlist".to_string());
+
+            Some(GatewayConfig {
+                host: optional_env("GATEWAY_HOST")?
+                    .or_else(|| cs.gateway_host.clone())
+                    .unwrap_or_else(|| "127.0.0.1".to_string()),
+                port: parse_optional_env(
+                    "GATEWAY_PORT",
+                    cs.gateway_port.unwrap_or(DEFAULT_GATEWAY_PORT),
+                )?,
+                auth_token: optional_env("GATEWAY_AUTH_TOKEN")?
+                    .or_else(|| cs.gateway_auth_token.clone()),
+                workspace_read_scopes,
+                memory_layers,
+                oidc,
+            })
+        } else {
+            None
+        };
+
+        let signal_url = optional_env("SIGNAL_HTTP_URL")?.or_else(|| cs.signal_http_url.clone());
+        let signal = if let Some(http_url) = signal_url {
+            let account = optional_env("SIGNAL_ACCOUNT")?
+                .or_else(|| cs.signal_account.clone())
+                .ok_or(ConfigError::InvalidValue {
+                    key: "SIGNAL_ACCOUNT".to_string(),
+                    message: "SIGNAL_ACCOUNT is required when SIGNAL_HTTP_URL is set".to_string(),
+                })?;
+            let allow_from =
+                match optional_env("SIGNAL_ALLOW_FROM")?.or_else(|| cs.signal_allow_from.clone()) {
+                    None => vec![account.clone()],
+                    Some(s) => s
+                        .split(',')
+                        .map(|e| e.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                };
+            let dm_policy = optional_env("SIGNAL_DM_POLICY")?
+                .or_else(|| cs.signal_dm_policy.clone())
+                .unwrap_or_else(|| "pairing".to_string());
+            let group_policy = optional_env("SIGNAL_GROUP_POLICY")?
+                .or_else(|| cs.signal_group_policy.clone())
+                .unwrap_or_else(|| "allowlist".to_string());
             Some(SignalConfig {
                 http_url,
                 account,
                 allow_from,
                 allow_from_groups: optional_env("SIGNAL_ALLOW_FROM_GROUPS")?
+                    .or_else(|| cs.signal_allow_from_groups.clone())
                     .map(|s| {
                         s.split(',')
                             .map(|e| e.trim().to_string())
@@ -149,6 +290,7 @@ impl ChannelsConfig {
                 dm_policy,
                 group_policy,
                 group_allow_from: optional_env("SIGNAL_GROUP_ALLOW_FROM")?
+                    .or_else(|| cs.signal_group_allow_from.clone())
                     .map(|s| {
                         s.split(',')
                             .map(|e| e.trim().to_string())
@@ -167,9 +309,7 @@ impl ChannelsConfig {
             None
         };
 
-        let cli_enabled = optional_env("CLI_ENABLED")?
-            .map(|s| s.to_lowercase() != "false" && s != "0")
-            .unwrap_or(true);
+        let cli_enabled = parse_bool_env("CLI_ENABLED", cs.cli_enabled)?;
 
         Ok(Self {
             cli: CliConfig {
@@ -180,10 +320,14 @@ impl ChannelsConfig {
             signal,
             wasm_channels_dir: optional_env("WASM_CHANNELS_DIR")?
                 .map(PathBuf::from)
+                .or_else(|| cs.wasm_channels_dir.clone())
                 .unwrap_or_else(default_channels_dir),
-            wasm_channels_enabled: parse_bool_env("WASM_CHANNELS_ENABLED", true)?,
+            wasm_channels_enabled: parse_bool_env(
+                "WASM_CHANNELS_ENABLED",
+                cs.wasm_channels_enabled,
+            )?,
             wasm_channel_owner_ids: {
-                let mut ids = settings.channels.wasm_channel_owner_ids.clone();
+                let mut ids = cs.wasm_channel_owner_ids.clone();
                 // Backwards compat: TELEGRAM_OWNER_ID env var
                 if let Some(id_str) = optional_env("TELEGRAM_OWNER_ID")? {
                     let id: i64 = id_str.parse().map_err(|e: std::num::ParseIntError| {
@@ -200,6 +344,10 @@ impl ChannelsConfig {
     }
 }
 
+/// Default gateway port — used both in `resolve()` and as the fallback in
+/// other modules that need to construct a gateway URL.
+pub const DEFAULT_GATEWAY_PORT: u16 = 3000;
+
 /// Get the default channels directory (~/.ironclaw/channels/).
 fn default_channels_dir() -> PathBuf {
     ironclaw_base_dir().join("channels")
@@ -208,6 +356,8 @@ fn default_channels_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use crate::config::channels::*;
+    use crate::config::helpers::lock_env;
+    use crate::settings::Settings;
 
     #[test]
     fn cli_config_fields() {
@@ -250,12 +400,13 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 3000,
             auth_token: Some("tok-abc".to_string()),
-            user_id: "default".to_string(),
+            workspace_read_scopes: vec![],
+            memory_layers: vec![],
+            oidc: None,
         };
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 3000);
         assert_eq!(cfg.auth_token.as_deref(), Some("tok-abc"));
-        assert_eq!(cfg.user_id, "default");
     }
 
     #[test]
@@ -264,7 +415,9 @@ mod tests {
             host: "0.0.0.0".to_string(),
             port: 3001,
             auth_token: None,
-            user_id: "anon".to_string(),
+            workspace_read_scopes: vec![],
+            memory_layers: vec![],
+            oidc: None,
         };
         assert!(cfg.auth_token.is_none());
     }
@@ -361,5 +514,45 @@ mod tests {
             dir.ends_with("channels"),
             "expected path ending in 'channels', got: {dir:?}"
         );
+    }
+
+    #[test]
+    fn resolve_uses_settings_channel_values_with_owner_scope_user_ids() {
+        let _guard = lock_env();
+        let mut settings = Settings::default();
+        settings.channels.http_enabled = true;
+        settings.channels.http_host = Some("127.0.0.2".to_string());
+        settings.channels.http_port = Some(8181);
+        settings.channels.gateway_enabled = true;
+        settings.channels.gateway_host = Some("127.0.0.3".to_string());
+        settings.channels.gateway_port = Some(9191);
+        settings.channels.gateway_auth_token = Some("tok".to_string());
+        settings.channels.signal_http_url = Some("http://127.0.0.1:8080".to_string());
+        settings.channels.signal_account = Some("+15551234567".to_string());
+        settings.channels.signal_allow_from = Some("+15551234567,+15557654321".to_string());
+        settings.channels.wasm_channels_dir = Some(PathBuf::from("/tmp/settings-channels"));
+        settings.channels.wasm_channels_enabled = false;
+
+        let cfg = ChannelsConfig::resolve(&settings, "owner-scope").expect("resolve");
+
+        let http = cfg.http.expect("http config");
+        assert_eq!(http.host, "127.0.0.2");
+        assert_eq!(http.port, 8181);
+        assert_eq!(http.user_id, "owner-scope");
+
+        let gateway = cfg.gateway.expect("gateway config");
+        assert_eq!(gateway.host, "127.0.0.3");
+        assert_eq!(gateway.port, 9191);
+        assert_eq!(gateway.auth_token.as_deref(), Some("tok"));
+
+        let signal = cfg.signal.expect("signal config");
+        assert_eq!(signal.account, "+15551234567");
+        assert_eq!(signal.allow_from, vec!["+15551234567", "+15557654321"]);
+
+        assert_eq!(
+            cfg.wasm_channels_dir,
+            PathBuf::from("/tmp/settings-channels")
+        );
+        assert!(!cfg.wasm_channels_enabled);
     }
 }

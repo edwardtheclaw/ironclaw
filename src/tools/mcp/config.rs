@@ -163,10 +163,8 @@ impl McpServerConfig {
                 }
 
                 // Remote servers must use HTTPS (localhost is allowed for development)
-                let url_lower = self.url.to_lowercase();
-                let is_localhost =
-                    url_lower.contains("localhost") || url_lower.contains("127.0.0.1");
-                if !is_localhost && !url_lower.starts_with("https://") {
+                let is_localhost = is_localhost_url(&self.url);
+                if !is_localhost && !self.url.to_lowercase().starts_with("https://") {
                     return Err(ConfigError::InvalidConfig {
                         reason: "Remote MCP servers must use HTTPS".to_string(),
                     });
@@ -252,13 +250,30 @@ impl McpServerConfig {
     }
 
     /// Get the secret name used to store the refresh token.
+    ///
+    /// Matches the convention used by the hosted OAuth flow in
+    /// `store_oauth_tokens`: `{token_secret_name}_refresh_token`.
     pub fn refresh_token_secret_name(&self) -> String {
+        format!("{}_refresh_token", self.token_secret_name())
+    }
+
+    /// Legacy secret name for refresh tokens (pre-v0.22).
+    ///
+    /// Earlier versions stored refresh tokens as `mcp_{name}_refresh_token`
+    /// instead of `{token_secret_name}_refresh_token`. Used as a fallback
+    /// during lookup to avoid forcing re-auth on existing users.
+    pub fn legacy_refresh_token_secret_name(&self) -> String {
         format!("mcp_{}_refresh_token", self.name)
     }
 
     /// Get the secret name used to store the DCR client ID.
     pub fn client_id_secret_name(&self) -> String {
         format!("mcp_{}_client_id", self.name)
+    }
+
+    /// Get the secret name used to store the DCR client secret.
+    pub fn client_secret_secret_name(&self) -> String {
+        format!("mcp_{}_client_secret", self.name)
     }
 }
 
@@ -442,7 +457,12 @@ pub async fn save_mcp_servers_to(
     }
 
     let content = serde_json::to_string_pretty(config)?;
-    fs::write(path, content).await?;
+
+    // Write to a temporary file first, then atomically rename to avoid
+    // corrupting the config if the process crashes during the write.
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, content).await?;
+    fs::rename(&tmp_path, path).await?;
 
     Ok(())
 }
@@ -570,7 +590,7 @@ pub async fn remove_mcp_server_db(
 ///
 /// Uses `url::Url` for proper parsing so edge cases (IPv6, userinfo, ports)
 /// are handled correctly without manual string splitting.
-fn is_localhost_url(url: &str) -> bool {
+pub(crate) fn is_localhost_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
@@ -747,9 +767,21 @@ mod tests {
     fn test_token_secret_names() {
         let config = McpServerConfig::new("notion", "https://mcp.notion.com");
         assert_eq!(config.token_secret_name(), "mcp_notion_access_token");
+        // Refresh token name follows the hosted OAuth convention:
+        // {token_secret_name}_refresh_token
         assert_eq!(
             config.refresh_token_secret_name(),
+            "mcp_notion_access_token_refresh_token"
+        );
+        // Legacy name used before v0.22 — fallback lookup prevents forced re-auth
+        assert_eq!(
+            config.legacy_refresh_token_secret_name(),
             "mcp_notion_refresh_token"
+        );
+        assert_eq!(config.client_id_secret_name(), "mcp_notion_client_id");
+        assert_eq!(
+            config.client_secret_secret_name(),
+            "mcp_notion_client_secret"
         );
     }
 
@@ -1124,5 +1156,34 @@ mod tests {
         assert_eq!(parsed.name, "http-server");
         assert!(parsed.transport.is_none());
         assert_eq!(parsed.headers.get("X-Custom").unwrap(), "value");
+    }
+
+    // --- Issue 3 regression: is_localhost_url rejects attacker subdomains ---
+
+    #[test]
+    fn test_is_localhost_url_rejects_attacker_subdomain() {
+        // Before the fix, url.contains("localhost") matched this.
+        assert!(
+            !is_localhost_url("http://evil.localhost.attacker.com:8080/mcp"),
+            "attacker subdomain containing 'localhost' must not be treated as local"
+        );
+    }
+
+    #[test]
+    fn test_is_localhost_url_accepts_real_localhost() {
+        assert!(is_localhost_url("http://localhost:8080/mcp"));
+        assert!(is_localhost_url("https://localhost/path"));
+    }
+
+    #[test]
+    fn test_is_localhost_url_accepts_loopback_ip() {
+        assert!(is_localhost_url("http://127.0.0.1:3000"));
+        assert!(is_localhost_url("http://[::1]:3000"));
+    }
+
+    #[test]
+    fn test_is_localhost_url_rejects_remote() {
+        assert!(!is_localhost_url("https://mcp.example.com"));
+        assert!(!is_localhost_url("http://192.168.1.1:8080"));
     }
 }

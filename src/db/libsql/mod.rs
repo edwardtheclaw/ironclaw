@@ -12,11 +12,11 @@ mod routines;
 mod sandbox;
 mod settings;
 mod tool_failures;
+mod users;
 mod workspace;
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -32,8 +32,6 @@ use crate::error::DatabaseError;
 use crate::workspace::MemoryDocument;
 
 use crate::db::libsql_migrations;
-
-static NAIVE_TIMESTAMP_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Explicit column list for routines table (matches positional access in `row_to_routine_libsql`).
 pub(crate) const ROUTINE_COLUMNS: &str = "\
@@ -166,13 +164,11 @@ impl LibSqlBackend {
 ///
 /// Returns an error if none of the formats match.
 pub(crate) fn parse_timestamp(s: &str) -> Result<DateTime<Utc>, String> {
-    let log_naive_timestamp_once = || {
-        if !NAIVE_TIMESTAMP_LOGGED.swap(true, Ordering::Relaxed) {
-            tracing::debug!(
-                timestamp = %s,
-                "parsed naive timestamp without timezone; assuming UTC for backward compatibility"
-            );
-        }
+    let log_naive_timestamp = || {
+        tracing::warn!(
+            timestamp = %s,
+            "parsed naive timestamp, assuming UTC — consider migrating to RFC 3339"
+        );
     };
 
     // RFC 3339 (our canonical write format)
@@ -181,12 +177,12 @@ pub(crate) fn parse_timestamp(s: &str) -> Result<DateTime<Utc>, String> {
     }
     // Naive with fractional seconds (legacy or SQLite datetime() output)
     if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
-        log_naive_timestamp_once();
+        log_naive_timestamp();
         return Ok(ndt.and_utc());
     }
     // Naive without fractional seconds (legacy format)
     if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-        log_naive_timestamp_once();
+        log_naive_timestamp();
         return Ok(ndt.and_utc());
     }
     Err(format!("unparseable timestamp: {:?}", s))
@@ -245,6 +241,17 @@ pub(crate) fn opt_text_owned(s: Option<String>) -> libsql::Value {
         Some(s) => libsql::Value::Text(s),
         None => libsql::Value::Null,
     }
+}
+
+pub(crate) fn normalize_notify_user(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || trimmed == "default" {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 /// Extract an i64 column, defaulting to 0.
@@ -330,6 +337,14 @@ impl Database for LibSqlBackend {
             .map_err(|e| DatabaseError::Migration(format!("libSQL migration failed: {}", e)))?;
         // Apply incremental migrations (V9+) tracked in _migrations table.
         libsql_migrations::run_incremental(&conn).await?;
+
+        // Set up vector index if embeddings are configured.
+        // This dynamically creates a libsql_vector_idx on memory_chunks.embedding
+        // with the correct F32_BLOB(N) dimension inferred from env vars.
+        if let Some(dimension) = workspace::resolve_embedding_dimension() {
+            self.ensure_vector_index(dimension).await?;
+        }
+
         Ok(())
     }
 }
@@ -378,7 +393,7 @@ pub(crate) fn row_to_routine_libsql(row: &libsql::Row) -> Result<Routine, Databa
         },
         notify: NotifyConfig {
             channel: get_opt_text(row, 12),
-            user: get_text(row, 13),
+            user: normalize_notify_user(get_opt_text(row, 13)),
             on_success: get_i64(row, 14) != 0,
             on_failure: get_i64(row, 15) != 0,
             on_attention: get_i64(row, 16) != 0,
@@ -419,7 +434,17 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use crate::db::Database;
-    use crate::db::libsql::{LibSqlBackend, parse_timestamp};
+    use crate::db::libsql::{LibSqlBackend, fmt_ts, normalize_notify_user, parse_timestamp};
+
+    #[test]
+    fn test_normalize_notify_user_treats_legacy_default_as_missing() {
+        assert_eq!(normalize_notify_user(None), None); // safety: test-only assertion
+        assert_eq!(normalize_notify_user(Some(String::new())), None); // safety: test-only assertion
+        assert_eq!(normalize_notify_user(Some("   ".to_string())), None); // safety: test-only assertion
+        assert_eq!(normalize_notify_user(Some("default".to_string())), None); // safety: test-only assertion
+        let normalized = normalize_notify_user(Some("123456789".to_string()));
+        assert_eq!(normalized, Some("123456789".to_string())); // safety: test-only assertion
+    }
 
     #[test]
     fn test_parse_timestamp_accepts_rfc3339_and_legacy_naive_formats() {
@@ -436,6 +461,15 @@ mod tests {
 
         let naive_without_millis = parse_timestamp("2026-03-07 12:34:56").unwrap();
         assert_eq!(naive_without_millis, expected);
+    }
+
+    #[test]
+    fn test_fmt_ts_roundtrips_through_parse_timestamp() {
+        let original = Utc.with_ymd_and_hms(2026, 6, 15, 8, 30, 45).unwrap()
+            + chrono::Duration::milliseconds(123);
+        let formatted = fmt_ts(&original);
+        let parsed = parse_timestamp(&formatted).unwrap();
+        assert_eq!(parsed, original);
     }
 
     #[tokio::test]
