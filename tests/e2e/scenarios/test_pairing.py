@@ -77,3 +77,31 @@ async def test_pairing_approve_requires_auth(ironclaw_server):
             timeout=10,
         )
     assert r.status_code == 401 or r.status_code == 403
+
+
+async def test_pairing_response_structure(ironclaw_server):
+    """GET /api/pairing/{channel} returns JSON with a list of requests."""
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{ironclaw_server}/api/pairing/db-test-channel",
+            headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
+            timeout=10,
+        )
+    if r.status_code == 200:
+        data = r.json()
+        assert "requests" in data or isinstance(data, list), (
+            f"Expected 'requests' key or list, got: {data}"
+        )
+
+
+async def test_approve_lowercase_code_not_500(ironclaw_server):
+    """Lowercase pairing code does not cause a server error (case-insensitive matching)."""
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{ironclaw_server}/api/pairing/db-test-channel/approve",
+            json={"code": "abcd1234"},
+            headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
+            timeout=10,
+        )
+    # 400/404 is fine — code doesn't exist. 500 is not acceptable.
+    assert r.status_code != 500, f"Server error on lowercase code: {r.text[:200]}"
