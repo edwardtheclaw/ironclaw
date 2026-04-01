@@ -355,10 +355,30 @@ impl Default for AcpModeConfig {
 }
 
 impl AcpModeConfig {
+    /// Load from environment variables only (used inside containers).
+    pub fn from_env() -> Self {
+        match Self::resolve_env_only() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to resolve AcpModeConfig: {e}, using defaults");
+                Self::default()
+            }
+        }
+    }
+
     pub(crate) fn resolve(settings: &crate::settings::Settings) -> Result<Self, ConfigError> {
         let defaults = Self::default();
         Ok(Self {
             enabled: parse_bool_env("ACP_ENABLED", settings.sandbox.acp_enabled)?,
+            memory_limit_mb: parse_optional_env("ACP_MEMORY_LIMIT_MB", defaults.memory_limit_mb)?,
+            timeout_secs: parse_optional_env("ACP_TIMEOUT_SECS", defaults.timeout_secs)?,
+        })
+    }
+
+    fn resolve_env_only() -> Result<Self, ConfigError> {
+        let defaults = Self::default();
+        Ok(Self {
+            enabled: parse_bool_env("ACP_ENABLED", defaults.enabled)?,
             memory_limit_mb: parse_optional_env("ACP_MEMORY_LIMIT_MB", defaults.memory_limit_mb)?,
             timeout_secs: parse_optional_env("ACP_TIMEOUT_SECS", defaults.timeout_secs)?,
         })

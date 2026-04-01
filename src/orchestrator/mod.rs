@@ -123,6 +123,7 @@ pub async fn setup_orchestrator(
             claude_code_memory_limit_mb: config.claude_code.memory_limit_mb,
             claude_code_allowed_tools: config.claude_code.allowed_tools.clone(),
             acp_memory_limit_mb: config.acp.memory_limit_mb,
+            acp_timeout_secs: config.acp.timeout_secs,
         };
         let jm = Arc::new(ContainerJobManager::new(job_config, token_store.clone()));
 

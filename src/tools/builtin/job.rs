@@ -925,30 +925,24 @@ impl Tool for CreateJobTool {
             // Resolve ACP agent config when mode is ACP.
             let acp_agent = if mode == JobMode::Acp {
                 let agent_name = require_str(&params, "agent_name")?;
-                let agents_file = if let Some(ref store) = self.store {
-                    crate::config::acp::load_acp_agents_from_db(store.as_ref(), &ctx.user_id)
-                        .await
-                        .map_err(|e| {
-                            ToolError::ExecutionFailed(format!("failed to load ACP agents: {}", e))
-                        })?
-                } else {
-                    crate::config::acp::load_acp_agents().await.map_err(|e| {
-                        ToolError::ExecutionFailed(format!("failed to load ACP agents: {}", e))
-                    })?
-                };
-                let agent = agents_file.get(agent_name).cloned().ok_or_else(|| {
-                    ToolError::InvalidParameters(format!(
-                        "ACP agent '{}' not found. Run 'ironclaw acp list' to see available agents.",
-                        agent_name
-                    ))
-                })?;
-                if !agent.enabled {
-                    return Err(ToolError::InvalidParameters(format!(
-                        "ACP agent '{}' is disabled. Enable it with 'ironclaw acp toggle {}'.",
-                        agent_name, agent_name
-                    )));
-                }
-                Some(agent)
+                Some(
+                    crate::config::acp::get_enabled_acp_agent_for_user(
+                        self.store.as_deref(),
+                        &ctx.user_id,
+                        agent_name,
+                    )
+                    .await
+                    .map_err(|e| match e {
+                        crate::config::acp::AcpConfigError::AgentNotFound { .. }
+                        | crate::config::acp::AcpConfigError::AgentDisabled { .. } => {
+                            ToolError::InvalidParameters(e.to_string())
+                        }
+                        _ => ToolError::ExecutionFailed(format!(
+                            "failed to load ACP agent '{}': {}",
+                            agent_name, e
+                        )),
+                    })?,
+                )
             } else {
                 None
             };

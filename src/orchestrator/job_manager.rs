@@ -71,6 +71,8 @@ pub struct ContainerJobConfig {
     pub claude_code_allowed_tools: Vec<String>,
     /// Memory limit for ACP containers.
     pub acp_memory_limit_mb: u64,
+    /// Maximum runtime for ACP bridge sessions in seconds.
+    pub acp_timeout_secs: u64,
 }
 
 impl Default for ContainerJobConfig {
@@ -87,6 +89,7 @@ impl Default for ContainerJobConfig {
             claude_code_memory_limit_mb: 4096,
             claude_code_allowed_tools: crate::config::ClaudeCodeConfig::default().allowed_tools,
             acp_memory_limit_mb: 4096,
+            acp_timeout_secs: 1800,
         }
     }
 }
@@ -231,6 +234,28 @@ impl ContainerJobManager {
         }
     }
 
+    fn extend_acp_env(
+        &self,
+        env_vec: &mut Vec<String>,
+        acp_agent: Option<&crate::config::acp::AcpAgentConfig>,
+    ) {
+        env_vec.push(format!("ACP_TIMEOUT_SECS={}", self.config.acp_timeout_secs));
+
+        if let Some(agent) = acp_agent {
+            env_vec.push(format!("ACP_AGENT_COMMAND={}", agent.command));
+            if !agent.args.is_empty()
+                && let Ok(json) = serde_json::to_string(&agent.args)
+            {
+                env_vec.push(format!("ACP_AGENT_ARGS={}", json));
+            }
+            if !agent.env.is_empty()
+                && let Ok(json) = serde_json::to_string(&agent.env)
+            {
+                env_vec.push(format!("ACP_AGENT_ENV={}", json));
+            }
+        }
+    }
+
     /// Get or create a Docker connection.
     async fn docker(&self) -> Result<bollard::Docker, OrchestratorError> {
         {
@@ -357,19 +382,9 @@ impl ContainerJobManager {
             }
         }
 
-        // ACP mode: inject per-job agent command/args/env for the bridge to spawn.
-        if let Some(ref agent) = acp_agent {
-            env_vec.push(format!("ACP_AGENT_COMMAND={}", agent.command));
-            if !agent.args.is_empty()
-                && let Ok(json) = serde_json::to_string(&agent.args)
-            {
-                env_vec.push(format!("ACP_AGENT_ARGS={}", json));
-            }
-            if !agent.env.is_empty()
-                && let Ok(json) = serde_json::to_string(&agent.env)
-            {
-                env_vec.push(format!("ACP_AGENT_ENV={}", json));
-            }
+        // ACP mode: inject runtime timeout plus per-job agent command/args/env.
+        if mode == JobMode::Acp {
+            self.extend_acp_env(&mut env_vec, acp_agent.as_ref());
         }
 
         // Memory limit per mode
@@ -750,5 +765,40 @@ mod tests {
     fn test_container_job_config_acp_memory_default() {
         let config = ContainerJobConfig::default();
         assert_eq!(config.acp_memory_limit_mb, 4096);
+    }
+
+    #[test]
+    fn test_container_job_config_acp_timeout_default() {
+        let config = ContainerJobConfig::default();
+        assert_eq!(config.acp_timeout_secs, 1800);
+    }
+
+    #[test]
+    fn test_extend_acp_env_includes_timeout_and_agent_details() {
+        let mut config = ContainerJobConfig::default();
+        config.acp_timeout_secs = 45;
+        let manager = ContainerJobManager::new(config, TokenStore::new());
+
+        let agent = crate::config::acp::AcpAgentConfig::new(
+            "codex",
+            "codex",
+            vec!["acp".into()],
+            HashMap::from([("FOO".to_string(), "bar".to_string())]),
+        );
+        let mut env_vec = Vec::new();
+        manager.extend_acp_env(&mut env_vec, Some(&agent));
+
+        assert!(env_vec.contains(&"ACP_TIMEOUT_SECS=45".to_string()));
+        assert!(env_vec.contains(&"ACP_AGENT_COMMAND=codex".to_string()));
+        assert!(
+            env_vec
+                .iter()
+                .any(|entry| entry.starts_with("ACP_AGENT_ARGS="))
+        );
+        assert!(
+            env_vec
+                .iter()
+                .any(|entry| entry.starts_with("ACP_AGENT_ENV="))
+        );
     }
 }

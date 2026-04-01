@@ -38,6 +38,10 @@ pub use container::WorkerRuntime;
 pub use job::{Worker, WorkerDeps};
 pub use proxy_llm::ProxyLlmProvider;
 
+fn acp_bridge_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(crate::config::AcpModeConfig::from_env().timeout_secs)
+}
+
 /// Run the Worker subcommand (inside Docker containers).
 pub async fn run_worker(
     job_id: uuid::Uuid,
@@ -99,7 +103,7 @@ pub async fn run_acp_bridge(job_id: uuid::Uuid, orchestrator_url: &str) -> anyho
     let config = acp_bridge::AcpBridgeConfig {
         job_id,
         orchestrator_url: orchestrator_url.to_string(),
-        timeout: std::time::Duration::from_secs(1800),
+        timeout: acp_bridge_timeout(),
         agent_command,
         agent_args,
         agent_env,
@@ -142,4 +146,27 @@ pub async fn run_claude_bridge(
     rt.run()
         .await
         .map_err(|e| anyhow::anyhow!("Claude bridge failed: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acp_bridge_timeout_defaults_to_1800_seconds() {
+        let _guard = crate::config::helpers::lock_env();
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe { std::env::remove_var("ACP_TIMEOUT_SECS") };
+        assert_eq!(acp_bridge_timeout(), std::time::Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn acp_bridge_timeout_respects_env_override() {
+        let _guard = crate::config::helpers::lock_env();
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe { std::env::set_var("ACP_TIMEOUT_SECS", "45") };
+        assert_eq!(acp_bridge_timeout(), std::time::Duration::from_secs(45));
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe { std::env::remove_var("ACP_TIMEOUT_SECS") };
+    }
 }

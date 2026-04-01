@@ -157,6 +157,9 @@ pub enum AcpConfigError {
 
     #[error("Agent not found: {name}")]
     AgentNotFound { name: String },
+
+    #[error("Agent is disabled: {name}")]
+    AgentDisabled { name: String },
 }
 
 // ==================== Disk persistence ====================
@@ -291,6 +294,17 @@ pub async fn load_acp_agents_from_db(
     }
 }
 
+/// Load ACP agent configurations from the active persistence backend.
+pub async fn load_acp_agents_for_user(
+    store: Option<&dyn crate::db::Database>,
+    user_id: &str,
+) -> Result<AcpAgentsFile, AcpConfigError> {
+    match store {
+        Some(store) => load_acp_agents_from_db(store, user_id).await,
+        None => load_acp_agents().await,
+    }
+}
+
 /// Save ACP agent configurations to the database settings table.
 pub async fn save_acp_agents_to_db(
     store: &dyn crate::db::Database,
@@ -303,6 +317,18 @@ pub async fn save_acp_agents_to_db(
         .await
         .map_err(std::io::Error::other)?;
     Ok(())
+}
+
+/// Save ACP agent configurations to the active persistence backend.
+pub async fn save_acp_agents_for_user(
+    store: Option<&dyn crate::db::Database>,
+    user_id: &str,
+    config: &AcpAgentsFile,
+) -> Result<(), AcpConfigError> {
+    match store {
+        Some(store) => save_acp_agents_to_db(store, user_id, config).await,
+        None => save_acp_agents(config).await,
+    }
 }
 
 /// Add a new ACP agent configuration (DB-backed).
@@ -336,6 +362,36 @@ pub async fn remove_acp_agent_db(
 
     save_acp_agents_to_db(store, user_id, &agents).await?;
     Ok(())
+}
+
+/// Load a single ACP agent from the active persistence backend.
+pub async fn get_acp_agent_for_user(
+    store: Option<&dyn crate::db::Database>,
+    user_id: &str,
+    name: &str,
+) -> Result<AcpAgentConfig, AcpConfigError> {
+    let agents = load_acp_agents_for_user(store, user_id).await?;
+    agents
+        .get(name)
+        .cloned()
+        .ok_or_else(|| AcpConfigError::AgentNotFound {
+            name: name.to_string(),
+        })
+}
+
+/// Load a single ACP agent and ensure it is enabled.
+pub async fn get_enabled_acp_agent_for_user(
+    store: Option<&dyn crate::db::Database>,
+    user_id: &str,
+    name: &str,
+) -> Result<AcpAgentConfig, AcpConfigError> {
+    let agent = get_acp_agent_for_user(store, user_id, name).await?;
+    if !agent.enabled {
+        return Err(AcpConfigError::AgentDisabled {
+            name: name.to_string(),
+        });
+    }
+    Ok(agent)
 }
 
 #[cfg(test)]
@@ -525,5 +581,56 @@ mod tests {
 
         let result = load_acp_agents_from(&path).await;
         assert!(result.is_err());
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_load_and_save_acp_agents_for_non_default_owner_scope() {
+        let (db, _tmp) = crate::testing::test_db().await;
+
+        let mut file = AcpAgentsFile::default();
+        file.upsert(AcpAgentConfig::new(
+            "goose",
+            "goose",
+            vec!["--stdio".into()],
+            HashMap::new(),
+        ));
+
+        save_acp_agents_for_user(Some(db.as_ref()), "owner-123", &file)
+            .await
+            .unwrap();
+
+        let loaded = load_acp_agents_for_user(Some(db.as_ref()), "owner-123")
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.get("goose").map(|agent| agent.command.as_str()),
+            Some("goose")
+        );
+
+        let default_scope = load_acp_agents_for_user(Some(db.as_ref()), "default")
+            .await
+            .unwrap();
+        assert!(default_scope.get("goose").is_none());
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_get_enabled_agent_rejects_disabled_agent() {
+        let (db, _tmp) = crate::testing::test_db().await;
+
+        let mut file = AcpAgentsFile::default();
+        let mut agent = AcpAgentConfig::new("codex", "codex", vec!["acp".into()], HashMap::new());
+        agent.enabled = false;
+        file.upsert(agent);
+
+        save_acp_agents_for_user(Some(db.as_ref()), "owner-123", &file)
+            .await
+            .unwrap();
+
+        let err = get_enabled_acp_agent_for_user(Some(db.as_ref()), "owner-123", "codex")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AcpConfigError::AgentDisabled { .. }));
     }
 }

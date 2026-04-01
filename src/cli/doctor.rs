@@ -10,6 +10,21 @@ use crate::bootstrap::ironclaw_base_dir;
 use crate::cli::fmt;
 use crate::settings::Settings;
 
+async fn load_acp_agents_for_doctor()
+-> Result<crate::config::acp::AcpAgentsFile, crate::config::acp::AcpConfigError> {
+    match crate::config::Config::from_env().await {
+        Ok(config) => {
+            let db: Option<std::sync::Arc<dyn crate::db::Database>> =
+                crate::db::connect_from_config(&config.database)
+                    .await
+                    .ok()
+                    .map(|db| db as std::sync::Arc<dyn crate::db::Database>);
+            crate::config::acp::load_acp_agents_for_user(db.as_deref(), &config.owner_id).await
+        }
+        Err(_) => crate::config::acp::load_acp_agents().await,
+    }
+}
+
 /// Run all diagnostic checks and print results.
 pub async fn run_doctor_command() -> anyhow::Result<()> {
     println!();
@@ -529,7 +544,7 @@ async fn check_mcp_config() -> CheckResult {
 }
 
 async fn check_acp_config() -> CheckResult {
-    match crate::config::acp::load_acp_agents().await {
+    match load_acp_agents_for_doctor().await {
         Ok(file) => {
             let agents: Vec<_> = file.enabled_agents().collect();
             if agents.is_empty() {

@@ -14,6 +14,37 @@ use uuid::Uuid;
 use crate::channels::web::server::GatewayState;
 use crate::channels::web::types::*;
 
+async fn resolve_sandbox_restart_mode(
+    store: &dyn crate::db::Database,
+    stored_mode: &str,
+    user_id: &str,
+) -> Result<
+    (
+        crate::orchestrator::job_manager::JobMode,
+        Option<crate::config::acp::AcpAgentConfig>,
+    ),
+    crate::config::acp::AcpConfigError,
+> {
+    if stored_mode == "claude_code" {
+        return Ok((crate::orchestrator::job_manager::JobMode::ClaudeCode, None));
+    }
+
+    if let Some(agent_name) = stored_mode.strip_prefix("acp:") {
+        let agent =
+            crate::config::acp::get_enabled_acp_agent_for_user(Some(store), user_id, agent_name)
+                .await?;
+        return Ok((crate::orchestrator::job_manager::JobMode::Acp, Some(agent)));
+    }
+
+    if stored_mode == "acp" {
+        return Err(crate::config::acp::AcpConfigError::InvalidConfig {
+            reason: "legacy ACP jobs without an agent name cannot be restarted".to_string(),
+        });
+    }
+
+    Ok((crate::orchestrator::job_manager::JobMode::Worker, None))
+}
+
 pub async fn jobs_list_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<JobListResponse>, (StatusCode, String)> {
@@ -354,6 +385,28 @@ pub async fn jobs_restart_handler(
         let new_job_id = Uuid::new_v4();
         let now = chrono::Utc::now();
 
+        let stored_mode = store
+            .get_sandbox_job_mode(old_job_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .unwrap_or_default();
+
+        let (mode, acp_agent) =
+            resolve_sandbox_restart_mode(store.as_ref(), &stored_mode, &old_job.user_id)
+                .await
+                .map_err(|e| (StatusCode::CONFLICT, format!("Cannot restart job: {}", e)))?;
+
+        let credential_grants: Vec<crate::orchestrator::auth::CredentialGrant> =
+            serde_json::from_str(&old_job.credential_grants_json).unwrap_or_else(|e| {
+                tracing::warn!(
+                    job_id = %old_job.id,
+                    "Failed to deserialize credential grants from stored job: {}. \
+                     Restarted job will have no credentials.",
+                    e
+                );
+                vec![]
+            });
+
         let record = crate::history::SandboxJobRecord {
             id: new_job_id,
             task: task.clone(),
@@ -372,49 +425,26 @@ pub async fn jobs_restart_handler(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let stored_mode = store
-            .get_sandbox_job_mode(old_job_id)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-
-        // Parse mode string — ACP jobs are stored as "acp:<agent_name>".
-        let (mode, acp_agent) = if stored_mode == "claude_code" {
-            (crate::orchestrator::job_manager::JobMode::ClaudeCode, None)
-        } else if let Some(agent_name) = stored_mode.strip_prefix("acp:") {
-            let agent = if let Some(ref s) = state.store {
-                crate::config::acp::load_acp_agents_from_db(s.as_ref(), &state.user_id)
-                    .await
-                    .ok()
-                    .and_then(|f| f.get(agent_name).cloned())
+        if mode != crate::orchestrator::job_manager::JobMode::Worker {
+            let mode_str = if mode == crate::orchestrator::job_manager::JobMode::Acp {
+                format!(
+                    "acp:{}",
+                    acp_agent
+                        .as_ref()
+                        .map(|agent| agent.name.as_str())
+                        .unwrap_or_default()
+                )
             } else {
-                crate::config::acp::load_acp_agents()
-                    .await
-                    .ok()
-                    .and_then(|f| f.get(agent_name).cloned())
+                mode.as_str().to_string()
             };
-            (crate::orchestrator::job_manager::JobMode::Acp, agent)
-        } else if stored_mode == "acp" {
-            // Legacy: "acp" without agent name — no agent config available
-            (crate::orchestrator::job_manager::JobMode::Acp, None)
-        } else {
-            (crate::orchestrator::job_manager::JobMode::Worker, None)
-        };
-
-        let credential_grants: Vec<crate::orchestrator::auth::CredentialGrant> =
-            serde_json::from_str(&old_job.credential_grants_json).unwrap_or_else(|e| {
-                tracing::warn!(
-                    job_id = %old_job.id,
-                    "Failed to deserialize credential grants from stored job: {}. \
-                     Restarted job will have no credentials.",
-                    e
-                );
-                vec![]
-            });
+            store
+                .update_sandbox_job_mode(new_job_id, &mode_str)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
 
         let project_dir = std::path::PathBuf::from(&old_job.project_dir);
-        let _token = jm
+        let create_result = jm
             .create_job(
                 new_job_id,
                 &task,
@@ -423,13 +453,27 @@ pub async fn jobs_restart_handler(
                 credential_grants,
                 acp_agent,
             )
-            .await
-            .map_err(|e| {
-                (
+            .await;
+        let _token = match create_result {
+            Ok(token) => token,
+            Err(e) => {
+                let error_text = e.to_string();
+                let _ = store
+                    .update_sandbox_job_status(
+                        new_job_id,
+                        "failed",
+                        Some(false),
+                        Some(error_text.as_str()),
+                        None,
+                        Some(chrono::Utc::now()),
+                    )
+                    .await;
+                return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to create container: {}", e),
-                )
-            })?;
+                    format!("Failed to create container: {}", error_text),
+                ));
+            }
+        };
 
         store
             .update_sandbox_job_status(new_job_id, "running", None, None, Some(now), None)
@@ -728,4 +772,63 @@ pub async fn job_files_read_handler(
         path: path.to_string(),
         content,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn sandbox_restart_mode_uses_original_job_owner_scope() {
+        let (db, _tmp) = crate::testing::test_db().await;
+
+        let mut agents = crate::config::acp::AcpAgentsFile::default();
+        agents.upsert(crate::config::acp::AcpAgentConfig::new(
+            "codex",
+            "codex",
+            vec!["acp".into()],
+            std::collections::HashMap::new(),
+        ));
+        crate::config::acp::save_acp_agents_for_user(Some(db.as_ref()), "owner-123", &agents)
+            .await
+            .unwrap();
+
+        let (mode, agent) = resolve_sandbox_restart_mode(db.as_ref(), "acp:codex", "owner-123")
+            .await
+            .unwrap();
+
+        assert_eq!(mode, crate::orchestrator::job_manager::JobMode::Acp);
+        assert_eq!(
+            agent.as_ref().map(|agent| agent.name.as_str()),
+            Some("codex")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn sandbox_restart_mode_rejects_disabled_acp_agent() {
+        let (db, _tmp) = crate::testing::test_db().await;
+
+        let mut agents = crate::config::acp::AcpAgentsFile::default();
+        let mut agent = crate::config::acp::AcpAgentConfig::new(
+            "codex",
+            "codex",
+            vec!["acp".into()],
+            std::collections::HashMap::new(),
+        );
+        agent.enabled = false;
+        agents.upsert(agent);
+        crate::config::acp::save_acp_agents_for_user(Some(db.as_ref()), "owner-123", &agents)
+            .await
+            .unwrap();
+
+        let err = resolve_sandbox_restart_mode(db.as_ref(), "acp:codex", "owner-123")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::config::acp::AcpConfigError::AgentDisabled { .. }
+        ));
+    }
 }

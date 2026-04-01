@@ -89,11 +89,11 @@ async fn add_agent(args: AcpAddArgs) -> anyhow::Result<()> {
 
     config.validate().map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    let db = connect_db().await;
-    let mut agents = load_agents(db.as_ref()).await?;
+    let storage = resolve_storage().await;
+    let mut agents = load_agents(storage.db.as_deref(), &storage.owner_id).await?;
     let is_update = agents.get(&args.name).is_some();
     agents.upsert(config);
-    save_agents(db.as_ref(), &agents).await?;
+    save_agents(storage.db.as_deref(), &storage.owner_id, &agents).await?;
 
     if is_update {
         println!("Updated ACP agent '{}'", args.name);
@@ -104,21 +104,21 @@ async fn add_agent(args: AcpAddArgs) -> anyhow::Result<()> {
 }
 
 async fn remove_agent(name: &str) -> anyhow::Result<()> {
-    let db = connect_db().await;
-    let mut agents = load_agents(db.as_ref()).await?;
+    let storage = resolve_storage().await;
+    let mut agents = load_agents(storage.db.as_deref(), &storage.owner_id).await?;
 
     if !agents.remove(name) {
         anyhow::bail!("ACP agent '{}' not found", name);
     }
 
-    save_agents(db.as_ref(), &agents).await?;
+    save_agents(storage.db.as_deref(), &storage.owner_id, &agents).await?;
     println!("Removed ACP agent '{}'", name);
     Ok(())
 }
 
 async fn list_agents() -> anyhow::Result<()> {
-    let db = connect_db().await;
-    let agents = load_agents(db.as_ref()).await?;
+    let storage = resolve_storage().await;
+    let agents = load_agents(storage.db.as_deref(), &storage.owner_id).await?;
 
     if agents.agents.is_empty() {
         println!("No ACP agents configured.");
@@ -148,8 +148,8 @@ async fn list_agents() -> anyhow::Result<()> {
 }
 
 async fn toggle_agent(name: &str) -> anyhow::Result<()> {
-    let db = connect_db().await;
-    let mut agents = load_agents(db.as_ref()).await?;
+    let storage = resolve_storage().await;
+    let mut agents = load_agents(storage.db.as_deref(), &storage.owner_id).await?;
 
     let agent = agents
         .get_mut(name)
@@ -158,7 +158,7 @@ async fn toggle_agent(name: &str) -> anyhow::Result<()> {
     agent.enabled = !agent.enabled;
     let new_state = if agent.enabled { "enabled" } else { "disabled" };
 
-    save_agents(db.as_ref(), &agents).await?;
+    save_agents(storage.db.as_deref(), &storage.owner_id, &agents).await?;
     println!("ACP agent '{}' is now {}", name, new_state);
     Ok(())
 }
@@ -191,11 +191,14 @@ async fn test_agent(name: &str) -> anyhow::Result<()> {
         }
     }
 
-    let db = connect_db().await;
-    let agents = load_agents(db.as_ref()).await?;
-    let agent = agents
-        .get(name)
-        .ok_or_else(|| anyhow::anyhow!("ACP agent '{}' not found", name))?;
+    let storage = resolve_storage().await;
+    let agent = crate::config::acp::get_enabled_acp_agent_for_user(
+        storage.db.as_deref(),
+        &storage.owner_id,
+        name,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     println!();
     println!("  Testing ACP agent '{}'...", name);
@@ -276,40 +279,44 @@ async fn test_agent(name: &str) -> anyhow::Result<()> {
 
 // ==================== DB / disk persistence helpers ====================
 
-async fn connect_db() -> Option<Arc<dyn Database>> {
-    let config = match crate::config::Config::from_env().await {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-    crate::db::connect_from_config(&config.database)
-        .await
-        .ok()
-        .map(|db| db as Arc<dyn Database>)
+struct AcpCliStorage {
+    db: Option<Arc<dyn Database>>,
+    owner_id: String,
 }
 
-async fn load_agents(db: Option<&Arc<dyn Database>>) -> Result<AcpAgentsFile, anyhow::Error> {
-    match db {
-        Some(store) => acp::load_acp_agents_from_db(store.as_ref(), "default")
-            .await
-            .map_err(|e| anyhow::anyhow!("{}", e)),
-        None => acp::load_acp_agents()
-            .await
-            .map_err(|e| anyhow::anyhow!("{}", e)),
+async fn resolve_storage() -> AcpCliStorage {
+    match crate::config::Config::from_env().await {
+        Ok(config) => AcpCliStorage {
+            db: crate::db::connect_from_config(&config.database)
+                .await
+                .ok()
+                .map(|db| db as Arc<dyn Database>),
+            owner_id: config.owner_id,
+        },
+        Err(_) => AcpCliStorage {
+            db: None,
+            owner_id: "default".to_string(),
+        },
     }
+}
+
+async fn load_agents(
+    db: Option<&dyn Database>,
+    owner_id: &str,
+) -> Result<AcpAgentsFile, anyhow::Error> {
+    acp::load_acp_agents_for_user(db, owner_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 async fn save_agents(
-    db: Option<&Arc<dyn Database>>,
+    db: Option<&dyn Database>,
+    owner_id: &str,
     agents: &AcpAgentsFile,
 ) -> Result<(), anyhow::Error> {
-    match db {
-        Some(store) => acp::save_acp_agents_to_db(store.as_ref(), "default", agents)
-            .await
-            .map_err(|e| anyhow::anyhow!("{}", e)),
-        None => acp::save_acp_agents(agents)
-            .await
-            .map_err(|e| anyhow::anyhow!("{}", e)),
-    }
+    acp::save_acp_agents_for_user(db, owner_id, agents)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 #[cfg(test)]
