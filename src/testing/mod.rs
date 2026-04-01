@@ -610,7 +610,7 @@ mod tests {
 
         let id = harness
             .db
-            .create_conversation("test", "user1", None)
+            .create_conversation("test", "user1", None, None)
             .await
             .expect("create conversation");
         assert!(!id.is_nil());
@@ -625,7 +625,7 @@ mod tests {
         let db = &harness.db;
 
         let conv_id = db
-            .create_conversation("tui", "alice", None)
+            .create_conversation("tui", "alice", None, None)
             .await
             .expect("create conversation");
 
@@ -672,7 +672,7 @@ mod tests {
         let db = &harness.db;
 
         let conv_id = db
-            .create_conversation("web", "bob", None)
+            .create_conversation("web", "bob", None, None)
             .await
             .expect("create conversation");
 
@@ -724,20 +724,20 @@ mod tests {
         let db = &harness.db;
 
         let conv_id = db
-            .create_conversation("tui", "alice", None)
+            .create_conversation("tui", "alice", None, None)
             .await
             .expect("create conversation");
 
         // Owner check should pass.
         assert!(
-            db.conversation_belongs_to_user(conv_id, "alice")
+            db.conversation_belongs_to_user(conv_id, "alice", None)
                 .await
                 .expect("belongs check")
         );
 
         // Different user should NOT own it.
         assert!(
-            !db.conversation_belongs_to_user(conv_id, "mallory")
+            !db.conversation_belongs_to_user(conv_id, "mallory", None)
                 .await
                 .expect("belongs check other user")
         );
@@ -790,7 +790,7 @@ mod tests {
         let db = &harness.db;
 
         let conv_id = db
-            .create_conversation("web", "alice", None)
+            .create_conversation("web", "alice", None, None)
             .await
             .expect("create conversation");
 
@@ -834,7 +834,7 @@ mod tests {
         let db = &harness.db;
 
         let conv_id = db
-            .create_conversation("tui", "dave", None)
+            .create_conversation("tui", "dave", None, None)
             .await
             .expect("create conversation");
 
@@ -877,7 +877,7 @@ mod tests {
 
         // Create two conversations for the same user.
         let c1 = db
-            .create_conversation("tui", "eve", None)
+            .create_conversation("tui", "eve", None, None)
             .await
             .expect("create c1");
         db.add_conversation_message(c1, "user", "First conversation opener")
@@ -885,7 +885,7 @@ mod tests {
             .expect("add msg to c1");
 
         let c2 = db
-            .create_conversation("tui", "eve", None)
+            .create_conversation("tui", "eve", None, None)
             .await
             .expect("create c2");
         db.add_conversation_message(c2, "user", "Second conversation opener")
@@ -894,7 +894,7 @@ mod tests {
 
         // List with preview.
         let summaries = db
-            .list_conversations_with_preview("eve", "tui", 10)
+            .list_conversations_with_preview("eve", None, "tui", 10)
             .await
             .expect("list with preview");
 
@@ -1169,6 +1169,7 @@ mod tests {
             name: "test-routine".to_string(),
             description: "A test routine".to_string(),
             user_id: "user1".to_string(),
+            workspace_id: None,
             enabled: true,
             trigger: Trigger::Cron {
                 schedule: "0 * * * *".to_string(),
@@ -1216,7 +1217,7 @@ mod tests {
 
         // Get by name
         let by_name = db
-            .get_routine_by_name("user1", "test-routine")
+            .get_routine_by_name("user1", None, "test-routine")
             .await
             .expect("get by name")
             .expect("should exist");
@@ -1305,6 +1306,7 @@ mod tests {
             name: "runtime-test".to_string(),
             description: "Test runtime update".to_string(),
             user_id: "user1".to_string(),
+            workspace_id: None,
             enabled: true,
             trigger: Trigger::Manual,
             action: RoutineAction::Lightweight {
@@ -1399,6 +1401,7 @@ mod tests {
             task: "Build a test tool".to_string(),
             status: "creating".to_string(),
             user_id: "user1".to_string(),
+            workspace_id: None,
             project_dir: "/workspace/test".to_string(),
             success: None,
             failure_reason: None,
@@ -1494,6 +1497,7 @@ mod tests {
             task: "Mode test".to_string(),
             status: "creating".to_string(),
             user_id: "user1".to_string(),
+            workspace_id: None,
             project_dir: "/workspace".to_string(),
             success: None,
             failure_reason: None,
@@ -1536,6 +1540,7 @@ mod tests {
             task: "Event test".to_string(),
             status: "running".to_string(),
             user_id: "user1".to_string(),
+            workspace_id: None,
             project_dir: "/workspace".to_string(),
             success: None,
             failure_reason: None,

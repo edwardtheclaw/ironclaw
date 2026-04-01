@@ -2094,6 +2094,21 @@ impl Store {
         Ok(row.is_some())
     }
 
+    /// Get the workspace scope for a conversation, if any.
+    pub async fn get_conversation_workspace_id(
+        &self,
+        conversation_id: Uuid,
+    ) -> Result<Option<Uuid>, DatabaseError> {
+        let conn = self.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT workspace_id FROM conversations WHERE id = $1",
+                &[&conversation_id],
+            )
+            .await?;
+        Ok(row.and_then(|r| r.get::<_, Option<Uuid>>(0)))
+    }
+
     /// Get the source_channel for a conversation.
     pub async fn get_conversation_source_channel(
         &self,
@@ -2666,7 +2681,10 @@ impl Store {
         Ok(count > 0)
     }
 
-    pub async fn has_settings_for_workspace(&self, workspace_id: Uuid) -> Result<bool, DatabaseError> {
+    pub async fn has_settings_for_workspace(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<bool, DatabaseError> {
         let conn = self.conn().await?;
         let row = conn
             .query_one(
@@ -3233,6 +3251,7 @@ mod tests {
             message_count: 1,
             started_at: Utc::now(),
             last_activity: Utc::now(),
+            workspace_id: None,
             thread_type: Some("thread".to_string()),
             channel: "telegram".to_string(),
         };
@@ -3248,6 +3267,7 @@ mod tests {
                 message_count: 0,
                 started_at: Utc::now(),
                 last_activity: Utc::now(),
+                workspace_id: None,
                 thread_type: None,
                 channel: ch.to_string(),
             };

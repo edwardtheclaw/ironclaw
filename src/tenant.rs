@@ -143,7 +143,9 @@ impl TenantScope {
     }
 
     pub async fn get_routine_by_name(&self, name: &str) -> Result<Option<Routine>, DatabaseError> {
-        self.inner.get_routine_by_name(&self.user_id, None, name).await
+        self.inner
+            .get_routine_by_name(&self.user_id, None, name)
+            .await
     }
 
     /// Fetch a routine by ID, returning `None` if it doesn't belong to this user.

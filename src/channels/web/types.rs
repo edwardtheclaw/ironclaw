@@ -1255,6 +1255,7 @@ mod tests {
             name: "status-check".to_string(),
             description: "routine status test".to_string(),
             user_id: "test-user".to_string(),
+            workspace_id: None,
             enabled: true,
             trigger: crate::agent::routine::Trigger::Manual,
             action: crate::agent::routine::RoutineAction::Lightweight {

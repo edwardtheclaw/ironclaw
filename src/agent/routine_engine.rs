@@ -1854,6 +1854,7 @@ async fn execute_routine_tool(
 }
 
 /// Send a notification based on the routine's notify config and run status.
+#[allow(clippy::too_many_arguments)]
 async fn send_notification(
     tx: &mpsc::Sender<OutgoingResponse>,
     notify: &NotifyConfig,
@@ -2218,6 +2219,7 @@ mod tests {
             name: "test".to_string(),
             description: String::new(),
             user_id: user_id.to_string(),
+            workspace_id: None,
             enabled: true,
             trigger,
             action: RoutineAction::Lightweight {
@@ -2251,6 +2253,7 @@ mod tests {
             content: content.to_string(),
             thread_id: None,
             conversation_scope_id: None,
+            workspace_id: None,
             received_at: Utc::now(),
             metadata: serde_json::Value::Null,
             timezone: None,

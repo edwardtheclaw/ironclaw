@@ -482,6 +482,11 @@ pub trait ConversationStore: Send + Sync {
         user_id: &str,
         workspace_id: Option<Uuid>,
     ) -> Result<bool, DatabaseError>;
+    /// Get the workspace scope for a conversation, if any.
+    async fn get_conversation_workspace_id(
+        &self,
+        conversation_id: Uuid,
+    ) -> Result<Option<Uuid>, DatabaseError>;
     /// Get the source_channel for a conversation (the channel that created it).
     async fn get_conversation_source_channel(
         &self,

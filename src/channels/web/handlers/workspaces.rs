@@ -164,10 +164,7 @@ pub async fn workspaces_detail_handler(
     ))?;
     let resolved = resolve_workspace_scope(store, &user, Some(&slug)).await?;
     let resolved = resolved.ok_or((StatusCode::NOT_FOUND, "Workspace not found".to_string()))?;
-    Ok(Json(workspace_info(
-        resolved.workspace,
-        resolved.role,
-    )))
+    Ok(Json(workspace_info(resolved.workspace, resolved.role)))
 }
 
 pub async fn workspaces_update_handler(
@@ -300,6 +297,9 @@ pub async fn workspace_members_delete_handler(
     if deleted {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err((StatusCode::NOT_FOUND, "Workspace member not found".to_string()))
+        Err((
+            StatusCode::NOT_FOUND,
+            "Workspace member not found".to_string(),
+        ))
     }
 }

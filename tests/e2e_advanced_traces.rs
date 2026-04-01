@@ -429,7 +429,7 @@ mod advanced {
 
         let routine = rig
             .database()
-            .get_routine_by_name("test-user", "telegram-bug-watcher")
+            .get_routine_by_name("test-user", None, "telegram-bug-watcher")
             .await
             .expect("get_routine_by_name")
             .expect("telegram-bug-watcher should exist");
@@ -505,7 +505,7 @@ mod advanced {
 
         let routine = rig
             .database()
-            .get_routine_by_name("test-user", "any-channel-bug-watcher")
+            .get_routine_by_name("test-user", None, "any-channel-bug-watcher")
             .await
             .expect("get_routine_by_name")
             .expect("any-channel-bug-watcher should exist");

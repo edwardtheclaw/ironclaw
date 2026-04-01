@@ -113,6 +113,7 @@ fn make_routine(user_id: &str, name: &str) -> crate::agent::routine::Routine {
         name: name.to_string(),
         description: format!("Test routine: {name}"),
         user_id: user_id.to_string(),
+        workspace_id: None,
         enabled: true,
         trigger: crate::agent::routine::Trigger::Cron {
             schedule: "0 9 * * *".to_string(),
@@ -155,6 +156,7 @@ fn make_sandbox_job(user_id: &str, task: &str) -> crate::history::SandboxJobReco
         task: task.to_string(),
         status: "completed".to_string(),
         user_id: user_id.to_string(),
+        workspace_id: None,
         project_dir: format!("/tmp/test-{}", Uuid::new_v4()),
         success: Some(true),
         failure_reason: None,
@@ -172,7 +174,9 @@ fn make_sandbox_job(user_id: &str, task: &str) -> crate::history::SandboxJobReco
 #[cfg(feature = "libsql")]
 mod workspace_pool {
     use super::*;
+    use crate::channels::web::handlers::workspaces::ResolvedWorkspace;
     use crate::config::{WorkspaceConfig, WorkspaceSearchConfig};
+    use crate::db::WorkspaceRecord;
     use crate::workspace::EmbeddingCacheConfig;
     use crate::workspace::layer::MemoryLayer;
 
@@ -257,6 +261,49 @@ mod workspace_pool {
         assert!(
             ws.read_user_ids().contains(&"shared".to_string()),
             "expected 'shared' in read_user_ids from identity scopes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_pool_ignores_identity_scopes_for_shared_workspace() {
+        let (db, _dir) = test_db().await;
+        let pool = WorkspacePool::new(
+            db,
+            None,
+            EmbeddingCacheConfig::default(),
+            WorkspaceSearchConfig::default(),
+            WorkspaceConfig::default(),
+        );
+        let identity = UserIdentity {
+            user_id: "bob".to_string(),
+            role: "admin".to_string(),
+            workspace_read_scopes: vec!["legacy-shared".to_string()],
+        };
+        let workspace = ResolvedWorkspace {
+            workspace: WorkspaceRecord {
+                id: Uuid::new_v4(),
+                name: "Shared".to_string(),
+                slug: "shared".to_string(),
+                description: "".to_string(),
+                status: "active".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                created_by: "alice".to_string(),
+                settings: serde_json::json!({}),
+            },
+            role: "member".to_string(),
+        };
+
+        let ws = pool.get_or_create_scoped(&identity, Some(&workspace)).await;
+        let scopes = ws.read_user_ids();
+        assert!(
+            !scopes.contains(&"legacy-shared".to_string()),
+            "workspace-scoped workspace should not inherit legacy token scopes"
+        );
+        assert!(
+            scopes.iter().any(|scope| scope.starts_with("workspace:")),
+            "expected synthetic workspace scope, got {:?}",
+            scopes
         );
     }
 

@@ -26,9 +26,11 @@ async fn resolve_routine_scope(
     user: &crate::channels::web::auth::UserIdentity,
     query: &WorkspaceQuery,
 ) -> Result<Option<uuid::Uuid>, (StatusCode, String)> {
-    Ok(resolve_workspace_scope(store, user, query.workspace.as_deref())
-        .await?
-        .map(|scope| scope.workspace.id))
+    Ok(
+        resolve_workspace_scope(store, user, query.workspace.as_deref())
+            .await?
+            .map(|scope| scope.workspace.id),
+    )
 }
 
 async fn load_visible_routine(
@@ -61,17 +63,18 @@ pub async fn routines_list_handler(
         "Database not available".to_string(),
     ))?;
 
-    let routines = if let Some(workspace_id) = resolve_routine_scope(store, &user, &workspace_query).await? {
-        store
-            .list_routines_for_workspace(workspace_id)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    } else {
-        store
-            .list_routines(&user.user_id)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    };
+    let routines =
+        if let Some(workspace_id) = resolve_routine_scope(store, &user, &workspace_query).await? {
+            store
+                .list_routines_for_workspace(workspace_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        } else {
+            store
+                .list_routines(&user.user_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        };
 
     let routine_ids: Vec<Uuid> = routines.iter().map(|routine| routine.id).collect();
     let last_run_statuses = store
@@ -99,17 +102,18 @@ pub async fn routines_summary_handler(
         "Database not available".to_string(),
     ))?;
 
-    let routines = if let Some(workspace_id) = resolve_routine_scope(store, &user, &workspace_query).await? {
-        store
-            .list_routines_for_workspace(workspace_id)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    } else {
-        store
-            .list_routines(&user.user_id)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    };
+    let routines =
+        if let Some(workspace_id) = resolve_routine_scope(store, &user, &workspace_query).await? {
+            store
+                .list_routines_for_workspace(workspace_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        } else {
+            store
+                .list_routines(&user.user_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        };
 
     let routine_ids: Vec<Uuid> = routines.iter().map(|routine| routine.id).collect();
     let last_run_statuses = store

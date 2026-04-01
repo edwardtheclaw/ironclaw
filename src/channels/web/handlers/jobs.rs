@@ -32,12 +32,18 @@ async fn resolve_job_scope(
     let Some(store) = state.store.as_ref() else {
         return Ok(None);
     };
-    Ok(resolve_workspace_scope(store, user, query.workspace.as_deref())
-        .await?
-        .map(|scope| scope.workspace.id))
+    Ok(
+        resolve_workspace_scope(store, user, query.workspace.as_deref())
+            .await?
+            .map(|scope| scope.workspace.id),
+    )
 }
 
-fn sandbox_job_visible(job: &crate::history::SandboxJobRecord, user_id: &str, scope: Option<Uuid>) -> bool {
+fn sandbox_job_visible(
+    job: &crate::history::SandboxJobRecord,
+    user_id: &str,
+    scope: Option<Uuid>,
+) -> bool {
     match scope {
         Some(workspace_id) => job.workspace_id == Some(workspace_id),
         None => job.workspace_id.is_none() && job.user_id == user_id,

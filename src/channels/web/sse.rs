@@ -19,9 +19,9 @@ const MAX_CONNECTIONS: u64 = 100;
 
 /// Envelope for broadcast events: carries an optional user scope.
 ///
-/// `user_id = None` means the event is global (e.g. Heartbeat) and delivered
-/// to all subscribers. `user_id = Some(id)` means the event is only delivered
-/// to subscribers that match that user_id.
+/// `user_id = None` means the event is global (e.g. Heartbeat) or workspace-
+/// scoped and delivered to all matching subscribers. `user_id = Some(id)` means
+/// the event is only delivered to subscribers that match that user_id.
 #[derive(Debug, Clone)]
 pub(crate) struct ScopedEvent {
     pub(crate) user_id: Option<String>,
@@ -93,6 +93,9 @@ impl SseManager {
     }
 
     /// Broadcast an event scoped to a specific user and workspace.
+    ///
+    /// This remains a user-targeted event. For workspace-wide fan-out, use
+    /// [`broadcast_for_workspace`].
     pub fn broadcast_for_user_in_workspace(
         &self,
         user_id: &str,
@@ -102,6 +105,15 @@ impl SseManager {
         let _ = self.tx.send(ScopedEvent {
             user_id: Some(user_id.to_string()),
             workspace_id: workspace_id.map(ToOwned::to_owned),
+            event,
+        });
+    }
+
+    /// Broadcast an event to all subscribers in a workspace.
+    pub fn broadcast_for_workspace(&self, workspace_id: &str, event: AppEvent) {
+        let _ = self.tx.send(ScopedEvent {
+            user_id: None,
+            workspace_id: Some(workspace_id.to_string()),
             event,
         });
     }
@@ -239,19 +251,24 @@ fn event_matches_scope(
 ) -> bool {
     match subscriber_user_id {
         None => true,
-        Some(subscriber) => match &scoped.user_id {
-            None => true,
-            Some(event_user) if event_user == subscriber => {
-                match (&subscriber_workspace_id, &scoped.workspace_id) {
-                    (_, None) if scoped.user_id.is_none() => true,
-                    (None, None) => true,
-                    (Some(sub_workspace), Some(event_workspace)) => {
-                        sub_workspace == event_workspace
-                    }
-                    _ => false,
-                }
+        Some(subscriber) => match (&scoped.user_id, &scoped.workspace_id) {
+            (None, None) => true,
+            (None, Some(event_workspace)) => {
+                matches!(
+                    subscriber_workspace_id,
+                    Some(sub_workspace) if sub_workspace == event_workspace
+                )
             }
-            Some(_) => false,
+            (Some(event_user), None) => {
+                event_user == subscriber && subscriber_workspace_id.is_none()
+            }
+            (Some(event_user), Some(event_workspace)) => {
+                event_user == subscriber
+                    && matches!(
+                        subscriber_workspace_id,
+                        Some(sub_workspace) if sub_workspace == event_workspace
+                    )
+            }
         },
     }
 }
@@ -429,10 +446,7 @@ mod tests {
         );
         let mut workspace = Box::pin(
             manager
-                .subscribe_raw_scoped(
-                    Some("alice".to_string()),
-                    Some("workspace-123".to_string()),
-                )
+                .subscribe_raw_scoped(Some("alice".to_string()), Some("workspace-123".to_string()))
                 .expect("subscribe"),
         );
 
@@ -468,5 +482,49 @@ mod tests {
         }
         let e = personal.next().await.unwrap();
         assert!(matches!(e, AppEvent::Heartbeat));
+    }
+
+    #[tokio::test]
+    async fn test_workspace_broadcast_fans_out_to_all_members() {
+        let manager = SseManager::new();
+        let mut alice = Box::pin(
+            manager
+                .subscribe_raw_scoped(Some("alice".to_string()), Some("workspace-123".to_string()))
+                .expect("subscribe"),
+        );
+        let mut bob = Box::pin(
+            manager
+                .subscribe_raw_scoped(Some("bob".to_string()), Some("workspace-123".to_string()))
+                .expect("subscribe"),
+        );
+        let mut outsider = Box::pin(
+            manager
+                .subscribe_raw_scoped(Some("carol".to_string()), Some("workspace-999".to_string()))
+                .expect("subscribe"),
+        );
+
+        manager.broadcast_for_workspace(
+            "workspace-123",
+            AppEvent::Status {
+                message: "workspace-wide".to_string(),
+                thread_id: None,
+            },
+        );
+
+        for stream in [&mut alice, &mut bob] {
+            let event = stream.next().await.unwrap();
+            match event {
+                AppEvent::Status { message, .. } => assert_eq!(message, "workspace-wide"),
+                _ => panic!("unexpected workspace event"),
+            }
+        }
+
+        manager.broadcast(AppEvent::Heartbeat);
+        assert!(matches!(
+            outsider.next().await.unwrap(),
+            AppEvent::Heartbeat
+        ));
+        assert!(matches!(alice.next().await.unwrap(), AppEvent::Heartbeat));
+        assert!(matches!(bob.next().await.unwrap(), AppEvent::Heartbeat));
     }
 }

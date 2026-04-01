@@ -8,14 +8,17 @@ use ironclaw::agent::SessionManager;
 use ironclaw::channels::IncomingMessage;
 use ironclaw::channels::web::auth::{MultiAuthState, UserIdentity};
 use ironclaw::channels::web::test_helpers::TestGatewayBuilder;
-use ironclaw::db::UserRecord;
 use ironclaw::db::libsql::LibSqlBackend;
+use ironclaw::db::{ConversationStore, Database, UserRecord, UserStore, WorkspaceMgmtStore};
 use serde_json::json;
+use uuid::Uuid;
 
 const ALICE_TOKEN: &str = "tok-alice-workspace";
 const BOB_TOKEN: &str = "tok-bob-workspace";
+const CHARLIE_TOKEN: &str = "tok-charlie-workspace";
 const ALICE_USER_ID: &str = "alice";
 const BOB_USER_ID: &str = "bob";
+const CHARLIE_USER_ID: &str = "charlie";
 
 fn workspace_auth() -> MultiAuthState {
     let mut tokens = HashMap::new();
@@ -31,6 +34,14 @@ fn workspace_auth() -> MultiAuthState {
         BOB_TOKEN.to_string(),
         UserIdentity {
             user_id: BOB_USER_ID.to_string(),
+            role: "member".to_string(),
+            workspace_read_scopes: Vec::new(),
+        },
+    );
+    tokens.insert(
+        CHARLIE_TOKEN.to_string(),
+        UserIdentity {
+            user_id: CHARLIE_USER_ID.to_string(),
             role: "member".to_string(),
             workspace_read_scopes: Vec::new(),
         },
@@ -63,6 +74,10 @@ async fn setup_store() -> Arc<LibSqlBackend> {
         .unwrap();
     store
         .create_user(&test_user(BOB_USER_ID, "member"))
+        .await
+        .unwrap();
+    store
+        .create_user(&test_user(CHARLIE_USER_ID, "member"))
         .await
         .unwrap();
     store
@@ -378,4 +393,64 @@ async fn workspace_threads_do_not_appear_in_personal_thread_listing() {
         .filter_map(|thread| thread["id"].as_str())
         .collect();
     assert!(!personal_thread_ids.contains(&scoped_thread_id.as_str()));
+}
+
+#[tokio::test]
+async fn responses_api_fetch_uses_workspace_scope_for_workspace_threads() {
+    let store = setup_store().await;
+    let workspace = store
+        .create_workspace(
+            "Responses Scope",
+            "responses-scope",
+            "",
+            ALICE_USER_ID,
+            &json!({}),
+        )
+        .await
+        .unwrap();
+    store
+        .add_workspace_member(workspace.id, BOB_USER_ID, "member", Some(ALICE_USER_ID))
+        .await
+        .unwrap();
+
+    let thread_id = store
+        .create_conversation_with_metadata(
+            "gateway",
+            BOB_USER_ID,
+            Some(workspace.id),
+            &json!({ "thread_type": "assistant" }),
+        )
+        .await
+        .unwrap();
+    store
+        .add_conversation_message(thread_id, "assistant", "workspace response")
+        .await
+        .unwrap();
+
+    let addr = start_workspace_server(store, None).await;
+    let client = reqwest::Client::new();
+    let response_id = format!("resp_{}{}", Uuid::new_v4().simple(), thread_id.simple());
+
+    let member_resp = client
+        .get(format!("http://{addr}/v1/responses/{response_id}"))
+        .header("Authorization", format!("Bearer {BOB_TOKEN}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(member_resp.status(), 200);
+    let member_json: serde_json::Value = member_resp.json().await.unwrap();
+    assert_eq!(member_json["id"], response_id);
+    assert_eq!(member_json["status"], "completed");
+    assert_eq!(
+        member_json["output"][0]["content"][0]["text"],
+        "workspace response"
+    );
+
+    let outsider_resp = client
+        .get(format!("http://{addr}/v1/responses/{response_id}"))
+        .header("Authorization", format!("Bearer {CHARLIE_TOKEN}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(outsider_resp.status(), 404);
 }

@@ -13,8 +13,8 @@ mod sandbox;
 mod settings;
 mod tool_failures;
 mod users;
-mod workspaces;
 mod workspace;
+mod workspaces;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -75,9 +75,17 @@ impl LibSqlBackend {
         Ok(Self { db: Arc::new(db) })
     }
 
-    /// Create a new in-memory database (for testing).
+    /// Create a new ephemeral test database.
     pub async fn new_memory() -> Result<Self, DatabaseError> {
-        let db = libsql::Builder::new_local(":memory:")
+        // This backend opens a fresh libSQL connection per operation, so a
+        // plain `:memory:` database would isolate migrations from later
+        // queries. Use a unique temp file instead so all connections see the
+        // same database during tests.
+        let path = std::env::temp_dir().join(format!(
+            "ironclaw-test-{}.db",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let db = libsql::Builder::new_local(path)
             .build()
             .await
             .map_err(|e| {

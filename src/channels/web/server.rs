@@ -57,10 +57,10 @@ use crate::channels::web::handlers::skills::{
     skills_install_handler, skills_list_handler, skills_remove_handler, skills_search_handler,
 };
 use crate::channels::web::handlers::workspaces::{
-    ResolvedWorkspace, WorkspaceQuery, resolve_workspace_scope, workspace_members_delete_handler, workspace_members_list_handler,
-    workspace_members_upsert_handler, workspace_scope_user_id, workspaces_archive_handler,
-    workspaces_create_handler, workspaces_detail_handler, workspaces_list_handler,
-    workspaces_update_handler,
+    ResolvedWorkspace, WorkspaceQuery, resolve_workspace_scope, workspace_members_delete_handler,
+    workspace_members_list_handler, workspace_members_upsert_handler, workspace_scope_user_id,
+    workspaces_archive_handler, workspaces_create_handler, workspaces_detail_handler,
+    workspaces_list_handler, workspaces_update_handler,
 };
 use crate::channels::web::log_layer::LogBroadcaster;
 use crate::channels::web::sse::SseManager;
@@ -277,8 +277,8 @@ impl WorkspacePool {
 
     /// Get or create a workspace for the given user identity.
     ///
-    /// Applies search config, memory layers, embedding cache, and read scopes
-    /// (both from global config and from the token's `workspace_read_scopes`).
+    /// Applies search config, memory layers, embedding cache, and legacy
+    /// compatibility read scopes for the personal workspace only.
     pub async fn get_or_create(&self, identity: &UserIdentity) -> Arc<Workspace> {
         self.get_or_create_scoped(identity, None).await
     }
@@ -325,11 +325,7 @@ impl WorkspacePool {
         // blocking other workspace lookups.
         drop(cache);
         if let Err(e) = ws.seed_if_empty().await {
-            tracing::warn!(
-                user_id = scope_user_id,
-                "Failed to seed workspace: {}",
-                e
-            );
+            tracing::warn!(user_id = scope_user_id, "Failed to seed workspace: {}", e);
         }
 
         ws
@@ -359,7 +355,11 @@ impl crate::tools::builtin::memory::WorkspaceResolver for WorkspacePool {
         ws
     }
 
-    async fn resolve_for_context(&self, user_id: &str, workspace_id: Option<&str>) -> Arc<Workspace> {
+    async fn resolve_for_context(
+        &self,
+        user_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Arc<Workspace> {
         if let Some(workspace_id) = workspace_id
             && let Ok(parsed) = Uuid::parse_str(workspace_id)
         {
@@ -1850,7 +1850,10 @@ async fn chat_events_handler(
     let sse = state
         .sse
         .subscribe_scoped(Some(user.user_id), workspace_scope)
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "Too many connections".to_string()))?;
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many connections".to_string(),
+        ))?;
     Ok((
         [("X-Accel-Buffering", "no"), ("Cache-Control", "no-cache")],
         sse,
@@ -1907,9 +1910,10 @@ async fn chat_ws_handler(
             "WebSocket origin not allowed".to_string(),
         ));
     }
-    let workspace_id = resolve_chat_workspace_id(&state, &user, workspace_query.workspace.as_deref())
-        .await?
-        .map(|id| id.to_string());
+    let workspace_id =
+        resolve_chat_workspace_id(&state, &user, workspace_query.workspace.as_deref())
+            .await?
+            .map(|id| id.to_string());
     Ok(ws.on_upgrade(move |socket| {
         crate::channels::web::ws::handle_ws_connection(socket, state, user, workspace_id)
     }))
@@ -2101,8 +2105,7 @@ async fn chat_threads_handler(
     // Try DB first for persistent thread list
     if let Some(ref store) = state.store {
         let workspace_id =
-            resolve_chat_workspace_id(&state, &user, workspace_query.workspace.as_deref())
-                .await?;
+            resolve_chat_workspace_id(&state, &user, workspace_query.workspace.as_deref()).await?;
         // Auto-create assistant thread if it doesn't exist
         let assistant_id = store
             .get_or_create_assistant_conversation(&user.user_id, workspace_id, "gateway")
@@ -2218,8 +2221,7 @@ async fn chat_new_thread_handler(
     // so that the subsequent loadThreads() call from the frontend sees it.
     if let Some(ref store) = state.store {
         let workspace_id =
-            resolve_chat_workspace_id(&state, &user, workspace_query.workspace.as_deref())
-                .await?;
+            resolve_chat_workspace_id(&state, &user, workspace_query.workspace.as_deref()).await?;
         match store
             .ensure_conversation(
                 thread_id,

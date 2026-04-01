@@ -65,7 +65,8 @@ pub struct UserIdentity {
     pub user_id: String,
     /// `admin` or `member`.
     pub role: String,
-    /// Additional user scopes this identity can read from.
+    /// Legacy compatibility scopes that can extend the personal workspace's
+    /// read view during migration.
     pub workspace_read_scopes: Vec<String>,
 }
 

@@ -1973,6 +1973,7 @@ mod tests {
             context_messages: vec![],
             deferred_tool_calls: vec![],
             user_timezone: None,
+            workspace_id: None,
             allow_always: true,
         });
         assert!(

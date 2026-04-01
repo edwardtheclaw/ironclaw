@@ -645,6 +645,7 @@ mod tests {
             name: name.to_string(),
             description: "test routine".to_string(),
             user_id: user_id.to_string(),
+            workspace_id: None,
             enabled: true,
             trigger: Trigger::Manual,
             action: RoutineAction::Lightweight {

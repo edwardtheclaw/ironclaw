@@ -105,7 +105,14 @@ impl ConversationStore for PgBackend {
         source_channel: Option<&str>,
     ) -> Result<bool, DatabaseError> {
         self.store
-            .ensure_conversation(id, channel, user_id, workspace_id, thread_id, source_channel)
+            .ensure_conversation(
+                id,
+                channel,
+                user_id,
+                workspace_id,
+                thread_id,
+                source_channel,
+            )
             .await
     }
 
@@ -235,6 +242,15 @@ impl ConversationStore for PgBackend {
             .await
     }
 
+    async fn get_conversation_workspace_id(
+        &self,
+        conversation_id: Uuid,
+    ) -> Result<Option<Uuid>, DatabaseError> {
+        self.store
+            .get_conversation_workspace_id(conversation_id)
+            .await
+    }
+
     async fn get_conversation_source_channel(
         &self,
         conversation_id: Uuid,
@@ -309,7 +325,9 @@ impl JobStore for PgBackend {
         &self,
         workspace_id: Uuid,
     ) -> Result<AgentJobSummary, DatabaseError> {
-        self.store.agent_job_summary_for_workspace(workspace_id).await
+        self.store
+            .agent_job_summary_for_workspace(workspace_id)
+            .await
     }
 
     async fn get_agent_job_failure_reason(
@@ -414,7 +432,9 @@ impl SandboxStore for PgBackend {
         &self,
         workspace_id: Uuid,
     ) -> Result<Vec<SandboxJobRecord>, DatabaseError> {
-        self.store.list_sandbox_jobs_for_workspace(workspace_id).await
+        self.store
+            .list_sandbox_jobs_for_workspace(workspace_id)
+            .await
     }
 
     async fn sandbox_job_summary_for_user(
@@ -428,7 +448,8 @@ impl SandboxStore for PgBackend {
         &self,
         workspace_id: Uuid,
     ) -> Result<SandboxJobSummary, DatabaseError> {
-        self.store.sandbox_job_summary_for_workspace(workspace_id)
+        self.store
+            .sandbox_job_summary_for_workspace(workspace_id)
             .await
     }
 
@@ -486,7 +507,9 @@ impl RoutineStore for PgBackend {
         workspace_id: Option<Uuid>,
         name: &str,
     ) -> Result<Option<Routine>, DatabaseError> {
-        self.store.get_routine_by_name(user_id, workspace_id, name).await
+        self.store
+            .get_routine_by_name(user_id, workspace_id, name)
+            .await
     }
 
     async fn list_routines(&self, user_id: &str) -> Result<Vec<Routine>, DatabaseError> {
@@ -659,7 +682,9 @@ impl SettingsStore for PgBackend {
         workspace_id: Uuid,
         key: &str,
     ) -> Result<Option<serde_json::Value>, DatabaseError> {
-        self.store.get_setting_for_workspace(workspace_id, key).await
+        self.store
+            .get_setting_for_workspace(workspace_id, key)
+            .await
     }
 
     async fn get_setting_full_for_workspace(
@@ -728,7 +753,9 @@ impl SettingsStore for PgBackend {
         &self,
         workspace_id: Uuid,
     ) -> Result<HashMap<String, serde_json::Value>, DatabaseError> {
-        self.store.get_all_settings_for_workspace(workspace_id).await
+        self.store
+            .get_all_settings_for_workspace(workspace_id)
+            .await
     }
 
     async fn set_all_settings(

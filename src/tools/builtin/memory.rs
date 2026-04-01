@@ -31,7 +31,11 @@ use crate::workspace::{Workspace, paths};
 pub trait WorkspaceResolver: Send + Sync {
     async fn resolve(&self, user_id: &str) -> Arc<Workspace>;
 
-    async fn resolve_for_context(&self, user_id: &str, _workspace_id: Option<&str>) -> Arc<Workspace> {
+    async fn resolve_for_context(
+        &self,
+        user_id: &str,
+        _workspace_id: Option<&str>,
+    ) -> Arc<Workspace> {
         self.resolve(user_id).await
     }
 }

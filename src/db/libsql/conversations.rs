@@ -686,6 +686,28 @@ impl ConversationStore for LibSqlBackend {
         Ok(found.is_some())
     }
 
+    async fn get_conversation_workspace_id(
+        &self,
+        conversation_id: Uuid,
+    ) -> Result<Option<Uuid>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT workspace_id FROM conversations WHERE id = ?1",
+                params![conversation_id.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            Some(row) => Ok(get_opt_text(&row, 0).and_then(|s| s.parse().ok())),
+            None => Ok(None),
+        }
+    }
+
     async fn get_conversation_source_channel(
         &self,
         conversation_id: Uuid,

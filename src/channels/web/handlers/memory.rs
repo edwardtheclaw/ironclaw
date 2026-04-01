@@ -30,7 +30,9 @@ pub(crate) async fn resolve_workspace(
         } else {
             None
         };
-        return Ok(pool.get_or_create_scoped(user, workspace_scope.as_ref()).await);
+        return Ok(pool
+            .get_or_create_scoped(user, workspace_scope.as_ref())
+            .await);
     }
     if let (Some(store), Some(query)) = (state.store.as_ref(), query)
         && query.workspace.is_some()

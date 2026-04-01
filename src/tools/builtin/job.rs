@@ -409,7 +409,10 @@ impl CreateJobTool {
             task: task.to_string(),
             status: "creating".to_string(),
             user_id: ctx.user_id.clone(),
-            workspace_id: ctx.workspace_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()),
+            workspace_id: ctx
+                .workspace_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok()),
             project_dir: project_dir_str.clone(),
             success: None,
             failure_reason: None,

@@ -1169,7 +1169,10 @@ impl Tool for RoutineCreateTool {
             name: normalized.name.clone(),
             description: normalized.description.clone(),
             user_id: ctx.user_id.clone(),
-            workspace_id: ctx.workspace_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()),
+            workspace_id: ctx
+                .workspace_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok()),
             enabled: true,
             trigger,
             action,

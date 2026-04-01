@@ -397,7 +397,7 @@ mod tests {
         let (direct_tx, mut direct_rx) = mpsc::channel(16);
         let state = make_test_state(None).await;
 
-        handle_client_message(WsClientMessage::Ping, &state, "user1", &direct_tx).await;
+        handle_client_message(WsClientMessage::Ping, &state, "user1", None, &direct_tx).await;
 
         let response = direct_rx.recv().await.unwrap();
         assert!(matches!(response, WsServerMessage::Pong));
@@ -419,6 +419,7 @@ mod tests {
             },
             &state,
             "user1",
+            None,
             &direct_tx,
         )
         .await;
@@ -445,6 +446,7 @@ mod tests {
             },
             &state,
             "user1",
+            None,
             &direct_tx,
         )
         .await;
@@ -473,6 +475,7 @@ mod tests {
             },
             &state,
             "user1",
+            None,
             &direct_tx,
         )
         .await;
@@ -497,6 +500,7 @@ mod tests {
             },
             &state,
             "user1",
+            None,
             &direct_tx,
         )
         .await;
@@ -523,6 +527,7 @@ mod tests {
             },
             &state,
             "user1",
+            None,
             &direct_tx,
         )
         .await;

@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn test_memory_document_new() {
-        let doc = MemoryDocument::new("user1", None, "context/vision.md");
+        let doc = MemoryDocument::new("user1", None, None, "context/vision.md");
         assert_eq!(doc.user_id, "user1");
         assert_eq!(doc.path, "context/vision.md");
         assert!(doc.content.is_empty());
@@ -235,22 +235,22 @@ mod tests {
 
     #[test]
     fn test_memory_document_file_name() {
-        let doc = MemoryDocument::new("user1", None, "projects/alpha/README.md");
+        let doc = MemoryDocument::new("user1", None, None, "projects/alpha/README.md");
         assert_eq!(doc.file_name(), "README.md");
     }
 
     #[test]
     fn test_memory_document_parent_dir() {
-        let doc = MemoryDocument::new("user1", None, "projects/alpha/README.md");
+        let doc = MemoryDocument::new("user1", None, None, "projects/alpha/README.md");
         assert_eq!(doc.parent_dir(), Some("projects/alpha"));
 
-        let root_doc = MemoryDocument::new("user1", None, "README.md");
+        let root_doc = MemoryDocument::new("user1", None, None, "README.md");
         assert_eq!(root_doc.parent_dir(), None);
     }
 
     #[test]
     fn test_memory_document_word_count() {
-        let mut doc = MemoryDocument::new("user1", None, "MEMORY.md");
+        let mut doc = MemoryDocument::new("user1", None, None, "MEMORY.md");
         assert_eq!(doc.word_count(), 0);
 
         doc.content = "Hello world, this is a test.".to_string();
@@ -259,16 +259,16 @@ mod tests {
 
     #[test]
     fn test_is_identity_document() {
-        let identity = MemoryDocument::new("user1", None, paths::IDENTITY);
+        let identity = MemoryDocument::new("user1", None, None, paths::IDENTITY);
         assert!(identity.is_identity_document());
 
-        let soul = MemoryDocument::new("user1", None, paths::SOUL);
+        let soul = MemoryDocument::new("user1", None, None, paths::SOUL);
         assert!(soul.is_identity_document());
 
-        let memory = MemoryDocument::new("user1", None, paths::MEMORY);
+        let memory = MemoryDocument::new("user1", None, None, paths::MEMORY);
         assert!(!memory.is_identity_document());
 
-        let custom = MemoryDocument::new("user1", None, "projects/notes.md");
+        let custom = MemoryDocument::new("user1", None, None, "projects/notes.md");
         assert!(!custom.is_identity_document());
     }
 

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{
         IntoResponse, Response,
@@ -24,7 +24,9 @@ use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use crate::channels::IncomingMessage;
+use crate::channels::web::handlers::workspaces::{WorkspaceQuery, resolve_workspace_scope};
 use crate::channels::web::types::AppEvent;
+use crate::db::Database;
 
 use super::server::GatewayState;
 
@@ -374,6 +376,63 @@ async fn send_to_agent(state: &GatewayState, msg: IncomingMessage) -> Result<(),
     })
 }
 
+async fn resolve_requested_workspace_id(
+    state: &GatewayState,
+    user: &super::auth::UserIdentity,
+    workspace_slug: Option<&str>,
+) -> Result<Option<Uuid>, ApiError> {
+    let Some(store) = state.store.as_ref() else {
+        if workspace_slug.is_some() {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database not configured",
+                "server_error",
+            ));
+        }
+        return Ok(None);
+    };
+
+    resolve_workspace_scope(store, user, workspace_slug)
+        .await
+        .map(|scope| scope.map(|resolved| resolved.workspace.id))
+        .map_err(|(status, message)| api_error(status, message, "invalid_request_error"))
+}
+
+async fn resolve_thread_workspace_id(
+    store: &Arc<dyn Database>,
+    user_id: &str,
+    thread_uuid: Uuid,
+) -> Result<Option<Uuid>, ApiError> {
+    let workspace_id = store
+        .get_conversation_workspace_id(thread_uuid)
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to resolve conversation workspace: {e}"),
+                "server_error",
+            )
+        })?;
+    let owns = store
+        .conversation_belongs_to_user(thread_uuid, user_id, workspace_id)
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to verify ownership: {e}"),
+                "server_error",
+            )
+        })?;
+    if !owns {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "Response not found",
+            "invalid_request_error",
+        ));
+    }
+    Ok(workspace_id)
+}
+
 // ---------------------------------------------------------------------------
 // Non-streaming: collect AppEvents into a ResponseObject
 // ---------------------------------------------------------------------------
@@ -552,6 +611,7 @@ impl ResponseAccumulator {
 pub async fn create_response_handler(
     State(state): State<Arc<GatewayState>>,
     super::auth::AuthenticatedUser(user): super::auth::AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
     Json(req): Json<ResponsesRequest>,
 ) -> Result<Response, ApiError> {
     if !state.chat_rate_limiter.check(&user.user_id) {
@@ -623,14 +683,45 @@ pub async fn create_response_handler(
     // Each POST gets its own unique response UUID.
     let response_uuid = Uuid::new_v4();
 
+    let requested_workspace_id =
+        resolve_requested_workspace_id(&state, &user, workspace_query.workspace.as_deref()).await?;
+    let mut workspace_id = requested_workspace_id;
+    if req.previous_response_id.is_some() {
+        let store = state.store.as_ref().ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database not configured",
+                "server_error",
+            )
+        })?;
+        let thread_workspace_id =
+            resolve_thread_workspace_id(store, &user.user_id, thread_uuid).await?;
+        if let Some(requested_workspace_id) = requested_workspace_id
+            && thread_workspace_id != Some(requested_workspace_id)
+        {
+            return Err(api_error(
+                StatusCode::NOT_FOUND,
+                "Response not found",
+                "invalid_request_error",
+            ));
+        }
+        workspace_id = thread_workspace_id;
+    }
+
     // Build the message for the agent loop.
-    let msg = IncomingMessage::new("gateway", &user.user_id, &content)
+    let mut msg = IncomingMessage::new("gateway", &user.user_id, &content)
         .with_thread(&thread_id_str)
         .with_metadata(serde_json::json!({
             "thread_id": &thread_id_str,
             "user_id": &user.user_id,
             "source": "responses_api",
         }));
+    if let Some(ref workspace_id) = workspace_id {
+        msg.workspace_id = Some(workspace_id.to_string());
+        let mut metadata = msg.metadata.clone();
+        metadata["workspace_id"] = serde_json::json!(workspace_id);
+        msg = msg.with_metadata(metadata);
+    }
 
     let resp_id = encode_response_id(&response_uuid, &thread_uuid);
     let model = req.model.clone();
@@ -1041,6 +1132,7 @@ async fn streaming_worker(
 pub async fn get_response_handler(
     State(state): State<Arc<GatewayState>>,
     super::auth::AuthenticatedUser(user): super::auth::AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
     Path(id): Path<String>,
 ) -> Result<Json<ResponseObject>, ApiError> {
     let (_response_uuid, thread_uuid) = decode_response_id(&id)
@@ -1054,18 +1146,13 @@ pub async fn get_response_handler(
         )
     })?;
 
-    // Verify the authenticated user owns this conversation.
-    let owns = store
-        .conversation_belongs_to_user(thread_uuid, &user.user_id, None)
-        .await
-        .map_err(|e| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to verify ownership: {e}"),
-                "server_error",
-            )
-        })?;
-    if !owns {
+    let requested_workspace_id =
+        resolve_requested_workspace_id(&state, &user, workspace_query.workspace.as_deref()).await?;
+    let thread_workspace_id =
+        resolve_thread_workspace_id(store, &user.user_id, thread_uuid).await?;
+    if let Some(requested_workspace_id) = requested_workspace_id
+        && thread_workspace_id != Some(requested_workspace_id)
+    {
         return Err(api_error(
             StatusCode::NOT_FOUND,
             format!("Response '{id}' not found"),

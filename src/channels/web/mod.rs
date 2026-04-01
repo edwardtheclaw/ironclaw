@@ -379,14 +379,15 @@ impl Channel for GatewayChannel {
             }
         };
 
-        self.state.sse.broadcast_for_user_in_workspace(
-            &msg.user_id,
-            msg.workspace_id.as_deref(),
-            AppEvent::Response {
-                content: response.content,
-                thread_id,
-            },
-        );
+        let event = AppEvent::Response {
+            content: response.content,
+            thread_id,
+        };
+        if let Some(workspace_id) = msg.workspace_id.as_deref() {
+            self.state.sse.broadcast_for_workspace(workspace_id, event);
+        } else {
+            self.state.sse.broadcast_for_user(&msg.user_id, event);
+        }
 
         Ok(())
     }
@@ -516,12 +517,10 @@ impl Channel for GatewayChannel {
         // Scope events to the user when user_id is available in metadata.
         // When user_id is missing (heartbeat, routines), events go to all
         // subscribers. In multi-tenant mode this leaks status across users.
-        if let Some(uid) = metadata.get("user_id").and_then(|v| v.as_str()) {
-            self.state.sse.broadcast_for_user_in_workspace(
-                uid,
-                workspace_scope_from_metadata(metadata),
-                event,
-            );
+        if let Some(workspace_id) = workspace_scope_from_metadata(metadata) {
+            self.state.sse.broadcast_for_workspace(workspace_id, event);
+        } else if let Some(uid) = metadata.get("user_id").and_then(|v| v.as_str()) {
+            self.state.sse.broadcast_for_user(uid, event);
         } else {
             tracing::debug!("Status event missing user_id in metadata; broadcasting globally");
             self.state.sse.broadcast(event);
@@ -543,14 +542,15 @@ impl Channel for GatewayChannel {
                 });
             }
         };
-        self.state.sse.broadcast_for_user_in_workspace(
-            user_id,
-            workspace_scope_from_metadata(&response.metadata),
-            AppEvent::Response {
-                content: response.content,
-                thread_id,
-            },
-        );
+        let event = AppEvent::Response {
+            content: response.content,
+            thread_id,
+        };
+        if let Some(workspace_id) = workspace_scope_from_metadata(&response.metadata) {
+            self.state.sse.broadcast_for_workspace(workspace_id, event);
+        } else {
+            self.state.sse.broadcast_for_user(user_id, event);
+        }
         Ok(())
     }
 
