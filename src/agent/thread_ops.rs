@@ -981,84 +981,93 @@ impl Agent {
         approved: bool,
         always: bool,
     ) -> Result<SubmissionResult, Error> {
-        // Get pending approval for this thread.
-        // The take-verify sequence is atomic under a single lock acquisition
-        // to prevent a TOCTOU race where a concurrent operation could modify
-        // or delete the thread between take and restore (#1486).
+        // Take pending approval, verify request ID, auto-approve (if always),
+        // and transition to Processing — all under a single lock acquisition.
+        // This prevents a TOCTOU race where the thread could be pruned between
+        // separate lock scopes, leaving a tool permanently auto-approved without
+        // execution ever starting (#1486).
         let pending = {
             let mut sess = session.lock().await;
-            let thread = sess
-                .threads
-                .get_mut(&thread_id)
-                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
 
-            if thread.state != ThreadState::AwaitingApproval {
-                // Stale or duplicate approval (tool already executed) — silently ignore.
-                tracing::debug!(
-                    %thread_id,
-                    state = ?thread.state,
-                    "Ignoring stale approval: thread not in AwaitingApproval state"
-                );
-                return Ok(SubmissionResult::ok_with_message(""));
-            }
+            // First borrow: validate state and take pending approval
+            let taken = {
+                let thread = sess.threads.get_mut(&thread_id).ok_or_else(|| {
+                    Error::from(crate::error::JobError::NotFound { id: thread_id })
+                })?;
 
-            let taken = match thread.take_pending_approval() {
-                Some(p) => p,
-                None => {
+                if thread.state != ThreadState::AwaitingApproval {
+                    // Stale or duplicate approval (tool already executed) — silently ignore.
                     tracing::debug!(
                         %thread_id,
-                        "Ignoring stale approval: no pending approval found"
+                        state = ?thread.state,
+                        "Ignoring stale approval: thread not in AwaitingApproval state"
                     );
                     return Ok(SubmissionResult::ok_with_message(""));
                 }
+
+                let taken = match thread.take_pending_approval() {
+                    Some(p) => p,
+                    None => {
+                        tracing::debug!(
+                            %thread_id,
+                            "Ignoring stale approval: no pending approval found"
+                        );
+                        return Ok(SubmissionResult::ok_with_message(""));
+                    }
+                };
+
+                // Verify request ID while still holding the lock — atomic with take
+                if let Some(req_id) = request_id {
+                    if req_id != taken.request_id {
+                        // Restore atomically under same lock
+                        thread.await_approval(taken);
+                        return Ok(SubmissionResult::error(
+                            "Request ID mismatch. Use the correct request ID.",
+                        ));
+                    }
+                }
+
+                taken
+                // Inner borrow of `thread` ends here
             };
 
-            // Verify request ID while still holding the lock — atomic with take
-            if let Some(req_id) = request_id {
-                if req_id != taken.request_id {
-                    // Restore atomically under same lock
-                    thread.await_approval(taken);
-                    return Ok(SubmissionResult::error(
-                        "Request ID mismatch. Use the correct request ID.",
-                    ));
+            // Auto-approve + state transition while we still hold the session
+            // lock. If we dropped the lock first, a concurrent prune could
+            // remove the thread, leaving the tool permanently auto-approved.
+            if approved {
+                if always {
+                    sess.auto_approve_tool(&taken.tool_name);
+                    tracing::info!(
+                        "Auto-approved tool '{}' for session {}",
+                        taken.tool_name,
+                        sess.id
+                    );
                 }
-            }
-
-            taken
-            // Lock dropped here — pending approval validated
-        };
-
-        if approved {
-            // Auto-approve + state transition under a single lock to prevent
-            // TOCTOU: if the thread is pruned between two separate locks, the
-            // tool would be permanently auto-approved without execution starting.
-            // We confirm the thread exists before auto-approving so there is no
-            // window where the tool is approved but the thread is gone.
-            {
-                let mut sess = session.lock().await;
-                if !sess.threads.contains_key(&thread_id) {
+                // Re-borrow thread after session-level mutation. The thread
+                // cannot have disappeared — we hold the session lock throughout.
+                if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                    thread.state = ThreadState::Processing;
+                } else {
+                    // Should be unreachable: lock held continuously since the
+                    // thread was validated above. Roll back auto-approve.
+                    if always {
+                        sess.auto_approved_tools.remove(&taken.tool_name);
+                    }
                     tracing::error!(
                         %thread_id,
-                        "Thread disappeared while setting state to Processing during approval"
+                        "Thread disappeared while holding session lock during approval"
                     );
                     return Ok(SubmissionResult::error(
                         "Internal error: thread no longer exists",
                     ));
                 }
-                if always {
-                    sess.auto_approve_tool(&pending.tool_name);
-                    tracing::info!(
-                        "Auto-approved tool '{}' for session {}",
-                        pending.tool_name,
-                        sess.id
-                    );
-                }
-                // Safe: we just confirmed the thread exists above under the same lock.
-                if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                    thread.state = ThreadState::Processing;
-                }
             }
 
+            taken
+            // Lock dropped here — all approval bookkeeping is complete
+        };
+
+        if approved {
             // Execute the approved tool and continue the loop
             let mut job_ctx =
                 JobContext::with_user(&message.user_id, "chat", "Interactive chat session")
@@ -2451,51 +2460,72 @@ mod tests {
         );
     }
 
-    /// Exercises the combined auto-approve + state-transition logic from
-    /// `process_approval()`. This helper mirrors the single-lock pattern
-    /// Mirrors the single-lock pattern in `process_approval()`: confirm
-    /// the thread exists first, then auto-approve, then transition state.
-    /// No rollback needed because the tool is never auto-approved when the
-    /// thread is missing.
+    /// Mirrors the single-lock pattern in `process_approval()`: take the
+    /// pending approval from the thread, optionally auto-approve, and
+    /// transition to `Processing` — all within a single borrow scope.
     ///
-    /// Returns `true` if the transition succeeded, `false` if the thread
-    /// was missing (auto-approve is never applied in that case).
-    fn apply_auto_approve_and_transition(
+    /// Because the thread lookup, auto-approve, and state transition all
+    /// happen under one `&mut Session` borrow, the thread cannot be pruned
+    /// between steps. Returns the taken `PendingApproval` on success, or
+    /// `None` if the thread does not exist or has no pending approval.
+    fn take_and_approve(
         session: &mut crate::agent::session::Session,
         thread_id: uuid::Uuid,
-        tool_name: &str,
         always: bool,
-    ) -> bool {
-        // Mirror the production code: check existence, then approve, then transition.
-        if !session.threads.contains_key(&thread_id) {
-            return false;
-        }
+    ) -> Option<crate::agent::session::PendingApproval> {
+        // Take the pending approval — early return if thread or approval missing
+        let taken = {
+            let thread = session.threads.get_mut(&thread_id)?;
+            thread.take_pending_approval()?
+            // thread borrow ends here
+        };
+
         if always {
-            session.auto_approve_tool(tool_name);
+            session.auto_approve_tool(&taken.tool_name);
         }
-        if let Some(thread) = session.threads.get_mut(&thread_id) {
-            thread.state = ThreadState::Processing;
+
+        // Re-borrow after session-level mutation
+        let thread = session.threads.get_mut(&thread_id).expect("thread exists");
+        thread.state = ThreadState::Processing;
+
+        Some(taken)
+    }
+
+    /// Helper to build a minimal PendingApproval for tests.
+    fn make_pending(tool_name: &str) -> crate::agent::session::PendingApproval {
+        crate::agent::session::PendingApproval {
+            request_id: uuid::Uuid::new_v4(),
+            tool_name: tool_name.to_string(),
+            tool_call_id: "call-1".to_string(),
+            description: "test".to_string(),
+            parameters: serde_json::json!({}),
+            display_parameters: serde_json::json!({}),
+            context_messages: vec![],
+            deferred_tool_calls: vec![],
+            user_timezone: None,
+            allow_always: true,
         }
-        true
     }
 
     #[test]
-    fn test_auto_approve_with_thread_disappearance_never_approves() {
-        // Regression test: when always=true and the thread is missing, the tool
-        // must never be added to auto-approved in the first place. This mirrors
-        // the single-lock check-then-approve pattern in process_approval().
+    fn test_auto_approve_with_thread_disappearance_never_commits() {
+        // Regression test: when always=true and the thread does not exist,
+        // the single-lock pattern in process_approval() prevents the
+        // auto-approve from ever being committed — the thread lookup fails
+        // before auto_approve_tool is called, so no rollback is needed.
         use crate::agent::session::Session;
 
         let mut session = Session::new("test-user");
         let thread_id = uuid::Uuid::new_v4();
 
-        // Thread does not exist — the combined operation must roll back
+        // Thread does not exist — take_and_approve must return None
+        // without adding to auto_approved_tools
         assert!(!session.threads.contains_key(&thread_id));
-        let ok = apply_auto_approve_and_transition(&mut session, thread_id, "dangerous_tool", true);
-        assert!(!ok, "transition must fail when thread is missing");
+        let result = take_and_approve(&mut session, thread_id, true);
+        assert!(result.is_none(), "must fail when thread is missing");
         assert!(
-            !session.is_tool_auto_approved("dangerous_tool"),
-            "auto-approve must be rolled back when the thread is missing"
+            session.auto_approved_tools.is_empty(),
+            "auto-approve must never be committed when the thread is missing"
         );
     }
 
@@ -2510,8 +2540,15 @@ mod tests {
         let thread = session.create_thread();
         let thread_id = thread.id;
 
-        let ok = apply_auto_approve_and_transition(&mut session, thread_id, "safe_tool", true);
-        assert!(ok, "transition must succeed when thread is present");
+        // Set up a pending approval on the thread
+        thread.state = ThreadState::AwaitingApproval;
+        thread.await_approval(make_pending("safe_tool"));
+
+        let result = take_and_approve(&mut session, thread_id, true);
+        assert!(
+            result.is_some(),
+            "transition must succeed when thread is present"
+        );
         assert!(
             session.is_tool_auto_approved("safe_tool"),
             "tool must remain auto-approved after successful transition"
@@ -2533,11 +2570,62 @@ mod tests {
         let thread = session.create_thread();
         let thread_id = thread.id;
 
-        let ok = apply_auto_approve_and_transition(&mut session, thread_id, "one_time_tool", false);
-        assert!(ok, "transition must succeed when thread is present");
+        // Set up a pending approval on the thread
+        thread.state = ThreadState::AwaitingApproval;
+        thread.await_approval(make_pending("one_time_tool"));
+
+        let result = take_and_approve(&mut session, thread_id, false);
+        assert!(
+            result.is_some(),
+            "transition must succeed when thread is present"
+        );
         assert!(
             !session.is_tool_auto_approved("one_time_tool"),
             "tool must not be auto-approved when always=false"
+        );
+    }
+
+    #[test]
+    fn test_auto_approve_thread_pruned_between_old_lock_scopes_impossible() {
+        // This test verifies the fix for the TOCTOU described in PR #1591:
+        // previously, `process_approval()` used two lock scopes — one to
+        // take the pending approval, and another to auto-approve + transition.
+        // If the thread was pruned between the two locks, the tool would be
+        // permanently auto-approved despite execution never starting.
+        //
+        // With the single-lock fix, auto-approve only happens when the thread
+        // is confirmed to exist (same borrow scope as the pending-approval
+        // take). We verify this by showing that removing the thread before
+        // the combined operation prevents auto-approve from ever committing.
+        use crate::agent::session::Session;
+
+        let mut session = Session::new("test-user");
+        let thread = session.create_thread();
+        let thread_id = thread.id;
+
+        // Set up a pending approval
+        thread.state = ThreadState::AwaitingApproval;
+        thread.await_approval(make_pending("risky_tool"));
+
+        // Simulate the old bug: remove the thread before the approval logic
+        // runs. Under the old two-lock pattern, the first lock would have
+        // already taken the pending approval, and the second lock would find
+        // the thread missing — leaving auto-approve committed.
+        session.threads.remove(&thread_id);
+
+        // Under the single-lock pattern, the entire operation fails atomically
+        let result = take_and_approve(&mut session, thread_id, true);
+        assert!(
+            result.is_none(),
+            "must fail when thread is pruned before approval"
+        );
+        assert!(
+            !session.is_tool_auto_approved("risky_tool"),
+            "auto-approve must never be committed when thread is pruned"
+        );
+        assert!(
+            session.auto_approved_tools.is_empty(),
+            "no tools should be in the auto-approved set"
         );
     }
 
