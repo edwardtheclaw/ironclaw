@@ -165,7 +165,13 @@ impl ConversationManager {
                     "resuming suspended foreground thread"
                 );
                 self.thread_manager
-                    .resume_thread(thread_id, user_id, Some(ThreadMessage::user(content)), None)
+                    .resume_thread(
+                        thread_id,
+                        user_id,
+                        Some(ThreadMessage::user(content)),
+                        None,
+                        None,
+                    )
                     .await?;
                 conv.add_entry(ConversationEntry::system_for_thread(
                     thread_id,

@@ -717,6 +717,7 @@ mod tests {
                 action_name: "http".into(),
                 call_id: "call_auth_1".into(),
                 parameters: serde_json::json!({"url": "https://api.github.com/repos"}),
+                completed_output: None,
             })],
         ));
         let leases = Arc::new(LeaseManager::new());
@@ -782,6 +783,7 @@ mod tests {
                     action_name: "http".into(),
                     call_id: "call_1".into(),
                     parameters: serde_json::json!({}),
+                    completed_output: None,
                 }),
                 Ok(ActionResult {
                     call_id: String::new(),

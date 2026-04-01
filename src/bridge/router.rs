@@ -43,6 +43,290 @@ fn engine_err(context: &str, e: impl std::fmt::Display) -> Error {
     })
 }
 
+fn gate_display_parameters(pending: &PendingGate) -> serde_json::Value {
+    pending
+        .display_parameters
+        .clone()
+        .unwrap_or_else(|| pending.parameters.clone())
+}
+
+fn resumed_action_result_message(
+    action_name: &str,
+    output: &serde_json::Value,
+) -> ironclaw_engine::ThreadMessage {
+    let rendered = serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string());
+    ironclaw_engine::ThreadMessage::user(format!(
+        "The pending action '{action_name}' has already been executed.\n\
+         Do not call it again unless the user explicitly asks.\n\
+         Continue from this result:\n{rendered}"
+    ))
+}
+
+async fn insert_and_notify_pending_gate(
+    agent: &Agent,
+    state: &EngineState,
+    message: &IncomingMessage,
+    pending: PendingGate,
+) -> Result<Option<String>, Error> {
+    let display_parameters = gate_display_parameters(&pending);
+
+    state
+        .pending_gates
+        .insert(pending.clone())
+        .await
+        .map_err(|e| engine_err("pending gate insert", e))?;
+
+    match &pending.resume_kind {
+        ironclaw_engine::ResumeKind::Approval { allow_always } => {
+            let _ = agent
+                .channels
+                .send_status(
+                    &message.channel,
+                    StatusUpdate::ApprovalNeeded {
+                        request_id: pending.request_id.to_string(),
+                        tool_name: pending.action_name.clone(),
+                        description: pending.description.clone(),
+                        parameters: display_parameters,
+                        allow_always: *allow_always,
+                    },
+                    &message.metadata,
+                )
+                .await;
+
+            Ok(Some(format!(
+                "Tool '{}' requires approval. Reply 'yes' to approve, 'no' to deny.",
+                pending.action_name
+            )))
+        }
+        ironclaw_engine::ResumeKind::Authentication {
+            credential_name,
+            instructions,
+            auth_url,
+        } => {
+            let _ = agent
+                .channels
+                .send_status(
+                    &message.channel,
+                    StatusUpdate::AuthRequired {
+                        extension_name: credential_name.clone(),
+                        instructions: Some(instructions.clone()),
+                        auth_url: auth_url.clone(),
+                        setup_url: None,
+                    },
+                    &message.metadata,
+                )
+                .await;
+
+            if let Some(ref sse) = state.sse {
+                sse.broadcast_for_user(
+                    &message.user_id,
+                    AppEvent::AuthRequired {
+                        extension_name: credential_name.clone(),
+                        instructions: Some(instructions.clone()),
+                        auth_url: auth_url.clone(),
+                        setup_url: None,
+                        thread_id: Some(pending.thread_id.to_string()),
+                    },
+                );
+            }
+
+            Ok(Some(format!(
+                "Authentication required for '{}'. Paste your token below (or type 'cancel'):",
+                credential_name
+            )))
+        }
+        ironclaw_engine::ResumeKind::External { callback_id } => {
+            tracing::debug!(
+                gate = %pending.gate_name,
+                callback = %callback_id,
+                "GatePaused(External)"
+            );
+            Ok(Some(format!(
+                "Waiting for external confirmation (gate: {})...",
+                pending.gate_name
+            )))
+        }
+    }
+}
+
+async fn execute_pending_gate_action(
+    agent: &Agent,
+    state: &EngineState,
+    message: &IncomingMessage,
+    pending: &PendingGate,
+    approval_already_granted: bool,
+    approval_event: Option<(String, bool)>,
+) -> Result<Option<String>, Error> {
+    let thread = state
+        .store
+        .load_thread(pending.thread_id)
+        .await
+        .map_err(|e| engine_err("load thread", e))?
+        .ok_or_else(|| engine_err("load thread", "thread not found"))?;
+
+    let lease = state
+        .thread_manager
+        .leases
+        .find_lease_for_action(pending.thread_id, &pending.action_name)
+        .await
+        .ok_or_else(|| {
+            engine_err(
+                "resume lease",
+                format!("no active lease covers action '{}'", pending.action_name),
+            )
+        })?;
+
+    let exec_ctx = ironclaw_engine::ThreadExecutionContext {
+        thread_id: pending.thread_id,
+        thread_type: thread.thread_type,
+        project_id: thread.project_id,
+        user_id: thread.user_id.clone(),
+        step_id: ironclaw_engine::StepId::new(),
+        current_call_id: Some(pending.call_id.clone()),
+    };
+
+    state.effect_adapter.reset_call_count();
+    match state
+        .effect_adapter
+        .execute_resolved_pending_action(
+            &pending.action_name,
+            pending.parameters.clone(),
+            &lease,
+            &exec_ctx,
+            approval_already_granted,
+        )
+        .await
+    {
+        Ok(result) => {
+            state
+                .thread_manager
+                .resume_thread(
+                    pending.thread_id,
+                    message.user_id.clone(),
+                    Some(resumed_action_result_message(
+                        &pending.action_name,
+                        &result.output,
+                    )),
+                    approval_event,
+                    Some(pending.call_id.clone()),
+                )
+                .await
+                .map_err(|e| engine_err("resume error", e))?;
+            await_thread_outcome(
+                agent,
+                state,
+                message,
+                pending.conversation_id,
+                pending.thread_id,
+            )
+            .await
+        }
+        Err(ironclaw_engine::EngineError::NeedApproval {
+            action_name,
+            call_id,
+            parameters,
+        }) => {
+            let pending_gate = PendingGate {
+                request_id: uuid::Uuid::new_v4(),
+                gate_name: "approval".into(),
+                user_id: message.user_id.clone(),
+                thread_id: pending.thread_id,
+                conversation_id: pending.conversation_id,
+                source_channel: message.channel.clone(),
+                action_name: action_name.clone(),
+                call_id,
+                parameters: parameters.clone(),
+                display_parameters: pending.display_parameters.clone(),
+                description: format!("Tool '{}' requires approval to execute.", action_name),
+                resume_kind: ironclaw_engine::ResumeKind::Approval { allow_always: true },
+                created_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+                original_message: None,
+                resume_output: None,
+            };
+            insert_and_notify_pending_gate(agent, state, message, pending_gate).await
+        }
+        Err(ironclaw_engine::EngineError::NeedAuthentication {
+            credential_name,
+            action_name,
+            call_id,
+            parameters,
+            completed_output,
+        }) => {
+            let setup_hint = state
+                .auth_manager
+                .as_ref()
+                .and_then(|mgr| mgr.get_setup_instructions(&credential_name))
+                .unwrap_or_else(|| format!("Provide your {} token", credential_name));
+
+            let auth_gate = PendingGate {
+                request_id: uuid::Uuid::new_v4(),
+                gate_name: "authentication".into(),
+                user_id: message.user_id.clone(),
+                thread_id: pending.thread_id,
+                conversation_id: pending.conversation_id,
+                source_channel: message.channel.clone(),
+                action_name,
+                call_id,
+                parameters,
+                display_parameters: pending.display_parameters.clone(),
+                description: format!("Authentication required for '{}'.", credential_name),
+                resume_kind: ironclaw_engine::ResumeKind::Authentication {
+                    credential_name: credential_name.clone(),
+                    instructions: setup_hint.clone(),
+                    auth_url: None,
+                },
+                created_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+                original_message: None,
+                resume_output: completed_output,
+            };
+            insert_and_notify_pending_gate(agent, state, message, auth_gate).await
+        }
+        Err(ironclaw_engine::EngineError::GatePaused {
+            gate_name,
+            action_name,
+            call_id,
+            parameters,
+            resume_kind,
+        }) => {
+            let display_parameters =
+                if let Some(tool) = state.effect_adapter.tools().get(&action_name).await {
+                    Some(crate::tools::redact_params(
+                        &parameters,
+                        tool.sensitive_params(),
+                    ))
+                } else {
+                    None
+                };
+            let pending_gate = PendingGate {
+                request_id: uuid::Uuid::new_v4(),
+                gate_name,
+                user_id: message.user_id.clone(),
+                thread_id: pending.thread_id,
+                conversation_id: pending.conversation_id,
+                source_channel: message.channel.clone(),
+                action_name: action_name.clone(),
+                call_id,
+                parameters: *parameters,
+                display_parameters,
+                description: format!(
+                    "Tool '{}' requires {}.",
+                    action_name,
+                    resume_kind.kind_name()
+                ),
+                resume_kind: *resume_kind,
+                created_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+                original_message: None,
+                resume_output: None,
+            };
+            insert_and_notify_pending_gate(agent, state, message, pending_gate).await
+        }
+        Err(e) => Err(engine_err("execute pending gate action", e)),
+    }
+}
+
 /// Resolve the default project for a user, creating one if needed.
 ///
 /// In multi-user deployments each user gets their own project so threads,
@@ -630,8 +914,10 @@ pub async fn pending_approval_for_user_thread(
             request_id: gate.request_id.to_string(),
             tool_name: gate.action_name,
             description: gate.description,
-            parameters: serde_json::to_string_pretty(&gate.parameters)
-                .unwrap_or_else(|_| gate.parameters.to_string()),
+            parameters: serde_json::to_string_pretty(
+                gate.display_parameters.as_ref().unwrap_or(&gate.parameters),
+            )
+            .unwrap_or_else(|_| gate.parameters.to_string()),
         })),
         PendingGateResolution::None | PendingGateResolution::Ambiguous => Ok(None),
     }
@@ -833,107 +1119,29 @@ pub async fn resolve_gate(
                 // Also approve hyphenated variant
                 let registry_name = pending.action_name.replace('_', "-");
                 state.effect_adapter.auto_approve_tool(&registry_name).await;
-            } else {
-                // Preferred match: same tool and same params on this thread.
-                state
-                    .effect_adapter
-                    .approve_next_tool_call_for_call_with_params(
-                        pending.thread_id,
-                        &pending.action_name,
-                        Some(&pending.call_id),
-                        Some(&pending.parameters),
-                    )
-                    .await;
-                // Fallback: the current engine resume path may replay the paused
-                // step without preserving the original approval call metadata
-                // exactly. Keep a single thread-scoped approval so the approved
-                // retry still executes once.
-                state
-                    .effect_adapter
-                    .approve_next_tool_call(pending.thread_id, &pending.action_name)
-                    .await;
+            }
+            let result = execute_pending_gate_action(
+                agent,
+                state,
+                message,
+                &pending,
+                true,
+                Some((pending.call_id.clone(), true)),
+            )
+            .await;
+
+            if always && result.is_err() {
                 let registry_name = pending.action_name.replace('_', "-");
-                if registry_name != pending.action_name {
-                    state
-                        .effect_adapter
-                        .approve_next_tool_call_for_call_with_params(
-                            pending.thread_id,
-                            &registry_name,
-                            Some(&pending.call_id),
-                            Some(&pending.parameters),
-                        )
-                        .await;
-                    state
-                        .effect_adapter
-                        .approve_next_tool_call(pending.thread_id, &registry_name)
-                        .await;
-                }
+                state
+                    .effect_adapter
+                    .revoke_auto_approve(&pending.action_name)
+                    .await;
+                state
+                    .effect_adapter
+                    .revoke_auto_approve(&registry_name)
+                    .await;
             }
-
-            let approved_msg = ironclaw_engine::ThreadMessage::user(format!(
-                "User approved action '{}'. Retry the exact same action with the same parameters now.",
-                pending.action_name
-            ));
-
-            match state
-                .thread_manager
-                .resume_thread(
-                    pending.thread_id,
-                    message.user_id.clone(),
-                    Some(approved_msg),
-                    Some((pending.call_id.clone(), true)),
-                )
-                .await
-                .map_err(|e| engine_err("resume error", e))
-            {
-                Ok(()) => {}
-                Err(e) => {
-                    // Rollback auto-approve on resume failure (fix: e75fa8c4)
-                    // Revoke both underscore and hyphenated variants
-                    if always {
-                        let registry_name = pending.action_name.replace('_', "-");
-                        state
-                            .effect_adapter
-                            .revoke_auto_approve(&pending.action_name)
-                            .await;
-                        state
-                            .effect_adapter
-                            .revoke_auto_approve(&registry_name)
-                            .await;
-                    } else {
-                        state
-                            .effect_adapter
-                            .revoke_next_tool_call_for_call_with_params(
-                                pending.thread_id,
-                                &pending.action_name,
-                                Some(&pending.call_id),
-                                Some(&pending.parameters),
-                            )
-                            .await;
-                        state
-                            .effect_adapter
-                            .revoke_next_tool_call(pending.thread_id, &pending.action_name)
-                            .await;
-                        let registry_name = pending.action_name.replace('_', "-");
-                        if registry_name != pending.action_name {
-                            state
-                                .effect_adapter
-                                .revoke_next_tool_call_for_call_with_params(
-                                    pending.thread_id,
-                                    &registry_name,
-                                    Some(&pending.call_id),
-                                    Some(&pending.parameters),
-                                )
-                                .await;
-                            state
-                                .effect_adapter
-                                .revoke_next_tool_call(pending.thread_id, &registry_name)
-                                .await;
-                        }
-                    }
-                    return Err(e);
-                }
-            }
+            return result;
         }
 
         ironclaw_engine::GateResolution::Denied { reason } => {
@@ -963,6 +1171,7 @@ pub async fn resolve_gate(
                     message.user_id.clone(),
                     Some(deny_msg),
                     Some((pending.call_id.clone(), false)),
+                    None,
                 )
                 .await
                 .map_err(|e| engine_err("resume error", e))?;
@@ -1026,7 +1235,9 @@ pub async fn resolve_gate(
                     }
                 }
 
-                if let Some(retry_content) = pending.original_message.clone() {
+                if pending.action_name == "authentication_fallback"
+                    && let Some(retry_content) = pending.original_message.clone()
+                {
                     let retry_msg = IncomingMessage {
                         content: retry_content.clone(),
                         channel: pending.source_channel.clone(),
@@ -1044,20 +1255,27 @@ pub async fn resolve_gate(
                     .await;
                 }
 
-                let resume_msg = ironclaw_engine::ThreadMessage::user(format!(
-                    "Credential stored for '{}'. Retry the pending action '{}' now.",
-                    credential_name, pending.action_name
-                ));
-                state
-                    .thread_manager
-                    .resume_thread(
-                        pending.thread_id,
-                        message.user_id.clone(),
-                        Some(resume_msg),
-                        None,
+                if let Some(resume_output) = pending.resume_output.clone() {
+                    state
+                        .thread_manager
+                        .resume_thread(
+                            pending.thread_id,
+                            message.user_id.clone(),
+                            Some(resumed_action_result_message(
+                                &pending.action_name,
+                                &resume_output,
+                            )),
+                            None,
+                            Some(pending.call_id.clone()),
+                        )
+                        .await
+                        .map_err(|e| engine_err("resume error", e))?;
+                } else {
+                    return execute_pending_gate_action(
+                        agent, state, message, &pending, false, None,
                     )
-                    .await
-                    .map_err(|e| engine_err("resume error", e))?;
+                    .await;
+                }
             } else {
                 return Err(engine_err(
                     "resolution mismatch",
@@ -1067,20 +1285,25 @@ pub async fn resolve_gate(
         }
 
         ironclaw_engine::GateResolution::ExternalCallback { .. } => {
-            let resume_msg = ironclaw_engine::ThreadMessage::user(format!(
-                "External authentication completed for '{}'. Retry the pending action '{}' now.",
-                pending.gate_name, pending.action_name
-            ));
-            state
-                .thread_manager
-                .resume_thread(
-                    pending.thread_id,
-                    message.user_id.clone(),
-                    Some(resume_msg),
-                    Some((pending.call_id.clone(), true)),
-                )
-                .await
-                .map_err(|e| engine_err("resume error", e))?;
+            if let Some(resume_output) = pending.resume_output.clone() {
+                state
+                    .thread_manager
+                    .resume_thread(
+                        pending.thread_id,
+                        message.user_id.clone(),
+                        Some(resumed_action_result_message(
+                            &pending.action_name,
+                            &resume_output,
+                        )),
+                        None,
+                        Some(pending.call_id.clone()),
+                    )
+                    .await
+                    .map_err(|e| engine_err("resume error", e))?;
+            } else {
+                return execute_pending_gate_action(agent, state, message, &pending, false, None)
+                    .await;
+            }
         }
     }
 
@@ -1792,6 +2015,7 @@ async fn await_thread_outcome(
                     action_name: "authentication_fallback".into(),
                     call_id: format!("fallback-auth-{thread_id}"),
                     parameters: serde_json::json!({ "credential_name": cred_name }),
+                    display_parameters: None,
                     description: format!("Authentication required for '{}'.", cred_name),
                     resume_kind: ironclaw_engine::ResumeKind::Authentication {
                         credential_name: cred_name.clone(),
@@ -1801,6 +2025,7 @@ async fn await_thread_outcome(
                     created_at: chrono::Utc::now(),
                     expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
                     original_message: Some(message.content.clone()),
+                    resume_output: None,
                 };
                 if let Err(e) = state.pending_gates.insert(pending).await {
                     tracing::debug!(error = %e, "failed to store fallback auth gate");
@@ -1862,11 +2087,13 @@ async fn await_thread_outcome(
                 action_name: action_name.clone(),
                 call_id,
                 parameters: parameters.clone(),
+                display_parameters: None,
                 description: format!("Tool '{}' requires approval to execute.", action_name),
                 resume_kind: ironclaw_engine::ResumeKind::Approval { allow_always: true },
                 created_at: chrono::Utc::now(),
                 expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
                 original_message: None,
+                resume_output: None,
             };
             let request_id = pending.request_id.to_string();
             let description = pending.description.clone();
@@ -1898,7 +2125,10 @@ async fn await_thread_outcome(
             )))
         }
         ThreadOutcome::NeedAuthentication {
-            credential_name, ..
+            credential_name,
+            action_name,
+            call_id,
+            parameters,
         } => {
             // Look up setup instructions from the skill's credential spec.
             // Look up setup instructions via AuthManager (or fall back to default).
@@ -1915,9 +2145,10 @@ async fn await_thread_outcome(
                 thread_id,
                 conversation_id: conv_id,
                 source_channel: message.channel.clone(),
-                action_name: credential_name.clone(),
-                call_id: format!("auth-{thread_id}"),
-                parameters: serde_json::json!({ "credential_name": credential_name }),
+                action_name,
+                call_id,
+                parameters,
+                display_parameters: None,
                 description: format!("Authentication required for '{}'.", credential_name),
                 resume_kind: ironclaw_engine::ResumeKind::Authentication {
                     credential_name: credential_name.clone(),
@@ -1927,6 +2158,7 @@ async fn await_thread_outcome(
                 created_at: chrono::Utc::now(),
                 expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
                 original_message: None,
+                resume_output: None,
             };
             state
                 .pending_gates
@@ -1993,7 +2225,8 @@ async fn await_thread_outcome(
                 source_channel: message.channel.clone(),
                 action_name: action_name.clone(),
                 call_id,
-                parameters: redacted_params,
+                parameters,
+                display_parameters: Some(redacted_params.clone()),
                 description: format!(
                     "Tool '{}' requires {} (gate: {gate_name})",
                     action_name,
@@ -2003,6 +2236,7 @@ async fn await_thread_outcome(
                 created_at: chrono::Utc::now(),
                 expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
                 original_message: None,
+                resume_output: None,
             };
 
             if let Err(e) = state.pending_gates.insert(pending.clone()).await {
@@ -2024,7 +2258,7 @@ async fn await_thread_outcome(
                                 request_id: pending.request_id.to_string(),
                                 tool_name: action_name.clone(),
                                 description: pending.description.clone(),
-                                parameters: pending.parameters.clone(),
+                                parameters: redacted_params,
                                 allow_always: *allow_always,
                             },
                             &message.metadata,
@@ -3197,11 +3431,13 @@ mod tests {
             action_name: "shell".into(),
             call_id: format!("call-{thread_id}"),
             parameters: serde_json::json!({"cmd": "ls"}),
+            display_parameters: None,
             description: "pending gate".into(),
             resume_kind,
             created_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
             original_message: None,
+            resume_output: None,
         }
     }
 

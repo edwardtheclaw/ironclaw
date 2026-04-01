@@ -152,11 +152,13 @@ mod tests {
             action_name: "shell".into(),
             call_id: "call_1".into(),
             parameters: serde_json::json!({"cmd":"ls"}),
+            display_parameters: None,
             description: "pending".into(),
             resume_kind: ResumeKind::Approval { allow_always: true },
             created_at: Utc::now(),
             expires_at: Utc::now() + Duration::minutes(30),
             original_message: None,
+            resume_output: None,
         }
     }
 

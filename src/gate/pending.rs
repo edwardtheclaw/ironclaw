@@ -44,6 +44,9 @@ pub struct PendingGate {
     pub call_id: String,
     /// Tool parameters.
     pub parameters: serde_json::Value,
+    /// Redacted parameters safe for UI display and history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_parameters: Option<serde_json::Value>,
     /// Human-readable description of what the tool will do.
     pub description: String,
     /// What kind of resolution is expected.
@@ -56,6 +59,9 @@ pub struct PendingGate {
     /// that completed instead of pausing the thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_message: Option<String>,
+    /// Completed action output to inject on resume after auth finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_output: Option<serde_json::Value>,
 }
 
 impl PendingGate {
@@ -91,7 +97,10 @@ impl From<&PendingGate> for PendingGateView {
             gate_name: gate.gate_name.clone(),
             tool_name: gate.action_name.clone(),
             description: gate.description.clone(),
-            parameters: serde_json::to_string_pretty(&gate.parameters).unwrap_or_default(),
+            parameters: serde_json::to_string_pretty(
+                gate.display_parameters.as_ref().unwrap_or(&gate.parameters),
+            )
+            .unwrap_or_default(),
             resume_kind: gate.resume_kind.clone(),
         }
     }
@@ -113,11 +122,13 @@ mod tests {
             action_name: "shell".into(),
             call_id: "call_1".into(),
             parameters: serde_json::json!({"command": "ls"}),
+            display_parameters: None,
             description: "Run shell command".into(),
             resume_kind: ResumeKind::Approval { allow_always: true },
             created_at: Utc::now(),
             expires_at: Utc::now() + Duration::seconds(expires_in_secs),
             original_message: None,
+            resume_output: None,
         }
     }
 

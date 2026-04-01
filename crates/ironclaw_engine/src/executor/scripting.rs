@@ -1272,6 +1272,7 @@ async fn resolve_tool_future(
             credential_name,
             action_name,
             call_id,
+            completed_output: _,
             ..
         })) => {
             let _ = leases.refund_use(lease_id).await;

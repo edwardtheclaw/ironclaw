@@ -68,6 +68,7 @@ pub enum EngineError {
         action_name: String,
         call_id: String,
         parameters: serde_json::Value,
+        completed_output: Option<serde_json::Value>,
     },
 
     #[error("approval required for action '{action_name}'")]

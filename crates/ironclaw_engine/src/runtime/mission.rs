@@ -230,7 +230,7 @@ impl MissionManager {
                 }
 
                 self.thread_manager
-                    .resume_thread(thread_id, user_id.to_string(), None, None)
+                    .resume_thread(thread_id, user_id.to_string(), None, None, None)
                     .await?;
                 self.spawn_mission_outcome_watcher(mission_id, thread_id);
                 resumed.push(thread_id);

@@ -473,6 +473,13 @@ fn make_caps(require_approval: bool) -> CapabilityRegistry {
                 effects: vec![EffectType::ReadLocal],
                 requires_approval: false,
             },
+            ActionDef {
+                name: "tool_install".into(),
+                description: "Install a tool".into(),
+                parameters_schema: serde_json::json!({"type": "object"}),
+                effects: vec![EffectType::WriteExternal],
+                requires_approval: require_approval,
+            },
         ],
         knowledge: vec![],
         policies: vec![],
@@ -514,12 +521,23 @@ fn sample_pending_gate(
         action_name: "http".into(),
         call_id: "call_1".into(),
         parameters: serde_json::json!({"url": "https://example.com"}),
+        display_parameters: None,
         description: "Tool 'http' requires approval".into(),
         resume_kind,
         created_at: Utc::now(),
         expires_at: Utc::now() + chrono::Duration::minutes(30),
         original_message: None,
+        resume_output: None,
     }
+}
+
+fn resumed_action_result_message(action_name: &str, output: &serde_json::Value) -> ThreadMessage {
+    let rendered = serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string());
+    ThreadMessage::user(format!(
+        "The pending action '{action_name}' has already been executed.\n\
+         Do not call it again unless the user explicitly asks.\n\
+         Continue from this result:\n{rendered}"
+    ))
 }
 
 // ── Tests: GatePaused ThreadOutcome ──────────────────────────
@@ -715,6 +733,7 @@ async fn gate_paused_thread_resumes_to_completion() {
         "test-user",
         Some(ThreadMessage::user("approved")),
         Some(("call_gate_1".into(), true)),
+        None,
     )
     .await
     .expect("resume_thread");
@@ -735,7 +754,7 @@ async fn gate_paused_thread_resumes_to_completion() {
 }
 
 #[tokio::test]
-async fn effect_adapter_approval_resolution_replays_pending_call() {
+async fn approval_resolution_executes_pending_call_directly() {
     let project_id = ProjectId::new();
     let tools = Arc::new(ToolRegistry::new());
     tools.register(Arc::new(ApprovalTool)).await;
@@ -754,17 +773,6 @@ async fn effect_adapter_approval_resolution_replays_pending_call() {
             response: LlmResponse::ActionCalls {
                 calls: vec![ironclaw_engine::ActionCall {
                     id: "call_approval_1".into(),
-                    action_name: "approval_test".into(),
-                    parameters: serde_json::json!({"value": "hello"}),
-                }],
-                content: None,
-            },
-            usage: TokenUsage::default(),
-        },
-        LlmOutput {
-            response: LlmResponse::ActionCalls {
-                calls: vec![ironclaw_engine::ActionCall {
-                    id: "call_approval_2".into(),
                     action_name: "approval_test".into(),
                     parameters: serde_json::json!({"value": "hello"}),
                 }],
@@ -818,22 +826,40 @@ async fn effect_adapter_approval_resolution_replays_pending_call() {
         ThreadState::Waiting
     );
 
-    effects
-        .approve_next_tool_call_for_call_with_params(
-            tid,
+    let thread = store.load_thread(tid).await.unwrap().unwrap();
+    let lease = mgr
+        .leases
+        .find_lease_for_action(tid, "approval_test")
+        .await
+        .expect("lease for approval_test");
+    let exec_ctx = ironclaw_engine::ThreadExecutionContext {
+        thread_id: tid,
+        thread_type: thread.thread_type,
+        project_id: thread.project_id,
+        user_id: "test-user".into(),
+        step_id: ironclaw_engine::StepId::new(),
+        current_call_id: Some("call_approval_1".into()),
+    };
+
+    let tool_result = effects
+        .execute_resolved_pending_action(
             "approval_test",
-            Some("call_approval_1"),
-            Some(&serde_json::json!({"value": "hello"})),
+            serde_json::json!({"value": "hello"}),
+            &lease,
+            &exec_ctx,
+            true,
         )
-        .await;
-    effects.approve_next_tool_call(tid, "approval_test").await;
+        .await
+        .expect("approved pending call should execute directly");
     mgr.resume_thread(
         tid,
         "test-user",
-        Some(ThreadMessage::user(
-            "User approved action 'approval_test'. Retry the exact same action with the same parameters now.",
+        Some(resumed_action_result_message(
+            "approval_test",
+            &tool_result.output,
         )),
         Some(("call_approval_1".into(), true)),
+        Some("call_approval_1".into()),
     )
     .await
     .expect("resume_thread");
@@ -932,14 +958,37 @@ async fn auth_resolution_retries_same_pending_action_without_second_pause() {
         ThreadState::Waiting
     );
 
+    let thread = store.load_thread(tid).await.unwrap().unwrap();
+    let lease = mgr
+        .leases
+        .find_lease_for_action(tid, "http")
+        .await
+        .expect("lease for http");
+    let exec_ctx = ironclaw_engine::ThreadExecutionContext {
+        thread_id: tid,
+        thread_type: thread.thread_type,
+        project_id: thread.project_id,
+        user_id: "test-user".into(),
+        step_id: ironclaw_engine::StepId::new(),
+        current_call_id: Some("call_auth_1".into()),
+    };
+
     effects.mark_authenticated("http").await;
+    let result = effects
+        .execute_action(
+            "http",
+            serde_json::json!({"url": "https://example.com/private"}),
+            &lease,
+            &exec_ctx,
+        )
+        .await
+        .expect("authenticated pending action should execute directly");
     mgr.resume_thread(
         tid,
         "test-user",
-        Some(ThreadMessage::user(
-            "Credential stored for 'test_api_key'. Retry the pending action 'http' now.",
-        )),
+        Some(resumed_action_result_message("http", &result.output)),
         None,
+        Some("call_auth_1".into()),
     )
     .await
     .expect("resume_thread");
@@ -968,6 +1017,7 @@ async fn auth_resolution_retries_same_pending_action_without_second_pause() {
 async fn approval_chains_directly_into_auth_for_install_flow() {
     let project_id = ProjectId::new();
     let effects = GateMockEffects::new_with_chain(vec![], vec![], vec!["tool_install".into()]);
+    let install_params = serde_json::json!({"kind": "mcp_server", "name": "notion"});
 
     let llm = ScriptedLlm::new(vec![
         LlmOutput {
@@ -975,29 +1025,7 @@ async fn approval_chains_directly_into_auth_for_install_flow() {
                 calls: vec![ironclaw_engine::ActionCall {
                     id: "call_install_1".into(),
                     action_name: "tool_install".into(),
-                    parameters: serde_json::json!({"kind": "mcp_server", "name": "notion"}),
-                }],
-                content: None,
-            },
-            usage: TokenUsage::default(),
-        },
-        LlmOutput {
-            response: LlmResponse::ActionCalls {
-                calls: vec![ironclaw_engine::ActionCall {
-                    id: "call_install_2".into(),
-                    action_name: "tool_install".into(),
-                    parameters: serde_json::json!({"name": "notion", "kind": "mcp_server"}),
-                }],
-                content: None,
-            },
-            usage: TokenUsage::default(),
-        },
-        LlmOutput {
-            response: LlmResponse::ActionCalls {
-                calls: vec![ironclaw_engine::ActionCall {
-                    id: "call_install_3".into(),
-                    action_name: "tool_install".into(),
-                    parameters: serde_json::json!({"kind": "mcp_server", "name": "notion"}),
+                    parameters: install_params.clone(),
                 }],
                 content: None,
             },
@@ -1034,21 +1062,28 @@ async fn approval_chains_directly_into_auth_for_install_flow() {
     let first = mgr.join_thread(tid).await.expect("first join");
     assert!(matches!(first, ThreadOutcome::GatePaused { .. }));
 
-    effects.mark_approved("tool_install").await;
-    mgr.resume_thread(
-        tid,
-        "test-user",
-        Some(ThreadMessage::user(
-            "User approved action 'tool_install'. Retry the exact same action with the same parameters now.",
-        )),
-        Some(("call_gate_1".into(), true)),
-    )
-    .await
-    .expect("resume after approval");
+    let thread = store.load_thread(tid).await.unwrap().unwrap();
+    let lease = mgr
+        .leases
+        .find_lease_for_action(tid, "tool_install")
+        .await
+        .expect("lease for tool_install");
+    let exec_ctx = ironclaw_engine::ThreadExecutionContext {
+        thread_id: tid,
+        thread_type: thread.thread_type,
+        project_id: thread.project_id,
+        user_id: "test-user".into(),
+        step_id: ironclaw_engine::StepId::new(),
+        current_call_id: Some("call_install_1".into()),
+    };
 
-    let second = mgr.join_thread(tid).await.expect("second join");
-    match second {
-        ThreadOutcome::GatePaused {
+    effects.mark_approved("tool_install").await;
+    let auth_pause = effects
+        .execute_action("tool_install", install_params.clone(), &lease, &exec_ctx)
+        .await
+        .expect_err("approved install should chain directly into auth");
+    match auth_pause {
+        EngineError::GatePaused {
             gate_name,
             action_name,
             resume_kind,
@@ -1056,7 +1091,7 @@ async fn approval_chains_directly_into_auth_for_install_flow() {
         } => {
             assert_eq!(gate_name, "authentication");
             assert_eq!(action_name, "tool_install");
-            match resume_kind {
+            match *resume_kind {
                 ResumeKind::Authentication {
                     credential_name, ..
                 } => assert_eq!(credential_name, "notion"),
@@ -1067,13 +1102,19 @@ async fn approval_chains_directly_into_auth_for_install_flow() {
     }
 
     effects.mark_authenticated("tool_install").await;
+    let install_result = effects
+        .execute_action("tool_install", install_params, &lease, &exec_ctx)
+        .await
+        .expect("authenticated install should complete directly");
     mgr.resume_thread(
         tid,
         "test-user",
-        Some(ThreadMessage::user(
-            "Credential stored for 'notion'. Retry the pending action 'tool_install' now.",
+        Some(resumed_action_result_message(
+            "tool_install",
+            &install_result.output,
         )),
         None,
+        Some("call_install_1".into()),
     )
     .await
     .expect("resume after auth");

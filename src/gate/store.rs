@@ -310,11 +310,13 @@ mod tests {
             action_name: "shell".into(),
             call_id: "call_1".into(),
             parameters: serde_json::json!({"command": "ls"}),
+            display_parameters: None,
             description: "Run shell command".into(),
             resume_kind: ResumeKind::Approval { allow_always: true },
             created_at: Utc::now(),
             expires_at: Utc::now() + Duration::seconds(expires_in_secs),
             original_message: None,
+            resume_output: None,
         }
     }
 
