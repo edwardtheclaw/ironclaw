@@ -71,6 +71,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /app/target/release/ironclaw /usr/local/bin/ironclaw
 COPY --from=builder /app/migrations /app/migrations
+COPY integrations/ /app/integrations/
 
 # Non-root user
 RUN useradd -m -u 1000 -s /bin/bash ironclaw
@@ -79,5 +80,7 @@ USER ironclaw
 EXPOSE 3000
 
 ENV RUST_LOG=ironclaw=info
+ENV SKILLS_DIR=/app/integrations/abound/skills
+ENV INTEGRATION_CREDENTIALS=/app/integrations/abound/credentials.json
 
 ENTRYPOINT ["ironclaw"]

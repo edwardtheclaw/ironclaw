@@ -319,6 +319,11 @@ impl AppBuilder {
         tools.register_builtin_tools();
         tools.register_tool_info();
 
+        // Load integration credential mappings (e.g. integrations/abound/credentials.json)
+        if let Ok(path) = std::env::var("INTEGRATION_CREDENTIALS") {
+            tools.load_credential_mappings(std::path::Path::new(&path));
+        }
+
         if let Some(ref ss) = self.secrets_store {
             tools.register_secrets_tools(Arc::clone(ss));
         }
