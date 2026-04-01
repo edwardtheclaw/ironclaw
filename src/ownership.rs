@@ -6,7 +6,7 @@
 
 /// Typed wrapper over `users.id`. Replaces all raw `&str`/`String` user_id params.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct OwnerId(pub String);
+pub struct OwnerId(String);
 
 impl OwnerId {
     pub fn new(id: impl Into<String>) -> Self {
@@ -44,7 +44,7 @@ pub enum UserRole {
 }
 
 /// Scope of a tool or skill. Extension point — nothing sets `Global` yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ResourceScope {
     User,
     Global,
@@ -70,7 +70,8 @@ impl Identity {
 /// Central authorization check: returns true if the actor owns the resource.
 ///
 /// Ownership is strict equality — role has no effect here.
-/// `AdminScope` gates admin-only operations separately.
+/// Admin-only operations are gated by a separate scope type; do not add
+/// role-based bypasses to this function.
 pub fn can_act_on(actor: &Identity, resource_owner: &OwnerId) -> bool {
     actor.owner_id == *resource_owner
 }
