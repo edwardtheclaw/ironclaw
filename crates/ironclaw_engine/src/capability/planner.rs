@@ -1,0 +1,198 @@
+//! Lease planning for new threads.
+//!
+//! Converts capability registry contents plus thread type into explicit
+//! capability grants. Thread-type-aware: Foreground gets all tiers,
+//! Research gets read-only + stateful, Mission excludes administrative tools.
+
+use crate::capability::registry::CapabilityRegistry;
+use crate::gate::tool_tier::{ToolTier, classify_tool_tier, is_autonomous_denylisted};
+use crate::types::thread::ThreadType;
+
+/// Explicit grant plan for a single capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityGrantPlan {
+    pub capability_name: String,
+    pub granted_actions: Vec<String>,
+}
+
+/// Plans explicit capability leases for new threads.
+///
+/// Uses [`ToolTier`] classification to scope grants by thread type:
+/// - **Foreground**: all tiers (interactive approval gates protect Privileged/Admin)
+/// - **Research**: `ReadOnly` and `Stateful` only
+/// - **Mission**: `ReadOnly`, `Stateful`, and non-denylisted `Privileged`
+#[derive(Debug, Default)]
+pub struct LeasePlanner;
+
+impl LeasePlanner {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Build the capability grants for a new thread.
+    pub fn plan_for_thread(
+        &self,
+        thread_type: ThreadType,
+        capabilities: &CapabilityRegistry,
+    ) -> Vec<CapabilityGrantPlan> {
+        capabilities
+            .list()
+            .into_iter()
+            .filter_map(|cap| {
+                let granted_actions: Vec<String> = cap
+                    .actions
+                    .iter()
+                    .filter(|action| {
+                        let tier = classify_tool_tier(action);
+                        Self::tier_allowed(thread_type, &action.name, tier)
+                    })
+                    .map(|action| action.name.clone())
+                    .collect();
+                if granted_actions.is_empty() {
+                    None
+                } else {
+                    Some(CapabilityGrantPlan {
+                        capability_name: cap.name.clone(),
+                        granted_actions,
+                    })
+                }
+            })
+            .collect()
+    }
+
+    /// Check whether a tool tier is allowed for a given thread type.
+    fn tier_allowed(thread_type: ThreadType, action_name: &str, tier: ToolTier) -> bool {
+        match thread_type {
+            ThreadType::Foreground => {
+                // Foreground gets everything — interactive approval gates
+                // protect Privileged and Administrative tools.
+                true
+            }
+            ThreadType::Research => {
+                // Research threads: read-only and stateful only.
+                tier <= ToolTier::Stateful
+            }
+            ThreadType::Mission => {
+                // Mission threads: no Administrative, no denylisted Privileged.
+                match tier {
+                    ToolTier::ReadOnly | ToolTier::Stateful => true,
+                    ToolTier::Privileged => !is_autonomous_denylisted(action_name),
+                    ToolTier::Administrative => false,
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::capability::{ActionDef, Capability, EffectType};
+
+    fn action(name: &str, effects: Vec<EffectType>, requires_approval: bool) -> ActionDef {
+        ActionDef {
+            name: name.into(),
+            description: format!("{name} action"),
+            parameters_schema: serde_json::json!({}),
+            effects,
+            requires_approval,
+        }
+    }
+
+    fn mixed_registry() -> CapabilityRegistry {
+        let mut reg = CapabilityRegistry::new();
+        reg.register(Capability {
+            name: "tools".into(),
+            description: "all tools".into(),
+            actions: vec![
+                action("echo", vec![EffectType::ReadLocal], false), // ReadOnly
+                action("read_file", vec![EffectType::ReadLocal], false), // ReadOnly
+                action("file_write", vec![EffectType::WriteLocal], false), // Stateful
+                action("shell", vec![EffectType::WriteLocal], true), // Privileged
+                action("http", vec![EffectType::WriteExternal], true), // Privileged
+                action("routine_create", vec![EffectType::WriteLocal], false), // Administrative (denylisted)
+                action("tool_install", vec![EffectType::WriteLocal], false), // Administrative (denylisted)
+            ],
+            knowledge: vec![],
+            policies: vec![],
+        });
+        reg
+    }
+
+    fn simple_registry() -> CapabilityRegistry {
+        let mut reg = CapabilityRegistry::new();
+        reg.register(Capability {
+            name: "tools".into(),
+            description: "test".into(),
+            actions: vec![action("read_file", vec![EffectType::ReadLocal], false)],
+            knowledge: vec![],
+            policies: vec![],
+        });
+        reg
+    }
+
+    #[test]
+    fn foreground_threads_get_explicit_actions() {
+        let planner = LeasePlanner::new();
+        let plans = planner.plan_for_thread(ThreadType::Foreground, &simple_registry());
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].capability_name, "tools");
+        assert_eq!(plans[0].granted_actions, vec!["read_file"]);
+    }
+
+    #[test]
+    fn test_foreground_gets_all_tiers() {
+        let planner = LeasePlanner::new();
+        let plans = planner.plan_for_thread(ThreadType::Foreground, &mixed_registry());
+        assert_eq!(plans.len(), 1);
+        let actions = &plans[0].granted_actions;
+        assert_eq!(actions.len(), 7, "Foreground should get all 7 actions");
+        assert!(actions.contains(&"routine_create".into()));
+        assert!(actions.contains(&"shell".into()));
+    }
+
+    #[test]
+    fn test_research_excludes_privileged_and_admin() {
+        let planner = LeasePlanner::new();
+        let plans = planner.plan_for_thread(ThreadType::Research, &mixed_registry());
+        assert_eq!(plans.len(), 1);
+        let actions = &plans[0].granted_actions;
+        // ReadOnly: echo, read_file. Stateful: file_write.
+        assert_eq!(
+            actions.len(),
+            3,
+            "Research should get 3 actions: {:?}",
+            actions
+        );
+        assert!(actions.contains(&"echo".into()));
+        assert!(actions.contains(&"read_file".into()));
+        assert!(actions.contains(&"file_write".into()));
+        assert!(!actions.contains(&"shell".into()));
+        assert!(!actions.contains(&"routine_create".into()));
+    }
+
+    #[test]
+    fn test_mission_excludes_administrative() {
+        let planner = LeasePlanner::new();
+        let plans = planner.plan_for_thread(ThreadType::Mission, &mixed_registry());
+        assert_eq!(plans.len(), 1);
+        let actions = &plans[0].granted_actions;
+        // Includes ReadOnly, Stateful, and non-denylisted Privileged (shell, http).
+        // Excludes Administrative (routine_create, tool_install).
+        assert!(actions.contains(&"echo".into()));
+        assert!(actions.contains(&"shell".into()));
+        assert!(actions.contains(&"http".into()));
+        assert!(!actions.contains(&"routine_create".into()));
+        assert!(!actions.contains(&"tool_install".into()));
+    }
+
+    #[test]
+    fn test_mission_excludes_denylisted_privileged() {
+        let planner = LeasePlanner::new();
+        let plans = planner.plan_for_thread(ThreadType::Mission, &mixed_registry());
+        let actions = &plans[0].granted_actions;
+        // routine_create and tool_install are in the denylist
+        assert!(!actions.contains(&"routine_create".into()));
+        assert!(!actions.contains(&"tool_install".into()));
+    }
+}

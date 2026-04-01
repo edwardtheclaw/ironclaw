@@ -94,10 +94,24 @@ pub struct HistoryResponse {
     pub oldest_timestamp: Option<String>,
     /// Pending tool approval that needs user action (re-rendered on thread switch).
     ///
-    /// Only populated from in-memory state; not persisted to DB.
-    /// Server restart clears pending approvals.
+    /// Populated from live session state and, when engine v2 is active,
+    /// durable engine metadata so approval cards survive thread switches and restarts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_approval: Option<PendingApprovalInfo>,
+    /// Pending auth flow that needs user action (re-rendered on SSE reconnect).
+    ///
+    /// When present, the frontend should show the auth card so the user can
+    /// submit credentials. Without this, SSE disconnects lose the auth card
+    /// and the user is stuck with a blocked chat input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_auth: Option<PendingAuthInfo>,
+}
+
+/// Lightweight DTO for pending auth state (credential name + instructions).
+#[derive(Debug, Serialize)]
+pub struct PendingAuthInfo {
+    pub extension_name: String,
+    pub instructions: Option<String>,
 }
 
 /// Lightweight DTO for a pending tool approval (excludes context_messages).
@@ -819,6 +833,69 @@ pub struct SettingsExportResponse {
 pub struct HealthResponse {
     pub status: &'static str,
     pub channel: &'static str,
+}
+
+// ── Engine v2 response types ────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct EngineThreadListResponse {
+    pub threads: Vec<crate::bridge::EngineThreadInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EngineThreadDetailResponse {
+    pub thread: crate::bridge::EngineThreadDetail,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EngineStepListResponse {
+    pub steps: Vec<crate::bridge::EngineStepInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EngineEventListResponse {
+    pub events: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EngineProjectListResponse {
+    pub projects: Vec<crate::bridge::EngineProjectInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EngineProjectDetailResponse {
+    pub project: crate::bridge::EngineProjectInfo,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EngineMissionListResponse {
+    pub missions: Vec<crate::bridge::EngineMissionInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EngineMissionSummaryResponse {
+    pub total: u64,
+    pub active: u64,
+    pub paused: u64,
+    pub completed: u64,
+    pub failed: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EngineMissionDetailResponse {
+    pub mission: crate::bridge::EngineMissionDetail,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EngineMissionFireResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub fired: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EngineActionResponse {
+    pub ok: bool,
 }
 
 #[cfg(test)]

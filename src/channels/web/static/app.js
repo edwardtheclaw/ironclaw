@@ -228,6 +228,28 @@ document.getElementById('token-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') authenticate();
 });
 
+// Close SSE connections on page unload to free the browser's connection pool.
+// Without this, stale SSE connections from prior page loads linger and exhaust
+// the HTTP/1.1 per-origin connection limit (6), blocking API fetch calls.
+window.addEventListener('beforeunload', () => {
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  if (logEventSource) { logEventSource.close(); logEventSource = null; }
+});
+
+// Pause SSE when the browser tab is hidden (another tab is focused) and resume
+// when it becomes visible again. This frees connection slots for other tabs
+// running the gateway — without this, each tab holds 1-2 SSE connections and
+// the 3rd tab exhausts the browser's per-origin limit.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    if (eventSource) { eventSource.close(); eventSource = null; }
+    if (logEventSource) { logEventSource.close(); logEventSource = null; }
+  } else if (token) {
+    connectSSE();
+    if (currentTab === 'logs') connectLogSSE();
+  }
+});
+
 // Note: main event listener registration is at the bottom of this file (search
 // "Event Listener Registration"). Do NOT add duplicate listeners here.
 
@@ -677,6 +699,13 @@ function connectSSE() {
       }
     });
   }
+
+  // Plan progress checklist
+  eventSource.addEventListener('plan_update', (e) => {
+    const data = JSON.parse(e.data);
+    if (data.thread_id && !isCurrentThread(data.thread_id)) return;
+    renderPlanChecklist(data);
+  });
 }
 
 // Check if an SSE event belongs to the currently viewed thread.
@@ -1467,6 +1496,94 @@ function showApproval(data) {
   container.scrollTop = container.scrollHeight;
 }
 
+// --- Plan Checklist ---
+
+function renderPlanChecklist(data) {
+  const chatContainer = document.getElementById('chat-messages');
+  const planId = data.plan_id;
+
+  // Find or create the plan container
+  let container = chatContainer.querySelector('.plan-container[data-plan-id="' + CSS.escape(planId) + '"]');
+  if (!container) {
+    container = document.createElement('div');
+    container.className = 'plan-container';
+    container.setAttribute('data-plan-id', planId);
+    chatContainer.appendChild(container);
+  }
+
+  // Clear and rebuild
+  container.innerHTML = '';
+
+  // Header
+  const header = document.createElement('div');
+  header.className = 'plan-header';
+
+  const title = document.createElement('span');
+  title.className = 'plan-title';
+  title.textContent = data.title || planId;
+  header.appendChild(title);
+
+  const badge = document.createElement('span');
+  badge.className = 'plan-status-badge plan-status-' + (data.status || 'draft');
+  badge.textContent = data.status || 'draft';
+  header.appendChild(badge);
+
+  container.appendChild(header);
+
+  // Steps
+  if (data.steps && data.steps.length > 0) {
+    const stepsList = document.createElement('div');
+    stepsList.className = 'plan-steps';
+
+    let completed = 0;
+    for (const step of data.steps) {
+      const stepEl = document.createElement('div');
+      stepEl.className = 'plan-step';
+      stepEl.setAttribute('data-status', step.status || 'pending');
+
+      const icon = document.createElement('span');
+      icon.className = 'plan-step-icon';
+      if (step.status === 'completed') {
+        icon.textContent = '\u2713'; // checkmark
+        completed++;
+      } else if (step.status === 'failed') {
+        icon.textContent = '\u2717'; // X
+      } else if (step.status === 'in_progress') {
+        icon.innerHTML = '<span class="plan-spinner"></span>';
+      } else {
+        icon.textContent = '\u25CB'; // circle
+      }
+      stepEl.appendChild(icon);
+
+      const text = document.createElement('span');
+      text.className = 'plan-step-text';
+      text.textContent = step.title;
+      stepEl.appendChild(text);
+
+      if (step.result) {
+        const result = document.createElement('span');
+        result.className = 'plan-step-result';
+        result.textContent = step.result;
+        stepEl.appendChild(result);
+      }
+
+      stepsList.appendChild(stepEl);
+    }
+    container.appendChild(stepsList);
+
+    // Summary
+    const summary = document.createElement('div');
+    summary.className = 'plan-summary';
+    summary.textContent = completed + ' of ' + data.steps.length + ' steps completed';
+    if (data.mission_id) {
+      summary.textContent += ' \u00b7 Mission: ' + data.mission_id.substring(0, 8);
+    }
+    container.appendChild(summary);
+  }
+
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
 function showJobCard(data) {
   const container = document.getElementById('chat-messages');
   const card = document.createElement('div');
@@ -1517,15 +1634,16 @@ function showJobCard(data) {
 // --- Auth card ---
 
 function handleAuthRequired(data) {
-  if (data.auth_url) {
-    setAuthFlowPending(true, data.instructions);
-    // OAuth flow: show the global auth prompt with an OAuth button + optional token paste field.
+  setAuthFlowPending(true, data.instructions);
+  if (data.auth_url || data.instructions) {
+    // Token paste flow (with optional OAuth button): show the global auth
+    // prompt card. This handles both OAuth credentials (auth_url present)
+    // and skill-based credentials (instructions present, no auth_url).
     showAuthCard(data);
   } else {
+    // Extension setup flow: fetch the extension's credential schema and show
+    // the multi-field configure modal (Extensions tab "Setup" button UI).
     if (getConfigureOverlay(data.extension_name)) return;
-    setAuthFlowPending(true, data.instructions);
-    // Setup flow: fetch the extension's credential schema and show the multi-field
-    // configure modal (the same UI used by the Extensions tab "Setup" button).
     showConfigureModal(data.extension_name);
   }
 }
@@ -1804,6 +1922,17 @@ function loadHistory(before) {
       // Re-render pending approval card if the thread is awaiting approval
       if (data.pending_approval) {
         showApproval(data.pending_approval);
+      }
+      // Re-show auth card if auth flow is pending (survives SSE reconnect)
+      if (data.pending_auth) {
+        handleAuthRequired({
+          extension_name: data.pending_auth.extension_name,
+          instructions: data.pending_auth.instructions,
+          auth_url: null,
+        });
+      } else {
+        // No pending auth — ensure stale auth UI is cleaned up
+        setAuthFlowPending(false);
       }
     } else {
       // Pagination: prepend older messages
@@ -2108,8 +2237,10 @@ function switchThread(threadId) {
 function createNewThread() {
   apiFetch('/api/chat/thread/new', { method: 'POST' }).then((data) => {
     currentThreadId = data.id || null;
+    currentThreadIsReadOnly = false;
     document.getElementById('chat-messages').innerHTML = '';
     showWelcomeCard();
+    enableChatInput();
     loadThreads();
   }).catch((err) => {
     showToast('Failed to create thread: ' + err.message, 'error');
@@ -2250,8 +2381,10 @@ function switchTab(tab) {
 
   if (tab === 'memory') loadMemoryTree();
   if (tab === 'jobs') loadJobs();
+  if (tab === 'missions') loadMissions();
   if (tab === 'routines') loadRoutines();
-  if (tab === 'logs') applyLogFilters();
+  if (tab === 'logs') { connectLogSSE(); applyLogFilters(); }
+  else if (logEventSource) { logEventSource.close(); logEventSource = null; }
   if (tab === 'settings') {
     loadSettingsSubtab(currentSettingsSubtab);
   } else {
@@ -4365,6 +4498,246 @@ function deleteRoutine(id, name) {
     .catch((err) => showToast('Delete failed: ' + err.message, 'error'));
 }
 
+// ── Missions ──────────────────────────────────────────────
+
+let currentMissionId = null;
+
+function loadMissions() {
+  currentMissionId = null;
+  const detail = document.getElementById('mission-detail');
+  if (detail) detail.style.display = 'none';
+  const table = document.getElementById('missions-table');
+  if (table) table.style.display = '';
+
+  Promise.all([
+    apiFetch('/api/engine/missions/summary'),
+    apiFetch('/api/engine/missions'),
+  ]).then(([summary, listData]) => {
+    renderMissionsSummary(summary);
+    renderMissionsList(listData.missions);
+  }).catch(() => {});
+}
+
+function renderMissionsSummary(s) {
+  document.getElementById('missions-summary').innerHTML = ''
+    + summaryCard(I18n.t('missions.summary.total'), s.total, '')
+    + summaryCard(I18n.t('missions.summary.active'), s.active, 'active')
+    + summaryCard(I18n.t('missions.summary.paused'), s.paused, '')
+    + summaryCard(I18n.t('missions.summary.completed'), s.completed, 'completed')
+    + summaryCard(I18n.t('missions.summary.failed'), s.failed, 'failed');
+}
+
+function renderMissionsList(missions) {
+  const tbody = document.getElementById('missions-tbody');
+  const empty = document.getElementById('missions-empty');
+
+  if (!missions || missions.length === 0) {
+    tbody.innerHTML = '';
+    empty.style.display = 'block';
+    return;
+  }
+
+  empty.style.display = 'none';
+  tbody.innerHTML = missions.map((m) => {
+    const statusClass = m.status === 'Active' ? 'in_progress'
+      : m.status === 'Completed' ? 'completed'
+      : m.status === 'Paused' ? 'pending'
+      : 'failed';
+
+    return '<tr class="mission-row" data-action="open-mission" data-id="' + escapeHtml(m.id) + '">'
+      + '<td>' + escapeHtml(m.name) + '</td>'
+      + '<td class="truncate">' + escapeHtml(m.goal) + '</td>'
+      + '<td>' + escapeHtml(m.cadence_type) + '</td>'
+      + '<td>' + m.thread_count + '</td>'
+      + '<td><span class="badge ' + statusClass + '">' + escapeHtml(m.status) + '</span></td>'
+      + '<td>'
+      + (m.status === 'Active' ? '<button class="btn-cancel" data-action="pause-mission" data-id="' + escapeHtml(m.id) + '">Pause</button> ' : '')
+      + (m.status === 'Paused' ? '<button class="btn-restart" data-action="resume-mission" data-id="' + escapeHtml(m.id) + '">Resume</button> ' : '')
+      + '<button class="btn-restart" data-action="fire-mission" data-id="' + escapeHtml(m.id) + '">Fire</button>'
+      + '</td>'
+      + '</tr>';
+  }).join('');
+}
+
+function openMissionDetail(id) {
+  currentMissionId = id;
+  apiFetch('/api/engine/missions/' + id).then((data) => {
+    renderMissionDetail(data.mission);
+  }).catch((err) => {
+    showToast('Failed to load mission: ' + err.message, 'error');
+  });
+}
+
+function closeMissionDetail() {
+  currentMissionId = null;
+  loadMissions();
+}
+
+function renderMissionDetail(m) {
+  const table = document.getElementById('missions-table');
+  if (table) table.style.display = 'none';
+  document.getElementById('missions-empty').style.display = 'none';
+
+  const detail = document.getElementById('mission-detail');
+  detail.style.display = 'block';
+
+  const statusClass = m.status === 'Active' ? 'in_progress'
+    : m.status === 'Completed' ? 'completed'
+    : m.status === 'Paused' ? 'pending'
+    : 'failed';
+
+  let html = '<div class="job-detail-header">'
+    + '<button class="btn-back" data-action="close-mission-detail">&larr; Back</button>'
+    + '<h2>' + escapeHtml(m.name) + '</h2>'
+    + '<span class="badge ' + statusClass + '">' + escapeHtml(m.status) + '</span>'
+    + '</div>';
+
+  // Goal — full-width markdown block
+  html += '<div class="job-description"><h3>Goal</h3>'
+    + '<div class="job-description-body">' + renderMarkdown(m.goal) + '</div></div>';
+
+  html += '<div class="job-meta-grid">'
+    + metaItem('Cadence', m.cadence_type)
+    + metaItem('Status', m.status)
+    + metaItem('Threads Today', m.threads_today + ' / ' + (m.max_threads_per_day || '∞'))
+    + metaItem('Total Threads', m.thread_count)
+    + metaItem('Created', formatDate(m.created_at))
+    + metaItem('Next Fire', m.next_fire_at ? formatDate(m.next_fire_at) : 'N/A')
+    + '</div>';
+
+  if (m.current_focus) {
+    html += '<div class="job-description"><h3>Current Focus</h3>'
+      + '<div class="job-description-body">' + renderMarkdown(m.current_focus) + '</div></div>';
+  }
+
+  if (m.success_criteria) {
+    html += '<div class="job-description"><h3>Success Criteria</h3>'
+      + '<div class="job-description-body">' + renderMarkdown(m.success_criteria) + '</div></div>';
+  }
+
+  if (m.approach_history && m.approach_history.length > 0) {
+    html += '<div class="job-description"><h3>Approach History</h3><ul>';
+    m.approach_history.forEach((a) => {
+      html += '<li>' + escapeHtml(a) + '</li>';
+    });
+    html += '</ul></div>';
+  }
+
+  if (m.threads && m.threads.length > 0) {
+    html += '<div class="job-description"><h3>Spawned Threads</h3>'
+      + '<table class="missions-table"><thead><tr>'
+      + '<th>Goal</th><th>Type</th><th>State</th><th>Steps</th><th>Tokens</th><th>Created</th>'
+      + '</tr></thead><tbody>';
+    m.threads.forEach((t) => {
+      var tState = t.state === 'Done' || t.state === 'Completed' ? 'completed'
+        : t.state === 'Failed' ? 'failed'
+        : t.state === 'Running' ? 'in_progress'
+        : 'pending';
+      html += '<tr class="mission-row" data-action="open-engine-thread" data-id="' + escapeHtml(t.id) + '">'
+        + '<td class="truncate">' + escapeHtml(t.goal) + '</td>'
+        + '<td>' + escapeHtml(t.thread_type) + '</td>'
+        + '<td><span class="badge ' + tState + '">' + escapeHtml(t.state) + '</span></td>'
+        + '<td>' + t.step_count + '</td>'
+        + '<td>' + t.total_tokens.toLocaleString() + '</td>'
+        + '<td>' + formatDate(t.created_at) + '</td>'
+        + '</tr>';
+    });
+    html += '</tbody></table></div>';
+  }
+
+  // Action buttons
+  html += '<div style="margin-top:16px;">';
+  if (m.status === 'Active') {
+    html += '<button class="btn-cancel" data-action="pause-mission" data-id="' + escapeHtml(m.id) + '">Pause</button> ';
+  }
+  if (m.status === 'Paused') {
+    html += '<button class="btn-restart" data-action="resume-mission" data-id="' + escapeHtml(m.id) + '">Resume</button> ';
+  }
+  html += '<button class="btn-restart" data-action="fire-mission" data-id="' + escapeHtml(m.id) + '">Fire Now</button>';
+  html += '</div>';
+
+  detail.innerHTML = html;
+}
+
+function openEngineThread(threadId) {
+  apiFetch('/api/engine/threads/' + threadId).then((data) => {
+    var t = data.thread;
+    var detail = document.getElementById('mission-detail');
+
+    var stateClass = t.state === 'Done' || t.state === 'Completed' ? 'completed'
+      : t.state === 'Failed' ? 'failed'
+      : t.state === 'Running' ? 'in_progress'
+      : 'pending';
+
+    var html = '<div class="job-detail-header">'
+      + '<button class="btn-back" data-action="back-to-mission">&larr; Back to Mission</button>'
+      + '<h2>Thread: ' + escapeHtml(t.goal) + '</h2>'
+      + '<span class="badge ' + stateClass + '">' + escapeHtml(t.state) + '</span>'
+      + '</div>';
+
+    html += '<div class="job-meta-grid">'
+      + metaItem('Thread ID', t.id)
+      + metaItem('Type', t.thread_type)
+      + metaItem('Steps', t.step_count)
+      + metaItem('Tokens', t.total_tokens.toLocaleString())
+      + metaItem('Cost', t.total_cost_usd > 0 ? '$' + t.total_cost_usd.toFixed(4) : '-')
+      + metaItem('Max Iterations', t.max_iterations)
+      + metaItem('Created', formatDate(t.created_at))
+      + metaItem('Completed', t.completed_at ? formatDate(t.completed_at) : '-')
+      + '</div>';
+
+    if (t.messages && t.messages.length > 0) {
+      html += '<div class="job-description"><h3>Messages (' + t.messages.length + ')</h3>';
+      t.messages.forEach(function(msg, i) {
+        var roleClass = msg.role === 'Assistant' ? 'assistant' : msg.role === 'User' ? 'user' : 'system';
+        html += '<div class="thread-message thread-msg-' + roleClass + '">'
+          + '<div class="thread-msg-role">' + escapeHtml(msg.role) + '</div>'
+          + '<div class="thread-msg-content">' + renderMarkdown(msg.content) + '</div>'
+          + '</div>';
+      });
+      html += '</div>';
+    }
+
+    detail.innerHTML = html;
+  }).catch(function(err) {
+    showToast('Failed to load thread: ' + err.message, 'error');
+  });
+}
+
+function fireMission(id) {
+  apiFetch('/api/engine/missions/' + id + '/fire', { method: 'POST' })
+    .then((data) => {
+      if (data.fired) {
+        showToast('Mission fired — thread ' + data.thread_id, 'success');
+      } else {
+        showToast('Mission not fired (terminal or budget exhausted)', 'warning');
+      }
+      if (currentMissionId === id) openMissionDetail(id);
+      else loadMissions();
+    })
+    .catch((err) => showToast('Fire failed: ' + err.message, 'error'));
+}
+
+function pauseMission(id) {
+  apiFetch('/api/engine/missions/' + id + '/pause', { method: 'POST' })
+    .then(() => {
+      showToast('Mission paused', 'success');
+      if (currentMissionId === id) openMissionDetail(id);
+      else loadMissions();
+    })
+    .catch((err) => showToast('Pause failed: ' + err.message, 'error'));
+}
+
+function resumeMission(id) {
+  apiFetch('/api/engine/missions/' + id + '/resume', { method: 'POST' })
+    .then(() => {
+      showToast('Mission resumed', 'success');
+      if (currentMissionId === id) openMissionDetail(id);
+      else loadMissions();
+    })
+    .catch((err) => showToast('Resume failed: ' + err.message, 'error'));
+}
+
 function formatRelativeTime(isoString) {
   if (!isoString) return '-';
   const d = new Date(isoString);
@@ -6238,6 +6611,31 @@ document.addEventListener('click', function(e) {
       break;
     case 'close-routine-detail':
       closeRoutineDetail();
+      break;
+    case 'open-mission':
+      openMissionDetail(el.dataset.id);
+      break;
+    case 'close-mission-detail':
+      closeMissionDetail();
+      break;
+    case 'fire-mission':
+      e.stopPropagation();
+      fireMission(el.dataset.id);
+      break;
+    case 'pause-mission':
+      e.stopPropagation();
+      pauseMission(el.dataset.id);
+      break;
+    case 'resume-mission':
+      e.stopPropagation();
+      resumeMission(el.dataset.id);
+      break;
+    case 'open-engine-thread':
+      openEngineThread(el.dataset.id);
+      break;
+    case 'back-to-mission':
+      if (currentMissionId) openMissionDetail(currentMissionId);
+      else closeMissionDetail();
       break;
     case 'view-run-job':
       e.preventDefault();

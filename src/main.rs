@@ -300,6 +300,11 @@ async fn async_main() -> anyhow::Result<()> {
         wizard.run().await?;
     }
 
+    // CLI flag overrides for config
+    if cli.auto_approve {
+        ironclaw::config::set_runtime_env("AGENT_AUTO_APPROVE_TOOLS", "true");
+    }
+
     // Load initial config from env + disk + optional TOML (before DB is available).
     // Credentials may be missing at this point — that's fine. LlmConfig::resolve()
     // defers gracefully, and AppBuilder::build_all() re-resolves after loading
@@ -523,6 +528,7 @@ async fn async_main() -> anyhow::Result<()> {
             &components.secrets_store,
             components.extension_manager.as_ref(),
             components.db.as_ref(),
+            &channel_names,
         )
         .await;
 
@@ -958,6 +964,11 @@ async fn async_main() -> anyhow::Result<()> {
         && let Some(ref sse) = sse_manager
     {
         ext_mgr.set_sse_sender(Arc::clone(sse)).await;
+    }
+
+    // Wire SSE into plan_update tool for live plan progress broadcasting.
+    if let Some(ref sse) = sse_manager {
+        components.tools.register_plan_tools(Some(Arc::clone(sse)));
     }
 
     // Snapshot memory for trace recording before the agent starts

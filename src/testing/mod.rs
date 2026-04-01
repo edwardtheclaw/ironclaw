@@ -504,7 +504,7 @@ impl TestHarnessBuilder {
         use crate::agent::cost_guard::{CostGuard, CostGuardConfig};
         use crate::config::{SafetyConfig, SkillsConfig};
         use crate::hooks::HookRegistry;
-        use crate::safety::SafetyLayer;
+        use ironclaw_safety::SafetyLayer;
 
         let (db, temp_dir) = if let Some(db) = self.db {
             // Caller provided a DB; create a dummy temp dir to satisfy the struct.
@@ -754,7 +754,7 @@ mod tests {
 
         // ensure_conversation should create the row.
         assert!(
-            db.ensure_conversation(conv_id, "web", "carol", None)
+            db.ensure_conversation(conv_id, "web", "carol", None, Some("web"))
                 .await
                 .expect("ensure first"),
             "first ensure_conversation should create the row"
@@ -762,7 +762,7 @@ mod tests {
 
         // Calling again with the same ID should not error.
         assert!(
-            db.ensure_conversation(conv_id, "web", "carol", None)
+            db.ensure_conversation(conv_id, "web", "carol", None, Some("web"))
                 .await
                 .expect("ensure second (idempotent)"),
             "second ensure_conversation should touch owned row"
@@ -807,7 +807,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
         assert!(
-            !db.ensure_conversation(conv_id, "web", "mallory", None)
+            !db.ensure_conversation(conv_id, "web", "mallory", None, None)
                 .await
                 .expect("foreign ensure should not error"),
             "foreign ensure_conversation should report not ensured"

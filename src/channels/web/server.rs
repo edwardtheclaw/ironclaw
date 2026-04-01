@@ -33,6 +33,12 @@ use crate::channels::relay::DEFAULT_RELAY_NAME;
 use crate::channels::web::auth::{
     AuthenticatedUser, CombinedAuthState, UserIdentity, auth_middleware,
 };
+use crate::channels::web::handlers::engine::{
+    engine_mission_detail_handler, engine_mission_fire_handler, engine_mission_pause_handler,
+    engine_mission_resume_handler, engine_missions_handler, engine_missions_summary_handler,
+    engine_project_detail_handler, engine_projects_handler, engine_thread_detail_handler,
+    engine_thread_events_handler, engine_thread_steps_handler, engine_threads_handler,
+};
 use crate::channels::web::handlers::jobs::{
     job_files_list_handler, job_files_read_handler, jobs_cancel_handler, jobs_detail_handler,
     jobs_events_handler, jobs_list_handler, jobs_prompt_handler, jobs_restart_handler,
@@ -376,9 +382,9 @@ pub struct GatewayState {
     /// LLM provider for OpenAI-compatible API proxy.
     pub llm_provider: Option<Arc<dyn crate::llm::LlmProvider>>,
     /// Skill registry for skill management API.
-    pub skill_registry: Option<Arc<std::sync::RwLock<crate::skills::SkillRegistry>>>,
+    pub skill_registry: Option<Arc<std::sync::RwLock<ironclaw_skills::SkillRegistry>>>,
     /// Skill catalog for searching the ClawHub registry.
-    pub skill_catalog: Option<Arc<crate::skills::catalog::SkillCatalog>>,
+    pub skill_catalog: Option<Arc<ironclaw_skills::catalog::SkillCatalog>>,
     /// Scheduler for sending follow-up messages to running agent jobs.
     pub scheduler: Option<crate::tools::builtin::SchedulerSlot>,
     /// Per-user rate limiter for chat endpoints (30 messages per 60 seconds per user).
@@ -515,6 +521,46 @@ pub async fn start_server(
             axum::routing::delete(routines_delete_handler),
         )
         .route("/api/routines/{id}/runs", get(routines_runs_handler))
+        // Engine v2
+        .route("/api/engine/threads", get(engine_threads_handler))
+        .route(
+            "/api/engine/threads/{id}",
+            get(engine_thread_detail_handler),
+        )
+        .route(
+            "/api/engine/threads/{id}/steps",
+            get(engine_thread_steps_handler),
+        )
+        .route(
+            "/api/engine/threads/{id}/events",
+            get(engine_thread_events_handler),
+        )
+        .route("/api/engine/projects", get(engine_projects_handler))
+        .route(
+            "/api/engine/projects/{id}",
+            get(engine_project_detail_handler),
+        )
+        .route("/api/engine/missions", get(engine_missions_handler))
+        .route(
+            "/api/engine/missions/summary",
+            get(engine_missions_summary_handler),
+        )
+        .route(
+            "/api/engine/missions/{id}",
+            get(engine_mission_detail_handler),
+        )
+        .route(
+            "/api/engine/missions/{id}/fire",
+            post(engine_mission_fire_handler),
+        )
+        .route(
+            "/api/engine/missions/{id}/pause",
+            post(engine_mission_pause_handler),
+        )
+        .route(
+            "/api/engine/missions/{id}/resume",
+            post(engine_mission_resume_handler),
+        )
         // Skills
         .route("/api/skills", get(skills_list_handler))
         .route("/api/skills/search", post(skills_search_handler))
@@ -1643,6 +1689,61 @@ async fn chat_auth_token_handler(
         }
         Err(e) => {
             let msg = e.to_string();
+
+            // Skill credential fallback: if the extension manager doesn't
+            // recognize the name (skill credential like "github_token"),
+            // store directly in the secrets store.
+            if matches!(&e, crate::extensions::ExtensionError::NotInstalled(_))
+                || msg.contains("not found")
+            {
+                let ss = state
+                    .tool_registry
+                    .as_ref()
+                    .and_then(|tr| tr.secrets_store().cloned())
+                    .or_else(|| {
+                        state
+                            .extension_manager
+                            .as_ref()
+                            .map(|em| std::sync::Arc::clone(em.secrets()))
+                    });
+
+                if let Some(ss) = ss {
+                    let params =
+                        crate::secrets::CreateSecretParams::new(&req.extension_name, &req.token);
+                    match ss.create(&user.user_id, params).await {
+                        Ok(_) => {
+                            clear_auth_mode(&state, &user.user_id).await;
+                            crate::bridge::clear_engine_pending_auth(&user.user_id).await;
+                            state.sse.broadcast_for_user(
+                                &user.user_id,
+                                AppEvent::AuthCompleted {
+                                    extension_name: req.extension_name.clone(),
+                                    success: true,
+                                    message: format!(
+                                        "Credential '{}' stored successfully.",
+                                        req.extension_name
+                                    ),
+                                },
+                            );
+                            return Ok(Json(ActionResponse::ok(format!(
+                                "Credential '{}' stored.",
+                                req.extension_name
+                            ))));
+                        }
+                        Err(se) => {
+                            return Ok(Json(ActionResponse::fail(format!(
+                                "Failed to store credential: {se}"
+                            ))));
+                        }
+                    }
+                } else {
+                    return Ok(Json(ActionResponse::fail(format!(
+                        "Cannot store credential '{}': no secrets store configured.",
+                        req.extension_name
+                    ))));
+                }
+            }
+
             // Re-emit auth_required for retry on validation errors
             if matches!(e, crate::extensions::ExtensionError::ValidationFailed(_)) {
                 state.sse.broadcast_for_user(
@@ -1667,6 +1768,8 @@ async fn chat_auth_cancel_handler(
     Json(_req): Json<AuthCancelRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
     clear_auth_mode(&state, &user.user_id).await;
+    // Also clear engine v2 pending auth so the next message isn't consumed as a token.
+    crate::bridge::clear_engine_pending_auth(&user.user_id).await;
     Ok(Json(ActionResponse::ok("Auth cancelled")))
 }
 
@@ -1758,6 +1861,15 @@ struct HistoryQuery {
     before: Option<String>,
 }
 
+/// Check engine v2 pending auth state and return a PendingAuthInfo if active.
+async fn engine_pending_auth_info(user_id: &str) -> Option<PendingAuthInfo> {
+    let (cred_name, instructions) = crate::bridge::get_engine_pending_auth(user_id).await?;
+    Some(PendingAuthInfo {
+        extension_name: cred_name,
+        instructions,
+    })
+}
+
 async fn chat_history_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
@@ -1831,6 +1943,7 @@ async fn chat_history_handler(
             has_more,
             oldest_timestamp,
             pending_approval: None,
+            pending_auth: engine_pending_auth_info(&user.user_id).await,
         }));
     }
 
@@ -1886,6 +1999,7 @@ async fn chat_history_handler(
             has_more: false,
             oldest_timestamp: None,
             pending_approval,
+            pending_auth: engine_pending_auth_info(&user.user_id).await,
         }));
     }
 
@@ -1905,6 +2019,7 @@ async fn chat_history_handler(
                 has_more,
                 oldest_timestamp,
                 pending_approval: None,
+                pending_auth: engine_pending_auth_info(&user.user_id).await,
             }));
         }
     }
@@ -1916,6 +2031,7 @@ async fn chat_history_handler(
         has_more: false,
         oldest_timestamp: None,
         pending_approval: None,
+        pending_auth: engine_pending_auth_info(&user.user_id).await,
     }))
 }
 
@@ -2028,7 +2144,7 @@ async fn chat_new_thread_handler(
     let session = session_manager.get_or_create_session(&user.user_id).await;
     let (thread_id, info) = {
         let mut sess = session.lock().await;
-        let thread = sess.create_thread();
+        let thread = sess.create_thread(Some("gateway"));
         let id = thread.id;
         let info = ThreadInfo {
             id: thread.id,
@@ -2047,7 +2163,7 @@ async fn chat_new_thread_handler(
     // so that the subsequent loadThreads() call from the frontend sees it.
     if let Some(ref store) = state.store {
         match store
-            .ensure_conversation(thread_id, "gateway", &user.user_id, None)
+            .ensure_conversation(thread_id, "gateway", &user.user_id, None, Some("gateway"))
             .await
         {
             Ok(true) => {}

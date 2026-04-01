@@ -894,6 +894,14 @@ impl Channel for ReplChannel {
             | StatusUpdate::CostGuard { .. } => {
                 // Infrastructure status events are only rendered by the TUI
             }
+            StatusUpdate::SkillActivated { skill_names } => {
+                if !skill_names.is_empty() {
+                    eprintln!(
+                        "  \x1b[36m\u{25C8} skills: {}\x1b[0m",
+                        skill_names.join(", ")
+                    );
+                }
+            }
         }
         Ok(())
     }

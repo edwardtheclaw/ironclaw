@@ -49,10 +49,10 @@ use crate::db::Database;
 use crate::error::ChannelError;
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
-use crate::skills::catalog::SkillCatalog;
-use crate::skills::registry::SkillRegistry;
 use crate::tools::ToolRegistry;
 use crate::workspace::Workspace;
+use ironclaw_skills::catalog::SkillCatalog;
+use ironclaw_skills::registry::SkillRegistry;
 
 use self::log_layer::{LogBroadcaster, LogLevelHandle};
 
@@ -515,6 +515,10 @@ impl Channel for GatewayChannel {
                 status,
                 session_id: None,
                 fallback_deliverable: None,
+            },
+            StatusUpdate::SkillActivated { skill_names } => AppEvent::SkillActivated {
+                skill_names,
+                thread_id,
             },
             StatusUpdate::RoutineUpdate { .. }
             | StatusUpdate::ContextPressure { .. }
