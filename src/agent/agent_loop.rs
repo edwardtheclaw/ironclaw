@@ -336,13 +336,29 @@ impl Agent {
     /// [`TenantCtx`] provides a [`TenantScope`] that auto-binds `user_id` on
     /// every database operation and a per-user rate limiter.
     pub(super) async fn tenant_ctx(&self, user_id: &str) -> crate::tenant::TenantCtx {
+        use crate::ownership::{Identity, OwnerId, UserRole};
+        // Bridge: creates Member identity from raw string.
+        // Will be replaced by OwnershipCache lookup in Task 9.
+        let identity = Identity::new(OwnerId::from(user_id), UserRole::Member);
+        self.tenant_ctx_with_identity(identity).await
+    }
+
+    /// Build a tenant-scoped execution context from a resolved `Identity`.
+    ///
+    /// Preferred over [`tenant_ctx`](Self::tenant_ctx) once the call site has a
+    /// full `Identity` available.
+    pub(super) async fn tenant_ctx_with_identity(
+        &self,
+        identity: crate::ownership::Identity,
+    ) -> crate::tenant::TenantCtx {
+        let user_id = identity.owner_id.as_str();
         let rate = self.deps.tenant_rates.get_or_create(user_id).await;
 
         let store = self
             .deps
             .store
             .as_ref()
-            .map(|db| crate::tenant::TenantScope::new(user_id, Arc::clone(db)));
+            .map(|db| crate::tenant::TenantScope::with_identity(identity.clone(), Arc::clone(db)));
 
         // Reuse the owner workspace if user matches, otherwise create per-user.
         // Per-user workspaces are seeded on first creation so they get identity
@@ -367,7 +383,7 @@ impl Agent {
         };
 
         crate::tenant::TenantCtx::new(
-            user_id,
+            identity,
             store,
             workspace,
             Arc::clone(&self.deps.cost_guard),
