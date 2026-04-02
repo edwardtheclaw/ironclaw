@@ -473,11 +473,13 @@ mod tests {
         let error = outcome.error.unwrap();
         assert!(
             error.contains("Registry unreachable")
+                || error.contains("Registry returned status")
                 || error.contains("connect")
                 || error.contains("502")
                 || error.contains("503")
-                || error.contains("504"),
-            "Expected connection or gateway error, got: {error}",
+                || error.contains("504")
+                || error.contains("403"),
+            "Expected connection, gateway, or proxy-blocked error, got: {error}",
         );
     }
 

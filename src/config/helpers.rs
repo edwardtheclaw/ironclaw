@@ -297,6 +297,15 @@ pub(crate) fn validate_base_url(url: &str, field_name: &str) -> Result<(), Confi
         // before the async runtime is fully driving I/O. If this ever moves to
         // a hot path, wrap in `tokio::task::spawn_blocking` or use
         // `tokio::net::lookup_host`.
+
+        // In test builds, allow skipping DNS resolution so unit tests can run
+        // without network access. The SSRF IP checks above still apply to
+        // IP-literal URLs.
+        #[cfg(test)]
+        if std::env::var("IRONCLAW_SKIP_DNS_VALIDATION").is_ok() {
+            return Ok(());
+        }
+
         use std::net::ToSocketAddrs;
         let port = parsed.port().unwrap_or(443);
         match (host, port).to_socket_addrs() {

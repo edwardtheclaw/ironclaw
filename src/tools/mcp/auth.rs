@@ -1930,7 +1930,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_url_safe_https() {
-        assert!(validate_url_safe("https://example.com/path").await.is_ok());
+        // Use a public IP literal to avoid DNS resolution in offline environments.
+        // 93.184.215.14 is example.com's IP — used as a non-private, non-loopback address.
+        assert!(
+            validate_url_safe("https://93.184.215.14/path")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
