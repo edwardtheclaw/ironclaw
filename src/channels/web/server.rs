@@ -1741,14 +1741,24 @@ pub async fn clear_auth_mode(state: &GatewayState, user_id: &str) {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct ChatEventsQuery {
+    #[serde(default)]
+    debug: bool,
+}
+
 async fn chat_events_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
+    Query(query): Query<ChatEventsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let sse = state.sse.subscribe(Some(user.user_id)).ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Too many connections".to_string(),
-    ))?;
+    let sse = state
+        .sse
+        .subscribe(Some(user.user_id), query.debug)
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many connections".to_string(),
+        ))?;
     Ok((
         [("X-Accel-Buffering", "no"), ("Cache-Control", "no-cache")],
         sse,
@@ -2882,6 +2892,11 @@ struct GatewayStatusResponse {
 struct DebugPromptResponse {
     components: Vec<DebugPromptComponent>,
     total_estimated_tokens: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_prompt: Option<String>,
+    model: String,
+    context_limit: usize,
+    note: &'static str,
 }
 
 #[derive(serde::Serialize)]
@@ -2939,10 +2954,23 @@ async fn debug_prompt_handler(
         }
     }
 
+    // Assemble full system prompt if workspace supports it.
+    let system_prompt = match workspace
+        .system_prompt_for_context_tz(false, chrono_tz::UTC)
+        .await
+    {
+        Ok(prompt) if !prompt.is_empty() => Some(prompt),
+        _ => None,
+    };
+
     let total: usize = components.iter().map(|c| c.estimated_tokens).sum();
     Ok(Json(DebugPromptResponse {
         components,
         total_estimated_tokens: total,
+        system_prompt,
+        model: state.active_config.llm_model.clone(),
+        context_limit: 100_000,
+        note: "reconstructed, may differ from last turn",
     }))
 }
 

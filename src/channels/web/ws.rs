@@ -77,7 +77,8 @@ pub async fn handle_ws_connection(
 
     // Subscribe to broadcast events (same source as SSE), scoped to this user.
     // Reject if we've hit the connection limit.
-    let Some(raw_stream) = state.sse.subscribe_raw(Some(user.user_id.clone())) else {
+    // TODO: Accept debug flag from WebSocket query params when needed.
+    let Some(raw_stream) = state.sse.subscribe_raw(Some(user.user_id.clone()), false) else {
         tracing::warn!("WebSocket rejected: too many connections");
         // Decrement the WS tracker we already incremented above.
         if let Some(ref tracker) = tracker_for_drop {

@@ -353,6 +353,21 @@ pub enum StatusUpdate {
         output_tokens: u64,
         cost_usd: String,
     },
+    /// Full (non-truncated) tool output (verbose/debug mode only).
+    ToolResultFull {
+        name: String,
+        output: String,
+        truncated: bool,
+    },
+    /// Per-LLM-call metrics with model, tokens, and timing (verbose/debug mode only).
+    TurnMetrics {
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        model: String,
+        duration_ms: u64,
+        iteration: usize,
+    },
 }
 
 /// Shared chat-style approval prompt formatting used by non-web channels.
@@ -372,9 +387,10 @@ const APPROVAL_SUMMARY_DESCRIPTION_BYTES: usize = 120;
 impl StatusUpdate {
     /// Build a `ToolCompleted` status with redacted parameters.
     ///
-    /// On failure, serializes the tool's input parameters as pretty JSON after
-    /// replacing any keys listed in the tool's `sensitive_params()` with
-    /// `"[REDACTED]"`. On success, no parameters or error are included.
+    /// Serializes the tool's input parameters as pretty JSON after replacing
+    /// any keys listed in the tool's `sensitive_params()` with `"[REDACTED]"`.
+    /// Parameters are always included (for debug panel visibility).
+    /// Error message is populated only on failure.
     ///
     /// Pass the resolved `Tool` reference (if available) so this method can
     /// query `sensitive_params()` directly — callers don't need to manage the
@@ -387,16 +403,13 @@ impl StatusUpdate {
     ) -> Self {
         let success = result.is_ok();
         let sensitive = tool.map(|t| t.sensitive_params()).unwrap_or(&[]);
+        let safe = crate::tools::redact_params(params, sensitive);
+        let params_str = serde_json::to_string_pretty(&safe).unwrap_or_else(|_| safe.to_string());
         Self::ToolCompleted {
             name,
             success,
             error: result.as_ref().err().map(|e| e.to_string()),
-            parameters: if !success {
-                let safe = crate::tools::redact_params(params, sensitive);
-                Some(serde_json::to_string_pretty(&safe).unwrap_or_else(|_| safe.to_string()))
-            } else {
-                None
-            },
+            parameters: Some(params_str),
         }
     }
 }
@@ -699,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_completed_no_params_on_success() {
+    fn tool_completed_includes_redacted_params_on_success() {
         let params = serde_json::json!({"name": "key", "value": "secret"});
         let ok: Result<String, crate::error::Error> = Ok("done".into());
 
@@ -714,7 +727,8 @@ mod tests {
         {
             assert!(success);
             assert!(error.is_none());
-            assert!(parameters.is_none(), "no params should be sent on success");
+            // Parameters are always included (redacted) for debug panel visibility.
+            assert!(parameters.is_some(), "params should always be included");
         } else {
             panic!("expected ToolCompleted variant");
         }

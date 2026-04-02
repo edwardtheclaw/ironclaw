@@ -240,16 +240,6 @@ pub async fn clear_auth_mode(state: &GatewayState, user_id: &str) {
     }
 }
 
-pub async fn chat_events_handler(
-    State(state): State<Arc<GatewayState>>,
-    AuthenticatedUser(user): AuthenticatedUser,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    state.sse.subscribe(Some(user.user_id)).ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Too many connections".to_string(),
-    ))
-}
-
 pub async fn chat_ws_handler(
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,

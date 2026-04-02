@@ -108,6 +108,7 @@ impl SseManager {
     pub fn subscribe_raw(
         &self,
         user_id: Option<String>,
+        verbose: bool,
     ) -> Option<impl Stream<Item = AppEvent> + Send + 'static + use<>> {
         // Atomically increment only if below the limit. This prevents
         // concurrent callers from overshooting max_connections.
@@ -128,12 +129,14 @@ impl SseManager {
             Ok(scoped) => {
                 // Global events (user_id=None) always pass through.
                 // Scoped events only pass if the subscriber matches (or subscriber is unscoped).
-                match (&user_id, &scoped.user_id) {
+                let event = match (&user_id, &scoped.user_id) {
                     (_, None) => Some(scoped.event), // global -> all
                     (None, _) => Some(scoped.event), // unscoped subscriber -> all
                     (Some(sub), Some(ev)) if sub == ev => Some(scoped.event), // match
                     _ => None,                       // different user -> skip
-                }
+                };
+                // Filter verbose-only events for non-verbose subscribers.
+                event.filter(|e| verbose || !e.is_verbose_only())
             }
             Err(_) => None,
         });
@@ -153,6 +156,7 @@ impl SseManager {
     pub fn subscribe(
         &self,
         user_id: Option<String>,
+        verbose: bool,
     ) -> Option<Sse<impl Stream<Item = Result<Event, Infallible>> + Send + 'static + use<>>> {
         // Atomically increment only if below the limit.
         let counter = Arc::clone(&self.connection_count);
@@ -170,12 +174,15 @@ impl SseManager {
 
         let stream = BroadcastStream::new(rx)
             .filter_map(move |result| match result {
-                Ok(scoped) => match (&user_id, &scoped.user_id) {
-                    (_, None) => Some(scoped.event),
-                    (None, _) => Some(scoped.event),
-                    (Some(sub), Some(ev)) if sub == ev => Some(scoped.event),
-                    _ => None,
-                },
+                Ok(scoped) => {
+                    let event = match (&user_id, &scoped.user_id) {
+                        (_, None) => Some(scoped.event),
+                        (None, _) => Some(scoped.event),
+                        (Some(sub), Some(ev)) if sub == ev => Some(scoped.event),
+                        _ => None,
+                    };
+                    event.filter(|e| verbose || !e.is_verbose_only())
+                }
                 Err(_) => None,
             })
             .filter_map(|event| {
@@ -255,7 +262,11 @@ mod tests {
     #[tokio::test]
     async fn test_broadcast_to_receiver() {
         let manager = SseManager::new();
-        let mut stream = Box::pin(manager.subscribe_raw(None).expect("should subscribe"));
+        let mut stream = Box::pin(
+            manager
+                .subscribe_raw(None, false)
+                .expect("should subscribe"),
+        );
 
         manager.broadcast(AppEvent::Status {
             message: "test".to_string(),
@@ -272,7 +283,11 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_raw_receives_events() {
         let manager = SseManager::new();
-        let mut stream = Box::pin(manager.subscribe_raw(None).expect("should subscribe"));
+        let mut stream = Box::pin(
+            manager
+                .subscribe_raw(None, false)
+                .expect("should subscribe"),
+        );
 
         assert_eq!(manager.connection_count(), 1);
 
@@ -292,7 +307,11 @@ mod tests {
     async fn test_subscribe_raw_decrements_on_drop() {
         let manager = SseManager::new();
         {
-            let _stream = Box::pin(manager.subscribe_raw(None).expect("should subscribe"));
+            let _stream = Box::pin(
+                manager
+                    .subscribe_raw(None, false)
+                    .expect("should subscribe"),
+            );
             assert_eq!(manager.connection_count(), 1);
         }
         // Stream dropped, counter should decrement
@@ -302,8 +321,16 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_raw_multiple_subscribers() {
         let manager = SseManager::new();
-        let mut s1 = Box::pin(manager.subscribe_raw(None).expect("should subscribe"));
-        let mut s2 = Box::pin(manager.subscribe_raw(None).expect("should subscribe"));
+        let mut s1 = Box::pin(
+            manager
+                .subscribe_raw(None, false)
+                .expect("should subscribe"),
+        );
+        let mut s2 = Box::pin(
+            manager
+                .subscribe_raw(None, false)
+                .expect("should subscribe"),
+        );
         assert_eq!(manager.connection_count(), 2);
 
         manager.broadcast(AppEvent::Heartbeat);
@@ -324,13 +351,21 @@ mod tests {
         let mut manager = SseManager::new();
         manager.max_connections = 2; // Low limit for testing
 
-        let _s1 = Box::pin(manager.subscribe_raw(None).expect("first should succeed"));
-        let _s2 = Box::pin(manager.subscribe_raw(None).expect("second should succeed"));
+        let _s1 = Box::pin(
+            manager
+                .subscribe_raw(None, false)
+                .expect("first should succeed"),
+        );
+        let _s2 = Box::pin(
+            manager
+                .subscribe_raw(None, false)
+                .expect("second should succeed"),
+        );
         assert_eq!(manager.connection_count(), 2);
 
         // Third should be rejected
-        assert!(manager.subscribe_raw(None).is_none());
-        assert!(manager.subscribe(None).is_none());
+        assert!(manager.subscribe_raw(None, false).is_none());
+        assert!(manager.subscribe(None, false).is_none());
     }
 
     #[tokio::test]
@@ -338,12 +373,12 @@ mod tests {
         let manager = SseManager::new();
         let mut alice = Box::pin(
             manager
-                .subscribe_raw(Some("alice".to_string()))
+                .subscribe_raw(Some("alice".to_string()), false)
                 .expect("subscribe"),
         );
         let mut bob = Box::pin(
             manager
-                .subscribe_raw(Some("bob".to_string()))
+                .subscribe_raw(Some("bob".to_string()), false)
                 .expect("subscribe"),
         );
 
@@ -370,5 +405,44 @@ mod tests {
         // Bob only gets the global heartbeat (alice's event was filtered)
         let e = bob.next().await.unwrap(); // safety: test-only
         assert!(matches!(e, AppEvent::Heartbeat)); // safety: test assertion
+    }
+
+    #[tokio::test]
+    async fn test_verbose_filtering() {
+        let manager = SseManager::new();
+        let mut verbose = Box::pin(
+            manager
+                .subscribe_raw(None, true)
+                .expect("verbose subscribe"),
+        );
+        let mut normal = Box::pin(
+            manager
+                .subscribe_raw(None, false)
+                .expect("normal subscribe"),
+        );
+
+        // Broadcast a verbose-only event
+        manager.broadcast(AppEvent::TurnMetrics {
+            thread_id: None,
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 0,
+            model: "test-model".to_string(),
+            duration_ms: 200,
+            iteration: 0,
+        });
+
+        // Broadcast a normal event
+        manager.broadcast(AppEvent::Heartbeat);
+
+        // Verbose subscriber gets both events
+        let e = verbose.next().await.unwrap();
+        assert!(matches!(e, AppEvent::TurnMetrics { .. }));
+        let e = verbose.next().await.unwrap();
+        assert!(matches!(e, AppEvent::Heartbeat));
+
+        // Normal subscriber only gets the heartbeat (TurnMetrics filtered)
+        let e = normal.next().await.unwrap();
+        assert!(matches!(e, AppEvent::Heartbeat));
     }
 }

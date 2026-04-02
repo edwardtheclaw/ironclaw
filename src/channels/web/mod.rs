@@ -503,6 +503,32 @@ impl Channel for GatewayChannel {
                 cost_usd,
                 thread_id,
             },
+            StatusUpdate::ToolResultFull {
+                name,
+                output,
+                truncated,
+            } => AppEvent::ToolResultFull {
+                name,
+                output,
+                truncated: if truncated { Some(true) } else { None },
+                thread_id,
+            },
+            StatusUpdate::TurnMetrics {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                model,
+                duration_ms,
+                iteration,
+            } => AppEvent::TurnMetrics {
+                thread_id,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                model,
+                duration_ms,
+                iteration,
+            },
         };
 
         // Scope events to the user when user_id is available in metadata.

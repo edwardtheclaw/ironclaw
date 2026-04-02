@@ -15,13 +15,16 @@
   let debugActive = false;
   let panelOpen = false;
   let activeTab = 'activity';
-  let activityLog = [];
+  let activityLog = [];    // all entries across turns
   let pendingTools = {};
+  let currentTurn = 0;     // increments on each user message
+  let viewingTurn = 0;     // which turn the Activity tab is showing
   let overlay = null;
   let panelEl = null;
   let toolbarBtn = null;
   let statsTimer = null;
   let sseReconnects = 0;
+  let totalEventsReceived = 0;
   let lastEventTime = null;
 
   let sessionStats = {
@@ -43,6 +46,9 @@
 
     activeTab = sessionStorage.getItem(SESSION_TAB_KEY) || 'activity';
     panelOpen = sessionStorage.getItem(SESSION_OPEN_KEY) !== 'false';
+
+    currentTurn = 1;
+    viewingTurn = 1;
 
     createToolbarButton();
     createPanel();
@@ -215,11 +221,13 @@
   var currentEventSource = null;
 
   function hookSSE() {
+    var isFirstConnect = true;
     // Register hook for app.js to call after creating eventSource
     window.onDebugSSEConnect = function (es) {
       currentEventSource = es;
       attachDebugListeners(es);
-      sseReconnects++;
+      if (!isFirstConnect) sseReconnects++;
+      isFirstConnect = false;
     };
 
     // Trigger a reconnect so the hook fires with debug=true URL
@@ -234,7 +242,7 @@
         var data = JSON.parse(e.data);
         addActivity('think', t('debug.activityStatus'), timeNow(), null, data.message || null);
       } catch (_) { /* ignore */ }
-      lastEventTime = Date.now();
+      lastEventTime = Date.now(); totalEventsReceived++;
     });
 
     es.addEventListener('thinking', function (e) {
@@ -242,7 +250,7 @@
         var data = JSON.parse(e.data);
         addActivity('think', t('debug.activityThinking'), timeNow(), null, data.message || null);
       } catch (_) { /* ignore */ }
-      lastEventTime = Date.now();
+      lastEventTime = Date.now(); totalEventsReceived++;
     });
 
     es.addEventListener('tool_started', function (e) {
@@ -253,7 +261,7 @@
         sessionStats.toolCalls++;
         updateStatsDisplay();
       } catch (_) { /* ignore */ }
-      lastEventTime = Date.now();
+      lastEventTime = Date.now(); totalEventsReceived++;
     });
 
     es.addEventListener('tool_completed', function (e) {
@@ -273,13 +281,15 @@
 
         if (pending) {
           updateActivity(pending.id, status, meta, extra);
-          delete pendingTools[data.name];
+          // Keep in pendingTools so tool_result / tool_result_full can still find it.
+          // Clean up after a short delay to handle late-arriving events.
+          setTimeout(function () { delete pendingTools[data.name]; }, 5000);
         } else {
           addActivity('tool', data.name || 'tool', meta, status, null, extra);
         }
         updateStatsDisplay();
       } catch (_) { /* ignore */ }
-      lastEventTime = Date.now();
+      lastEventTime = Date.now(); totalEventsReceived++;
     });
 
     es.addEventListener('tool_result', function (e) {
@@ -290,7 +300,7 @@
           appendActivityOutput(pending.id, data.preview || '');
         }
       } catch (_) { /* ignore */ }
-      lastEventTime = Date.now();
+      lastEventTime = Date.now(); totalEventsReceived++;
     });
 
     es.addEventListener('reasoning_update', function (e) {
@@ -304,7 +314,7 @@
         }
         addActivity('think', t('debug.activityReasoning'), timeNow(), null, body);
       } catch (_) { /* ignore */ }
-      lastEventTime = Date.now();
+      lastEventTime = Date.now(); totalEventsReceived++;
     });
 
     es.addEventListener('turn_cost', function (e) {
@@ -325,7 +335,7 @@
         // Refresh gateway stats to pick up latest model usage
         fetchGatewayStats();
       } catch (_) { /* ignore */ }
-      lastEventTime = Date.now();
+      lastEventTime = Date.now(); totalEventsReceived++;
     });
 
     es.addEventListener('response', function (e) {
@@ -335,7 +345,7 @@
         if ((data.content || '').length > 100) preview += '...';
         addActivity('stream', t('debug.activityResponse'), timeNow(), 'success', preview);
       } catch (_) { /* ignore */ }
-      lastEventTime = Date.now();
+      lastEventTime = Date.now(); totalEventsReceived++;
     });
 
     es.addEventListener('error', function (e) {
@@ -343,22 +353,65 @@
         var data = JSON.parse(e.data);
         addActivity('error', t('debug.activityError'), timeNow(), 'failure', data.message || null);
       } catch (_) { /* ignore */ }
-      lastEventTime = Date.now();
+      lastEventTime = Date.now(); totalEventsReceived++;
+    });
+
+    es.addEventListener('turn_metrics', function (e) {
+      try {
+        var data = JSON.parse(e.data);
+        var info = 'Model: ' + data.model;
+        info += '\nIn: ' + formatNumber(data.input_tokens || 0) + 't  Out: ' + formatNumber(data.output_tokens || 0) + 't';
+        if (data.cache_read_tokens) info += '  Cache: ' + formatNumber(data.cache_read_tokens) + 't';
+        var duration = data.duration_ms ? formatDuration(data.duration_ms) : '';
+        addActivity('llm', 'LLM Call #' + (data.iteration + 1), duration, null, null, { info: info });
+      } catch (_) { /* ignore */ }
+      lastEventTime = Date.now(); totalEventsReceived++;
+    });
+
+    es.addEventListener('tool_result_full', function (e) {
+      try {
+        var data = JSON.parse(e.data);
+        var pending = pendingTools[data.name];
+        if (pending) {
+          appendActivityOutput(pending.id, data.output || '');
+        }
+      } catch (_) { /* ignore */ }
+      lastEventTime = Date.now(); totalEventsReceived++;
     });
 
     es.addEventListener('stream_chunk', function () {
-      lastEventTime = Date.now();
+      lastEventTime = Date.now(); totalEventsReceived++;
     });
   }
 
-  // ── Hook send message to clear activity ──
+  // ── Hook send message to start new turn ──
 
   function hookSendMessage() {
     var origSend = window.sendMessage;
     if (typeof origSend === 'function') {
       window.sendMessage = function () {
-        clearActivity();
+        startNewTurn();
         return origSend.apply(window, arguments);
+      };
+    }
+
+    // Hook addMessage to stamp user messages with turn number + add click handler
+    var origAddMessage = window.addMessage;
+    if (typeof origAddMessage === 'function') {
+      window.addMessage = function (role, content) {
+        var el = origAddMessage.apply(window, arguments);
+        if (el) {
+          el.setAttribute('data-debug-turn', String(currentTurn));
+          el.addEventListener('click', function () {
+            var turn = parseInt(el.getAttribute('data-debug-turn'), 10);
+            if (turn && turn > 0) {
+              viewTurn(turn);
+              if (!panelOpen) openPanel();
+              switchDebugTab('activity');
+            }
+          });
+        }
+        return el;
       };
     }
   }
@@ -373,7 +426,7 @@
     var timeStr = meta && /^\d{2}:\d{2}:\d{2}$/.test(meta) ? meta : '';
     if (timeStr && activityLog.length > 0) {
       var last = activityLog[activityLog.length - 1];
-      if (last.type === type && last.meta === timeStr && !status && !last.status) {
+      if (last.turn === currentTurn && last.type === type && last.meta === timeStr && !status && !last.status) {
         // Append body text to the previous entry
         var newBody = body || '';
         if (last.body && newBody) {
@@ -405,7 +458,7 @@
     }
 
     var id = ++activityIdCounter;
-    var entry = { id: id, type: type, label: label, meta: meta || '', status: status, body: body || '', time: now };
+    var entry = { id: id, turn: currentTurn, type: type, label: label, meta: meta || '', status: status, body: body || '', time: now };
     if (extra) {
       if (extra.params) entry.params = extra.params;
       if (extra.output) entry.output = extra.output;
@@ -415,12 +468,13 @@
 
     // Eviction
     while (activityLog.length > MAX_ACTIVITY) {
-      var removed = activityLog.shift();
-      var el = document.getElementById('debug-activity-' + removed.id);
-      if (el) el.remove();
+      activityLog.shift();
     }
 
-    renderActivityEntry(entry);
+    // Only render if viewing the current turn
+    if (viewingTurn === currentTurn) {
+      renderActivityEntry(entry);
+    }
     return id;
   }
 
@@ -511,19 +565,44 @@
     }
   }
 
-  function clearActivity() {
-    activityLog = [];
+  function startNewTurn() {
     pendingTools = {};
-    activityIdCounter = 0;
-    var list = document.getElementById('debug-activity-list');
-    if (list) {
-      list.textContent = '';
-      var notice = document.createElement('div');
-      notice.className = 'debug-activity-clear-notice';
-      notice.setAttribute('data-i18n', 'debug.activityCleared');
-      notice.textContent = t('debug.activityCleared');
-      list.appendChild(notice);
+    currentTurn++;
+    viewingTurn = currentTurn;
+    // Evict oldest entries if over cap
+    while (activityLog.length > MAX_ACTIVITY) {
+      activityLog.shift();
     }
+    rebuildActivityDOM();
+    updateTurnNav();
+  }
+
+  function entriesForTurn(turn) {
+    return activityLog.filter(function (e) { return e.turn === turn; });
+  }
+
+  function maxTurn() {
+    return currentTurn;
+  }
+
+  function viewTurn(turn) {
+    if (turn < 1) turn = 1;
+    if (turn > maxTurn()) turn = maxTurn();
+    viewingTurn = turn;
+    rebuildActivityDOM();
+    updateTurnNav();
+  }
+
+  function updateTurnNav() {
+    var nav = document.getElementById('debug-turn-nav');
+    if (!nav) return;
+    var label = nav.querySelector('.debug-turn-label');
+    var prevBtn = nav.querySelector('.debug-turn-prev');
+    var nextBtn = nav.querySelector('.debug-turn-next');
+    if (label) label.textContent = t('debug.activityTurn') + ' ' + viewingTurn + ' / ' + maxTurn();
+    if (prevBtn) prevBtn.disabled = viewingTurn <= 1;
+    if (nextBtn) nextBtn.disabled = viewingTurn >= maxTurn();
+    nav.style.display = maxTurn() > 0 ? 'flex' : 'none';
   }
 
   function rebuildActivityDOM() {
@@ -531,7 +610,9 @@
     if (!list) return;
     list.textContent = '';
 
-    if (activityLog.length === 0) {
+    var entries = entriesForTurn(viewingTurn);
+
+    if (entries.length === 0) {
       var empty = document.createElement('div');
       empty.className = 'debug-activity-empty';
       empty.setAttribute('data-i18n', 'debug.activityEmpty');
@@ -540,7 +621,7 @@
       return;
     }
 
-    activityLog.forEach(function (entry) {
+    entries.forEach(function (entry) {
       renderActivityEntry(entry);
     });
   }
@@ -665,7 +746,7 @@
 
     var llmCalls = 0;
     var toolCalls = 0;
-    activityLog.forEach(function (e) {
+    entriesForTurn(viewingTurn).forEach(function (e) {
       if (e.type === 'llm') llmCalls++;
       if (e.type === 'tool') toolCalls++;
     });
@@ -700,6 +781,15 @@
     header.appendChild(total);
     header.appendChild(refreshBtn);
 
+    var progress = document.createElement('progress');
+    progress.className = 'debug-prompt-progress';
+    progress.id = 'debug-prompt-progress';
+    progress.max = 100000;
+    progress.value = 0;
+
+    pane.appendChild(header);
+    pane.appendChild(progress);
+
     var body = document.createElement('div');
     body.id = 'debug-prompt-body';
 
@@ -709,11 +799,45 @@
     empty.textContent = t('debug.promptEmpty');
     body.appendChild(empty);
 
-    pane.appendChild(header);
     pane.appendChild(body);
   }
 
   function buildActivityPane(pane) {
+    // Turn navigation bar
+    var nav = document.createElement('div');
+    nav.className = 'debug-turn-nav';
+    nav.id = 'debug-turn-nav';
+    nav.style.display = 'none';
+
+    var prevBtn = document.createElement('button');
+    prevBtn.className = 'debug-turn-prev';
+    prevBtn.textContent = '\u25C0';
+    prevBtn.title = t('debug.activityPrevTurn');
+    prevBtn.addEventListener('click', function () { viewTurn(viewingTurn - 1); });
+
+    var turnLabel = document.createElement('span');
+    turnLabel.className = 'debug-turn-label';
+    turnLabel.textContent = '';
+
+    var nextBtn = document.createElement('button');
+    nextBtn.className = 'debug-turn-next';
+    nextBtn.textContent = '\u25B6';
+    nextBtn.title = t('debug.activityNextTurn');
+    nextBtn.addEventListener('click', function () { viewTurn(viewingTurn + 1); });
+
+    var latestBtn = document.createElement('button');
+    latestBtn.className = 'debug-turn-latest';
+    latestBtn.textContent = t('debug.activityLatest');
+    latestBtn.addEventListener('click', function () { viewTurn(maxTurn()); });
+
+    nav.appendChild(prevBtn);
+    nav.appendChild(turnLabel);
+    nav.appendChild(nextBtn);
+    nav.appendChild(latestBtn);
+
+    pane.appendChild(nav);
+
+    // Activity list
     var list = document.createElement('div');
     list.className = 'debug-activity-list';
     list.id = 'debug-activity-list';
@@ -834,6 +958,7 @@
     var detail = document.createElement('div');
     detail.className = 'debug-sse-detail';
     var parts = [t('debug.statsSseReconnects') + ': ' + sseReconnects];
+    parts.push(t('debug.statsSseEvents') + ': ' + totalEventsReceived);
     if (lastEventTime) {
       var ago = Math.round((Date.now() - lastEventTime) / 1000);
       parts.push(t('debug.statsSseLastEvent') + ': ' + ago + 's');
@@ -874,14 +999,36 @@
   }
 
   function renderPromptData(data) {
+    // Header: model + token progress
     var totalEl = document.getElementById('debug-prompt-total');
     if (totalEl) {
       totalEl.textContent = '';
-      var label = document.createTextNode(t('debug.promptTotal') + ': ');
+
+      // Model name
+      if (data.model) {
+        var modelSpan = document.createElement('span');
+        modelSpan.className = 'debug-prompt-model';
+        modelSpan.textContent = data.model;
+        totalEl.appendChild(modelSpan);
+        totalEl.appendChild(document.createTextNode(' \u00B7 '));
+      }
+
+      var tokensUsed = data.total_estimated_tokens || 0;
+      var contextLimit = data.context_limit || 100000;
       var strong = document.createElement('strong');
-      strong.textContent = formatNumber(data.total_estimated_tokens || 0) + ' tokens';
-      totalEl.appendChild(label);
+      strong.textContent = formatNumber(tokensUsed) + ' / ' + formatNumber(contextLimit) + ' tokens';
       totalEl.appendChild(strong);
+    }
+
+    // Context usage progress bar
+    var progressEl = document.getElementById('debug-prompt-progress');
+    if (progressEl) {
+      var used = data.total_estimated_tokens || 0;
+      var limit = data.context_limit || 100000;
+      var pct = Math.min(100, Math.round((used / limit) * 100));
+      progressEl.value = used;
+      progressEl.max = limit;
+      progressEl.title = pct + '% (' + formatNumber(used) + ' / ' + formatNumber(limit) + ')';
     }
 
     var body = document.getElementById('debug-prompt-body');
@@ -896,6 +1043,7 @@
       return;
     }
 
+    // Component breakdown
     data.components.forEach(function (comp) {
       var details = document.createElement('details');
       details.className = 'debug-prompt-section';
@@ -925,6 +1073,37 @@
       details.appendChild(content);
       body.appendChild(details);
     });
+
+    // Full assembled system prompt (collapsed by default)
+    if (data.system_prompt) {
+      var fullDetails = document.createElement('details');
+      fullDetails.className = 'debug-prompt-section';
+
+      var fullSummary = document.createElement('summary');
+      var fullLabel = document.createElement('span');
+      fullLabel.textContent = t('debug.promptFull');
+      var fullBadge = document.createElement('span');
+      fullBadge.className = 'debug-prompt-badge';
+      fullBadge.textContent = formatNumber(data.total_estimated_tokens || 0) + ' tok';
+      fullSummary.appendChild(fullLabel);
+      fullSummary.appendChild(fullBadge);
+
+      var fullContent = document.createElement('pre');
+      fullContent.className = 'debug-prompt-full';
+      fullContent.textContent = data.system_prompt;
+
+      fullDetails.appendChild(fullSummary);
+      fullDetails.appendChild(fullContent);
+      body.appendChild(fullDetails);
+    }
+
+    // Note
+    if (data.note) {
+      var noteEl = document.createElement('div');
+      noteEl.className = 'debug-prompt-note';
+      noteEl.textContent = data.note;
+      body.appendChild(noteEl);
+    }
   }
 
   // ── Gateway stats fetch ──
