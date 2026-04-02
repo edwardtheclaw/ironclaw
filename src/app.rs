@@ -354,28 +354,23 @@ impl AppBuilder {
             ws = ws.with_memory_layers(self.config.workspace.memory_layers.clone());
             let ws = Arc::new(ws);
 
-            // Detect multi-tenant mode: when the database has registered users,
-            // each authenticated user needs their own workspace scope. Use
-            // WorkspacePool (which implements WorkspaceResolver) to create
-            // per-user workspaces on demand instead of sharing the startup
-            // workspace across all users.
+            // Memory tools must resolve by `ctx.user_id`, not a fixed startup
+            // workspace. Even outside authenticated multi-tenant mode, some
+            // channels and test harnesses route non-owner users through
+            // per-user tenant workspaces seeded on demand.
             let is_multi_tenant = db.has_any_users().await.unwrap_or(false);
-
-            if is_multi_tenant {
-                let pool = Arc::new(crate::channels::web::server::WorkspacePool::new(
-                    Arc::clone(db),
-                    embeddings.clone(),
-                    emb_cache_config,
-                    self.config.search.clone(),
-                    self.config.workspace.clone(),
-                ));
-                tools.register_memory_tools_with_resolver(pool);
-                tracing::info!(
-                    "Memory tools configured with per-user workspace resolver (multi-tenant mode)"
-                );
-            } else {
-                tools.register_memory_tools(Arc::clone(&ws));
-            }
+            let pool = Arc::new(crate::channels::web::server::WorkspacePool::new(
+                Arc::clone(db),
+                embeddings.clone(),
+                emb_cache_config,
+                self.config.search.clone(),
+                self.config.workspace.clone(),
+            ));
+            tools.register_memory_tools_with_resolver(pool);
+            tracing::info!(
+                multi_tenant = is_multi_tenant,
+                "Memory tools configured with per-user workspace resolver"
+            );
 
             Some(ws)
         } else {
