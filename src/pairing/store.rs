@@ -32,7 +32,10 @@ pub struct PairingStore {
 impl PairingStore {
     /// Create a DB-backed pairing store with cache write-through.
     pub fn new(db: Arc<dyn Database>, cache: Arc<OwnershipCache>) -> Self {
-        Self { db: Some(db), cache }
+        Self {
+            db: Some(db),
+            cache,
+        }
     }
 
     /// Create a no-op pairing store (for environments without a database).
@@ -72,7 +75,9 @@ impl PairingStore {
         meta: Option<serde_json::Value>,
     ) -> Result<PairingRequestRecord, DatabaseError> {
         let Some(ref db) = self.db else {
-            return Err(DatabaseError::Query("pairing unavailable: no database configured".to_string()));
+            return Err(DatabaseError::Query(
+                "pairing unavailable: no database configured".to_string(),
+            ));
         };
         db.upsert_pairing_request(channel, external_id, meta).await
     }
@@ -80,13 +85,11 @@ impl PairingStore {
     /// Approve a pairing code, mapping `(channel, external_id)` → `owner_id`.
     /// Updates DB atomically. Cache is populated on next `resolve_identity` call
     /// (we don't know channel/external_id here, so lazy cache population is correct).
-    pub async fn approve(
-        &self,
-        code: &str,
-        owner_id: &OwnerId,
-    ) -> Result<(), DatabaseError> {
+    pub async fn approve(&self, code: &str, owner_id: &OwnerId) -> Result<(), DatabaseError> {
         let Some(ref db) = self.db else {
-            return Err(DatabaseError::Query("pairing unavailable: no database configured".to_string()));
+            return Err(DatabaseError::Query(
+                "pairing unavailable: no database configured".to_string(),
+            ));
         };
         db.approve_pairing(code, owner_id.as_str()).await
     }
@@ -103,11 +106,7 @@ impl PairingStore {
     }
 
     /// Remove a channel identity (unlink). Evicts from cache.
-    pub async fn remove(
-        &self,
-        channel: &str,
-        external_id: &str,
-    ) -> Result<(), DatabaseError> {
+    pub async fn remove(&self, channel: &str, external_id: &str) -> Result<(), DatabaseError> {
         let Some(ref db) = self.db else {
             self.cache.evict(channel, external_id);
             return Ok(());

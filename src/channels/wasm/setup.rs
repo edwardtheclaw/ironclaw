@@ -246,7 +246,13 @@ async fn register_channel(
         // The credential injection system only replaces placeholders in URLs
         // and headers, so channels like Feishu that exchange app_id + app_secret
         // for a tenant token need the raw values in their config.
-        inject_channel_secrets_into_config(&channel_name, &config.owner_id, secrets_store, &mut config_updates).await;
+        inject_channel_secrets_into_config(
+            &channel_name,
+            &config.owner_id,
+            secrets_store,
+            &mut config_updates,
+        )
+        .await;
 
         if !config_updates.is_empty() {
             channel_arc.update_config(config_updates).await;

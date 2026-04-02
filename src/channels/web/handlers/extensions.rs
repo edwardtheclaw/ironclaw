@@ -64,10 +64,8 @@ pub async fn extensions_list_handler(
     let extensions = installed
         .into_iter()
         .map(|ext| {
-            let activation_status = derive_activation_status(
-                &ext,
-                owner_bound_channels.contains(&ext.name),
-            );
+            let activation_status =
+                derive_activation_status(&ext, owner_bound_channels.contains(&ext.name));
             ExtensionInfo {
                 name: ext.name,
                 display_name: ext.display_name,

@@ -63,7 +63,10 @@ pub struct Identity {
 
 impl Identity {
     pub fn new(owner_id: impl Into<OwnerId>, role: UserRole) -> Self {
-        Self { owner_id: owner_id.into(), role }
+        Self {
+            owner_id: owner_id.into(),
+            role,
+        }
     }
 }
 
@@ -85,20 +88,29 @@ mod tests {
 
     #[test]
     fn test_can_act_on_own_resource() {
-        let actor = Identity { owner_id: OwnerId::from("alice"), role: UserRole::Member };
+        let actor = Identity {
+            owner_id: OwnerId::from("alice"),
+            role: UserRole::Member,
+        };
         assert!(can_act_on(&actor, &OwnerId::from("alice")));
     }
 
     #[test]
     fn test_cannot_act_on_others_resource() {
-        let actor = Identity { owner_id: OwnerId::from("alice"), role: UserRole::Member };
+        let actor = Identity {
+            owner_id: OwnerId::from("alice"),
+            role: UserRole::Member,
+        };
         assert!(!can_act_on(&actor, &OwnerId::from("bob")));
     }
 
     #[test]
     fn test_admin_cannot_act_on_others_resource() {
         // Admin role does NOT bypass ownership in can_act_on
-        let actor = Identity { owner_id: OwnerId::from("alice"), role: UserRole::Admin };
+        let actor = Identity {
+            owner_id: OwnerId::from("alice"),
+            role: UserRole::Admin,
+        };
         assert!(!can_act_on(&actor, &OwnerId::from("bob")));
     }
 

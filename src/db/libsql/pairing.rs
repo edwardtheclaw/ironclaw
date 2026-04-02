@@ -34,10 +34,12 @@ impl ChannelPairingStore for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?
         {
             Some(row) => {
-                let owner_id: String =
-                    row.get(0).map_err(|e| DatabaseError::Query(e.to_string()))?;
-                let role_str: String =
-                    row.get(1).map_err(|e| DatabaseError::Query(e.to_string()))?;
+                let owner_id: String = row
+                    .get(0)
+                    .map_err(|e| DatabaseError::Query(e.to_string()))?;
+                let role_str: String = row
+                    .get(1)
+                    .map_err(|e| DatabaseError::Query(e.to_string()))?;
                 let role = if role_str == "admin" {
                     UserRole::Admin
                 } else {
@@ -76,13 +78,21 @@ impl ChannelPairingStore for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?
         {
-            let id_str: String = row.get(0).map_err(|e| DatabaseError::Query(e.to_string()))?;
+            let id_str: String = row
+                .get(0)
+                .map_err(|e| DatabaseError::Query(e.to_string()))?;
             return Ok(PairingRequestRecord {
                 id: uuid::Uuid::parse_str(&id_str)
                     .map_err(|e| DatabaseError::Query(e.to_string()))?,
-                channel: row.get(1).map_err(|e| DatabaseError::Query(e.to_string()))?,
-                external_id: row.get(2).map_err(|e| DatabaseError::Query(e.to_string()))?,
-                code: row.get(3).map_err(|e| DatabaseError::Query(e.to_string()))?,
+                channel: row
+                    .get(1)
+                    .map_err(|e| DatabaseError::Query(e.to_string()))?,
+                external_id: row
+                    .get(2)
+                    .map_err(|e| DatabaseError::Query(e.to_string()))?,
+                code: row
+                    .get(3)
+                    .map_err(|e| DatabaseError::Query(e.to_string()))?,
                 created_at: get_ts(&row, 4),
                 expires_at: get_ts(&row, 5),
             });
@@ -152,10 +162,15 @@ impl ChannelPairingStore for LibSqlBackend {
                     id: code.to_string(),
                 })?;
 
-            let req_id: String = row.get(0).map_err(|e| DatabaseError::Query(e.to_string()))?;
-            let channel: String = row.get(1).map_err(|e| DatabaseError::Query(e.to_string()))?;
-            let external_id: String =
-                row.get(2).map_err(|e| DatabaseError::Query(e.to_string()))?;
+            let req_id: String = row
+                .get(0)
+                .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            let channel: String = row
+                .get(1)
+                .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            let external_id: String = row
+                .get(2)
+                .map_err(|e| DatabaseError::Query(e.to_string()))?;
             let now_str = fmt_ts(&chrono::Utc::now());
 
             conn.execute(
@@ -222,13 +237,21 @@ impl ChannelPairingStore for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?
         {
-            let id_str: String = row.get(0).map_err(|e| DatabaseError::Query(e.to_string()))?;
+            let id_str: String = row
+                .get(0)
+                .map_err(|e| DatabaseError::Query(e.to_string()))?;
             result.push(PairingRequestRecord {
                 id: uuid::Uuid::parse_str(&id_str)
                     .map_err(|e| DatabaseError::Query(e.to_string()))?,
-                channel: row.get(1).map_err(|e| DatabaseError::Query(e.to_string()))?,
-                external_id: row.get(2).map_err(|e| DatabaseError::Query(e.to_string()))?,
-                code: row.get(3).map_err(|e| DatabaseError::Query(e.to_string()))?,
+                channel: row
+                    .get(1)
+                    .map_err(|e| DatabaseError::Query(e.to_string()))?,
+                external_id: row
+                    .get(2)
+                    .map_err(|e| DatabaseError::Query(e.to_string()))?,
+                code: row
+                    .get(3)
+                    .map_err(|e| DatabaseError::Query(e.to_string()))?,
                 created_at: get_ts(&row, 4),
                 expires_at: get_ts(&row, 5),
             });
@@ -312,11 +335,12 @@ mod tests {
         assert_eq!(req.code.len(), 8);
 
         // Before approval: still unknown
-        assert!(db
-            .resolve_channel_identity("telegram", "tg-alice-123")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            db.resolve_channel_identity("telegram", "tg-alice-123")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // Approve
         db.approve_pairing(&req.code, "alice").await.unwrap();
@@ -363,20 +387,22 @@ mod tests {
             .await
             .unwrap();
         db.approve_pairing(&req.code, "alice").await.unwrap();
-        assert!(db
-            .resolve_channel_identity("telegram", "tg-remove-test")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            db.resolve_channel_identity("telegram", "tg-remove-test")
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         db.remove_channel_identity("telegram", "tg-remove-test")
             .await
             .unwrap();
-        assert!(db
-            .resolve_channel_identity("telegram", "tg-remove-test")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            db.resolve_channel_identity("telegram", "tg-remove-test")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -458,6 +484,9 @@ mod tests {
 
         // Second approval with same code fails
         let err = db.approve_pairing(&req.code, "alice").await;
-        assert!(err.is_err(), "Approving an already-approved code should fail");
+        assert!(
+            err.is_err(),
+            "Approving an already-approved code should fail"
+        );
     }
 }

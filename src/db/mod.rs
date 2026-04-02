@@ -961,11 +961,7 @@ pub trait ChannelPairingStore: Send + Sync {
     /// Approve the pairing `code`, mapping `(channel, external_id)` → `owner_id`.
     /// Sets owner_id on the pairing_requests row + creates channel_identities row — one transaction.
     /// Returns `Err` if code is invalid, expired, or already approved.
-    async fn approve_pairing(
-        &self,
-        code: &str,
-        owner_id: &str,
-    ) -> Result<(), DatabaseError>;
+    async fn approve_pairing(&self, code: &str, owner_id: &str) -> Result<(), DatabaseError>;
 
     /// List pending (unapproved, non-expired) pairing requests for a channel.
     async fn list_pending_pairings(

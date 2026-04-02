@@ -105,7 +105,8 @@ async fn create_telegram_channel(
     runtime: Arc<WasmChannelRuntime>,
     config_json: &str,
 ) -> WasmChannel {
-    create_telegram_channel_with_store(runtime, config_json, Arc::new(PairingStore::new_noop())).await
+    create_telegram_channel_with_store(runtime, config_json, Arc::new(PairingStore::new_noop()))
+        .await
 }
 
 async fn create_telegram_channel_with_store(

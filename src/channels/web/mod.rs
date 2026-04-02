@@ -324,10 +324,7 @@ impl GatewayChannel {
     }
 
     /// Inject the shared pairing store for the pairing API endpoints.
-    pub fn with_pairing_store(
-        mut self,
-        store: Arc<crate::pairing::PairingStore>,
-    ) -> Self {
+    pub fn with_pairing_store(mut self, store: Arc<crate::pairing::PairingStore>) -> Self {
         self.rebuild_state(|s| s.pairing_store = Some(store));
         self
     }

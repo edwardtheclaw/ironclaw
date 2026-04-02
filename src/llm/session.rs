@@ -510,13 +510,11 @@ impl SessionManager {
         // Persist to encrypted secrets store (preferred) if attached
         if let Some(ref secrets) = *self.secrets.read().await {
             let user_id = self.user_id.read().await.clone();
-            let session_json_str = serde_json::to_string(&session)
-                .unwrap_or_else(|_| token.to_string());
-            let params = crate::secrets::CreateSecretParams::new(
-                "nearai_session_token",
-                session_json_str,
-            )
-            .with_provider("nearai");
+            let session_json_str =
+                serde_json::to_string(&session).unwrap_or_else(|_| token.to_string());
+            let params =
+                crate::secrets::CreateSecretParams::new("nearai_session_token", session_json_str)
+                    .with_provider("nearai");
             if let Err(e) = secrets.create(&user_id, params).await {
                 tracing::warn!("Failed to save session to encrypted secrets: {}", e);
             } else {
@@ -622,11 +620,12 @@ impl SessionManager {
                 reason: format!("Secrets lookup failed: {}", e),
             })?;
 
-        let session: SessionData =
-            serde_json::from_str(decrypted.expose()).map_err(|e| LlmError::SessionRenewalFailed {
+        let session: SessionData = serde_json::from_str(decrypted.expose()).map_err(|e| {
+            LlmError::SessionRenewalFailed {
                 provider: "nearai".to_string(),
                 reason: format!("Failed to parse session from secrets: {}", e),
-            })?;
+            }
+        })?;
 
         let mut guard = self.token.write().await;
         *guard = Some(SecretString::from(session.session_token));

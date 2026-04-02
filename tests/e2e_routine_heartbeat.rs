@@ -585,12 +585,7 @@ mod tests {
         engine.refresh_event_cache().await;
 
         // Positive match: message containing "deploy to production".
-        let matching_msg = make_message(
-            "test",
-            "default",
-            "default",
-            "deploy to production now",
-        );
+        let matching_msg = make_message("test", "default", "default", "deploy to production now");
         let fired = engine
             .check_event_triggers(&matching_msg, &matching_msg.content)
             .await;
@@ -919,12 +914,7 @@ mod tests {
         engine.refresh_event_cache().await;
 
         // First fire should work.
-        let msg = make_message(
-            "test",
-            "default",
-            "default",
-            "test-cooldown trigger",
-        );
+        let msg = make_message("test", "default", "default", "test-cooldown trigger");
         let fired1 = engine.check_event_triggers(&msg, &msg.content).await;
         assert!(fired1 >= 1, "First fire should work");
 

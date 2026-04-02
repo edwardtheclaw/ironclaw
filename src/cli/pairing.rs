@@ -99,10 +99,7 @@ async fn run_list(
 
     println!("Pairing requests ({}):", requests.len());
     for r in &requests {
-        println!(
-            "  {}  {}  {}",
-            r.code, r.external_id, r.created_at
-        );
+        println!("  {}  {}  {}", r.code, r.external_id, r.created_at);
     }
 
     Ok(())

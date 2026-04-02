@@ -57,14 +57,20 @@ pub struct TenantScope {
 impl TenantScope {
     /// Construct from a resolved `Identity` (preferred).
     pub fn with_identity(identity: crate::ownership::Identity, db: Arc<dyn Database>) -> Self {
-        Self { identity, inner: db }
+        Self {
+            identity,
+            inner: db,
+        }
     }
 
     /// Bridge constructor for call sites not yet migrated to `Identity`.
     /// Creates a Member-role identity from a raw user_id string.
     pub fn new(user_id: impl Into<String>, db: Arc<dyn Database>) -> Self {
         use crate::ownership::{Identity, OwnerId, UserRole};
-        Self::with_identity(Identity::new(OwnerId::from(user_id.into()), UserRole::Member), db)
+        Self::with_identity(
+            Identity::new(OwnerId::from(user_id.into()), UserRole::Member),
+            db,
+        )
     }
 
     pub fn identity(&self) -> &crate::ownership::Identity {
@@ -78,11 +84,15 @@ impl TenantScope {
     // === Jobs ===
 
     pub async fn list_agent_jobs(&self) -> Result<Vec<AgentJobRecord>, DatabaseError> {
-        self.inner.list_agent_jobs_for_user(self.identity.owner_id.as_str()).await
+        self.inner
+            .list_agent_jobs_for_user(self.identity.owner_id.as_str())
+            .await
     }
 
     pub async fn agent_job_summary(&self) -> Result<AgentJobSummary, DatabaseError> {
-        self.inner.agent_job_summary_for_user(self.identity.owner_id.as_str()).await
+        self.inner
+            .agent_job_summary_for_user(self.identity.owner_id.as_str())
+            .await
     }
 
     /// Fetch a job by ID, returning `None` if it doesn't belong to this user.
@@ -125,11 +135,15 @@ impl TenantScope {
     // === Sandbox jobs ===
 
     pub async fn list_sandbox_jobs(&self) -> Result<Vec<SandboxJobRecord>, DatabaseError> {
-        self.inner.list_sandbox_jobs_for_user(self.identity.owner_id.as_str()).await
+        self.inner
+            .list_sandbox_jobs_for_user(self.identity.owner_id.as_str())
+            .await
     }
 
     pub async fn sandbox_job_summary(&self) -> Result<SandboxJobSummary, DatabaseError> {
-        self.inner.sandbox_job_summary_for_user(self.identity.owner_id.as_str()).await
+        self.inner
+            .sandbox_job_summary_for_user(self.identity.owner_id.as_str())
+            .await
     }
 
     /// Fetch a sandbox job by ID, returning `None` if it doesn't belong to this user.
@@ -152,11 +166,15 @@ impl TenantScope {
     // === Routines ===
 
     pub async fn list_routines(&self) -> Result<Vec<Routine>, DatabaseError> {
-        self.inner.list_routines(self.identity.owner_id.as_str()).await
+        self.inner
+            .list_routines(self.identity.owner_id.as_str())
+            .await
     }
 
     pub async fn get_routine_by_name(&self, name: &str) -> Result<Option<Routine>, DatabaseError> {
-        self.inner.get_routine_by_name(self.identity.owner_id.as_str(), name).await
+        self.inner
+            .get_routine_by_name(self.identity.owner_id.as_str(), name)
+            .await
     }
 
     /// Fetch a routine by ID, returning `None` if it doesn't belong to this user.
@@ -169,7 +187,8 @@ impl TenantScope {
 
     pub async fn create_routine(&self, routine: &Routine) -> Result<(), DatabaseError> {
         debug_assert_eq!(
-            routine.user_id, self.identity.owner_id.as_str(),
+            routine.user_id,
+            self.identity.owner_id.as_str(),
             "routine.user_id must match TenantScope user"
         );
         self.inner.create_routine(routine).await
@@ -232,11 +251,15 @@ impl TenantScope {
     // === Settings ===
 
     pub async fn get_setting(&self, key: &str) -> Result<Option<serde_json::Value>, DatabaseError> {
-        self.inner.get_setting(self.identity.owner_id.as_str(), key).await
+        self.inner
+            .get_setting(self.identity.owner_id.as_str(), key)
+            .await
     }
 
     pub async fn get_setting_full(&self, key: &str) -> Result<Option<SettingRow>, DatabaseError> {
-        self.inner.get_setting_full(self.identity.owner_id.as_str(), key).await
+        self.inner
+            .get_setting_full(self.identity.owner_id.as_str(), key)
+            .await
     }
 
     pub async fn set_setting(
@@ -244,32 +267,44 @@ impl TenantScope {
         key: &str,
         value: &serde_json::Value,
     ) -> Result<(), DatabaseError> {
-        self.inner.set_setting(self.identity.owner_id.as_str(), key, value).await
+        self.inner
+            .set_setting(self.identity.owner_id.as_str(), key, value)
+            .await
     }
 
     pub async fn delete_setting(&self, key: &str) -> Result<bool, DatabaseError> {
-        self.inner.delete_setting(self.identity.owner_id.as_str(), key).await
+        self.inner
+            .delete_setting(self.identity.owner_id.as_str(), key)
+            .await
     }
 
     pub async fn list_settings(&self) -> Result<Vec<SettingRow>, DatabaseError> {
-        self.inner.list_settings(self.identity.owner_id.as_str()).await
+        self.inner
+            .list_settings(self.identity.owner_id.as_str())
+            .await
     }
 
     pub async fn get_all_settings(
         &self,
     ) -> Result<HashMap<String, serde_json::Value>, DatabaseError> {
-        self.inner.get_all_settings(self.identity.owner_id.as_str()).await
+        self.inner
+            .get_all_settings(self.identity.owner_id.as_str())
+            .await
     }
 
     pub async fn set_all_settings(
         &self,
         settings: &HashMap<String, serde_json::Value>,
     ) -> Result<(), DatabaseError> {
-        self.inner.set_all_settings(self.identity.owner_id.as_str(), settings).await
+        self.inner
+            .set_all_settings(self.identity.owner_id.as_str(), settings)
+            .await
     }
 
     pub async fn has_settings(&self) -> Result<bool, DatabaseError> {
-        self.inner.has_settings(self.identity.owner_id.as_str()).await
+        self.inner
+            .has_settings(self.identity.owner_id.as_str())
+            .await
     }
 
     // === Conversations ===
@@ -291,7 +326,13 @@ impl TenantScope {
         thread_id: Option<&str>,
     ) -> Result<bool, DatabaseError> {
         self.inner
-            .ensure_conversation(id, channel, self.identity.owner_id.as_str(), thread_id, Some(channel))
+            .ensure_conversation(
+                id,
+                channel,
+                self.identity.owner_id.as_str(),
+                thread_id,
+                Some(channel),
+            )
             .await
     }
 
@@ -320,7 +361,11 @@ impl TenantScope {
         routine_name: &str,
     ) -> Result<Uuid, DatabaseError> {
         self.inner
-            .get_or_create_routine_conversation(routine_id, routine_name, self.identity.owner_id.as_str())
+            .get_or_create_routine_conversation(
+                routine_id,
+                routine_name,
+                self.identity.owner_id.as_str(),
+            )
             .await
     }
 
@@ -802,7 +847,10 @@ impl AdminScope {
         if identity.role != crate::ownership::UserRole::Admin {
             return None;
         }
-        Some(Self { inner: db, identity })
+        Some(Self {
+            inner: db,
+            identity,
+        })
     }
 
     // === User management ===
@@ -924,7 +972,13 @@ impl TenantCtx {
         cost_guard: Arc<CostGuard>,
         rate: Arc<TenantRateState>,
     ) -> Self {
-        Self { identity, store, workspace, cost_guard, rate }
+        Self {
+            identity,
+            store,
+            workspace,
+            cost_guard,
+            rate,
+        }
     }
 
     pub fn user_id(&self) -> &str {
@@ -949,7 +1003,9 @@ impl TenantCtx {
 
     /// Check cost limits for this tenant (global + per-user).
     pub async fn check_cost_allowed(&self) -> Result<(), CostLimitExceeded> {
-        self.cost_guard.check_allowed_for_user(self.identity.owner_id.as_str()).await
+        self.cost_guard
+            .check_allowed_for_user(self.identity.owner_id.as_str())
+            .await
     }
 
     /// Record an LLM call for this tenant.
@@ -1011,7 +1067,9 @@ mod tests {
     }
 
     async fn test_db() -> Arc<dyn crate::db::Database> {
-        let backend = crate::db::libsql::LibSqlBackend::new_memory().await.unwrap();
+        let backend = crate::db::libsql::LibSqlBackend::new_memory()
+            .await
+            .unwrap();
         Arc::new(backend)
     }
 
@@ -1037,13 +1095,19 @@ mod tests {
     #[tokio::test]
     async fn test_admin_scope_new_returns_some_for_admin() {
         let scope = AdminScope::new(admin_identity(), test_db().await);
-        assert!(scope.is_some(), "Admin identity should construct AdminScope");
+        assert!(
+            scope.is_some(),
+            "Admin identity should construct AdminScope"
+        );
     }
 
     #[tokio::test]
     async fn test_admin_scope_new_returns_none_for_member() {
         let scope = AdminScope::new(alice_identity(), test_db().await);
-        assert!(scope.is_none(), "Member identity should NOT construct AdminScope");
+        assert!(
+            scope.is_none(),
+            "Member identity should NOT construct AdminScope"
+        );
     }
 
     #[tokio::test]

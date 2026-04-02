@@ -86,7 +86,10 @@ impl Database for PgBackend {
         ];
         for table in &tables {
             tx.execute(
-                &format!("UPDATE {} SET user_id = $1 WHERE user_id = 'default'", table),
+                &format!(
+                    "UPDATE {} SET user_id = $1 WHERE user_id = 'default'",
+                    table
+                ),
                 &[&owner_id],
             )
             .await

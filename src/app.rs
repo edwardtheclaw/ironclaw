@@ -250,12 +250,8 @@ impl AppBuilder {
 
                 // Migrate NEAR AI session token from plaintext settings to
                 // encrypted secrets. Idempotent — safe to run on every startup.
-                migrate_session_credential(
-                    db.as_ref(),
-                    secrets.as_ref(),
-                    &self.config.owner_id,
-                )
-                .await;
+                migrate_session_credential(db.as_ref(), secrets.as_ref(), &self.config.owner_id)
+                    .await;
             }
 
             // Inject LLM API keys from encrypted storage

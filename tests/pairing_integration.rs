@@ -74,7 +74,13 @@ mod tests {
         assert_eq!(pending[0].code, r1.code);
 
         // 3. User identity is not resolved yet
-        assert!(store.resolve_identity(channel, "user_12345").await.unwrap().is_none());
+        assert!(
+            store
+                .resolve_identity(channel, "user_12345")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // 4. Approve via code
         store.approve(&r1.code, &owner_id).await.unwrap();
@@ -156,10 +162,7 @@ mod tests {
             .upsert_request("telegram", "user_a", None)
             .await
             .unwrap();
-        let r_slack = store
-            .upsert_request("slack", "user_b", None)
-            .await
-            .unwrap();
+        let r_slack = store.upsert_request("slack", "user_b", None).await.unwrap();
 
         // Each channel has its own pending
         assert_eq!(store.list_pending("telegram").await.unwrap().len(), 1);

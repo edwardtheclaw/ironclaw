@@ -62,7 +62,11 @@ mod tests {
         // Create the owner via get_or_create_user (atomic upsert)
         create_user(&db, "henry", "admin").await;
 
-        let user = db.get_user("henry").await.unwrap().expect("owner should exist");
+        let user = db
+            .get_user("henry")
+            .await
+            .unwrap()
+            .expect("owner should exist");
         assert_eq!(user.id, "henry");
         assert_eq!(user.role, "admin");
         assert_eq!(user.status, "active");
@@ -77,7 +81,11 @@ mod tests {
         create_user(&db, "henry", "admin").await;
 
         // Exactly one row
-        let user = db.get_user("henry").await.unwrap().expect("owner should exist");
+        let user = db
+            .get_user("henry")
+            .await
+            .unwrap()
+            .expect("owner should exist");
         assert_eq!(user.id, "henry");
     }
 
@@ -183,10 +191,8 @@ mod tests {
         let db: Arc<dyn Database> = Arc::new(backend);
 
         let alice_identity = Identity::new(OwnerId::from("alice"), UserRole::Member);
-        let alice_scope = ironclaw::tenant::TenantScope::with_identity(
-            alice_identity,
-            Arc::clone(&db),
-        );
+        let alice_scope =
+            ironclaw::tenant::TenantScope::with_identity(alice_identity, Arc::clone(&db));
         alice_scope
             .set_setting("lang", &serde_json::json!("en"))
             .await
@@ -194,10 +200,7 @@ mod tests {
 
         // Bob uses Identity with Admin role — still cannot see Alice's setting
         let bob_identity = Identity::new(OwnerId::from("bob"), UserRole::Admin);
-        let bob_scope = ironclaw::tenant::TenantScope::with_identity(
-            bob_identity,
-            Arc::clone(&db),
-        );
+        let bob_scope = ironclaw::tenant::TenantScope::with_identity(bob_identity, Arc::clone(&db));
         let result = bob_scope.get_setting("lang").await.unwrap();
         assert!(
             result.is_none(),
@@ -206,10 +209,8 @@ mod tests {
 
         // Alice sees her own setting
         let alice_identity2 = Identity::new(OwnerId::from("alice"), UserRole::Member);
-        let alice_scope2 = ironclaw::tenant::TenantScope::with_identity(
-            alice_identity2,
-            Arc::clone(&db),
-        );
+        let alice_scope2 =
+            ironclaw::tenant::TenantScope::with_identity(alice_identity2, Arc::clone(&db));
         let alices = alice_scope2.get_setting("lang").await.unwrap();
         assert_eq!(alices, Some(serde_json::json!("en")));
     }
@@ -280,19 +281,23 @@ mod tests {
             .unwrap();
 
         // Approve only telegram
-        db.approve_pairing(&req_telegram.code, "alice").await.unwrap();
+        db.approve_pairing(&req_telegram.code, "alice")
+            .await
+            .unwrap();
 
         // telegram resolves; slack does not
-        assert!(db
-            .resolve_channel_identity("telegram", "user-999")
-            .await
-            .unwrap()
-            .is_some());
-        assert!(db
-            .resolve_channel_identity("slack", "user-999")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            db.resolve_channel_identity("telegram", "user-999")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.resolve_channel_identity("slack", "user-999")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     // -----------------------------------------------------------------------

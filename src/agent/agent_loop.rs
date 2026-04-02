@@ -354,11 +354,10 @@ impl Agent {
         let user_id = identity.owner_id.as_str();
         let rate = self.deps.tenant_rates.get_or_create(user_id).await;
 
-        let store = self
-            .deps
-            .store
-            .as_ref()
-            .map(|db| crate::tenant::TenantScope::with_identity(identity.clone(), Arc::clone(db)));
+        let store =
+            self.deps.store.as_ref().map(|db| {
+                crate::tenant::TenantScope::with_identity(identity.clone(), Arc::clone(db))
+            });
 
         // Reuse the owner workspace if user matches, otherwise create per-user.
         // Per-user workspaces are seeded on first creation so they get identity

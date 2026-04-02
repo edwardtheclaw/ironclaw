@@ -369,13 +369,14 @@ impl Database for LibSqlBackend {
             ];
             for table in &tables {
                 conn.execute(
-                    &format!("UPDATE {} SET user_id = ?1 WHERE user_id = 'default'", table),
+                    &format!(
+                        "UPDATE {} SET user_id = ?1 WHERE user_id = 'default'",
+                        table
+                    ),
                     libsql::params![owner_id],
                 )
                 .await
-                .map_err(|e| {
-                    DatabaseError::Query(format!("migrate_default_owner {table}: {e}"))
-                })?;
+                .map_err(|e| DatabaseError::Query(format!("migrate_default_owner {table}: {e}")))?;
             }
             Ok::<(), DatabaseError>(())
         }
