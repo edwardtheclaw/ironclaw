@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
 use crate::channels::web::types::*;
+use crate::ownership::{Identity, OwnerId, UserRole, can_act_on};
 
 fn db_error(context: &str, e: impl std::fmt::Display) -> (StatusCode, String) {
     tracing::error!(%e, context, "Database error in jobs handler");
@@ -159,7 +160,8 @@ pub async fn jobs_detail_handler(
     // Try sandbox job from DB first.
     match store.get_sandbox_job(job_id).await {
         Ok(Some(job)) => {
-            if job.user_id != user.user_id {
+            let actor = Identity::new(OwnerId::from(user.user_id.clone()), UserRole::Member);
+            if !can_act_on(&actor, &OwnerId::from(job.user_id.clone())) {
                 return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
             }
             let browse_id = std::path::Path::new(&job.project_dir)
@@ -228,7 +230,8 @@ pub async fn jobs_detail_handler(
     // Fall back to agent job from DB.
     match store.get_job(job_id).await {
         Ok(Some(ctx)) => {
-            if ctx.user_id != user.user_id {
+            let actor = Identity::new(OwnerId::from(user.user_id.clone()), UserRole::Member);
+            if !can_act_on(&actor, &OwnerId::from(ctx.user_id.clone())) {
                 return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
             }
             let elapsed_secs = ctx.started_at.map(|start| {
@@ -290,7 +293,8 @@ pub async fn jobs_cancel_handler(
     if let Some(ref store) = state.store {
         match store.get_sandbox_job(job_id).await {
             Ok(Some(job)) => {
-                if job.user_id != user.user_id {
+                let actor = Identity::new(OwnerId::from(user.user_id.clone()), UserRole::Member);
+                if !can_act_on(&actor, &OwnerId::from(job.user_id.clone())) {
                     return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
                 }
                 if job.status == "running" || job.status == "creating" {
@@ -329,7 +333,8 @@ pub async fn jobs_cancel_handler(
     if let Some(ref store) = state.store {
         match store.get_job(job_id).await {
             Ok(Some(job)) => {
-                if job.user_id != user.user_id {
+                let actor = Identity::new(OwnerId::from(user.user_id.clone()), UserRole::Member);
+                if !can_act_on(&actor, &OwnerId::from(job.user_id.clone())) {
                     return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
                 }
                 if job.state.is_active() {
@@ -385,7 +390,8 @@ pub async fn jobs_restart_handler(
     // Try sandbox job restart first.
     match store.get_sandbox_job(old_job_id).await {
         Ok(Some(old_job)) => {
-            if old_job.user_id != user.user_id {
+            let actor = Identity::new(OwnerId::from(user.user_id.clone()), UserRole::Member);
+            if !can_act_on(&actor, &OwnerId::from(old_job.user_id.clone())) {
                 return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
             }
             if old_job.status != "interrupted" && old_job.status != "failed" {
@@ -489,7 +495,8 @@ pub async fn jobs_restart_handler(
     // Try agent job restart: dispatch a new job via the scheduler.
     match store.get_job(old_job_id).await {
         Ok(Some(old_job)) => {
-            if old_job.user_id != user.user_id {
+            let actor = Identity::new(OwnerId::from(user.user_id.clone()), UserRole::Member);
+            if !can_act_on(&actor, &OwnerId::from(old_job.user_id.clone())) {
                 return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
             }
             if old_job.state.is_active() {
@@ -574,7 +581,8 @@ pub async fn jobs_prompt_handler(
         && let Ok(Some(sandbox_job)) = s.get_sandbox_job(job_id).await
     {
         // Verify ownership.
-        if sandbox_job.user_id != user.user_id {
+        let actor = Identity::new(OwnerId::from(user.user_id.clone()), UserRole::Member);
+        if !can_act_on(&actor, &OwnerId::from(sandbox_job.user_id.clone())) {
             return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
         }
 
@@ -606,7 +614,8 @@ pub async fn jobs_prompt_handler(
     if let Some(ref store) = state.store {
         match store.get_job(job_id).await {
             Ok(Some(agent_job)) => {
-                if agent_job.user_id != user.user_id {
+                let actor = Identity::new(OwnerId::from(user.user_id.clone()), UserRole::Member);
+                if !can_act_on(&actor, &OwnerId::from(agent_job.user_id.clone())) {
                     return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
                 }
             }
@@ -659,12 +668,13 @@ pub async fn jobs_events_handler(
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
 
     // Verify ownership before returning events (check both sandbox and agent jobs).
+    let actor = Identity::new(OwnerId::from(user.user_id.clone()), UserRole::Member);
     let is_owner = match store.get_sandbox_job(job_id).await {
-        Ok(Some(job)) => job.user_id == user.user_id,
+        Ok(Some(job)) => can_act_on(&actor, &OwnerId::from(job.user_id.clone())),
         Ok(None) => {
             // Fall back to agent job ownership check.
             match store.get_job(job_id).await {
-                Ok(Some(ctx)) => ctx.user_id == user.user_id,
+                Ok(Some(ctx)) => can_act_on(&actor, &OwnerId::from(ctx.user_id.clone())),
                 _ => false,
             }
         }
@@ -726,7 +736,8 @@ pub async fn job_files_list_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Job not found".to_string()))?;
 
-    if job.user_id != user.user_id {
+    let actor = Identity::new(OwnerId::from(user.user_id.clone()), UserRole::Member);
+    if !can_act_on(&actor, &OwnerId::from(job.user_id.clone())) {
         return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
     }
 
@@ -794,7 +805,8 @@ pub async fn job_files_read_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Job not found".to_string()))?;
 
-    if job.user_id != user.user_id {
+    let actor = Identity::new(OwnerId::from(user.user_id.clone()), UserRole::Member);
+    if !can_act_on(&actor, &OwnerId::from(job.user_id.clone())) {
         return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
     }
 
