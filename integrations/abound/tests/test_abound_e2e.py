@@ -1,3 +1,6 @@
+# /// script
+# dependencies = ["requests", "openai"]
+# ///
 """E2E tests for Abound API integration through IronClaw's Responses API.
 
 Creates a test user, injects Abound dev credentials, then sends natural
@@ -111,7 +114,31 @@ r = admin.put(
 )
 check("inject api key", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
 
+
 # AGENTS.md is auto-seeded via AGENTS_SEED_PATH env var on the server
+
+print("\n--- Setup: Verify Massive API key is seeded (global default user) ---")
+r = admin.get(f"{BASE_URL}/api/admin/users/default/secrets")
+if r.status_code == 200:
+    secret_names = [s["name"] for s in r.json().get("secrets", [])]
+    if "massive_api_key" not in secret_names:
+        massive_key = os.environ.get("MASSIVE_API_KEY")
+        if massive_key:
+            r2 = admin.put(
+                f"{BASE_URL}/api/admin/users/default/secrets/massive_api_key",
+                json={"value": massive_key, "provider": "massive"},
+            )
+            check("massive_api_key seeded on default", r2.status_code == 200,
+                  f"got {r2.status_code}: {r2.text[:200]}")
+        else:
+            check("massive_api_key seeded on default", False,
+                  f"not found and MASSIVE_API_KEY env var not set — seed with: curl -X PUT {BASE_URL}/api/admin/users/default/secrets/massive_api_key -d '{{\"value\": \"<key>\"}}'")
+    else:
+        check("massive_api_key seeded on default", True)
+else:
+    check("secrets list accessible", False, f"got {r.status_code}: {r.text[:200]}")
+
+# Wait for workspace bootstrap and auth cache to settle
 print("\n  Waiting 5s for workspace bootstrap...")
 time.sleep(5)
 print()
@@ -119,9 +146,59 @@ print()
 client = OpenAI(api_key=user_token, base_url=f"{BASE_URL}/v1")
 
 # -----------------------------------------------------------
-# 1. Get Account Info (natural language)
+# 1. Smart remittance: analyze_transfer
 # -----------------------------------------------------------
-print("--- 1. Account info ---")
+print("--- 1. Smart remittance: analyze_transfer ---")
+try:
+    response = client.responses.create(
+        model="default",
+        input="Should I send $500 to India now or wait? Analyze the current USD/INR rate and timing.",
+        timeout=180,
+    )
+    check("status completed", response.status == "completed", f"status={response.status}")
+    check("has output", len(response.output) > 0)
+
+    agent_text = extract_agent_text(response)
+    print(f"  Agent response ({len(agent_text)} chars): {agent_text[:400]}")
+
+    has_analysis = any(term in agent_text.lower() for term in [
+        "wait", "now", "rate", "inr", "volatility", "rsi", "hit rate", "recommend",
+    ])
+    check("contains timing analysis", has_analysis,
+          "agent response doesn't contain transfer timing analysis")
+except Exception as e:
+    check("request succeeded", False, str(e))
+print()
+
+# -----------------------------------------------------------
+# 2. Smart remittance: validate_transfer_target
+# -----------------------------------------------------------
+print("--- 2. Smart remittance: validate_transfer_target ---")
+try:
+    response = client.responses.create(
+        model="default",
+        input="What's the probability of USD/INR hitting 95 in the next 30 days?",
+        timeout=180,
+    )
+    check("status completed", response.status == "completed", f"status={response.status}")
+    check("has output", len(response.output) > 0)
+
+    agent_text = extract_agent_text(response)
+    print(f"  Agent response ({len(agent_text)} chars): {agent_text[:400]}")
+
+    has_probability = any(term in agent_text.lower() for term in [
+        "probability", "hit", "%", "horizon", "days", "chance",
+    ])
+    check("contains probability analysis", has_probability,
+          "agent response doesn't contain probability/horizon data")
+except Exception as e:
+    check("request succeeded", False, str(e))
+print()
+
+# -----------------------------------------------------------
+# 3. Get Account Info (natural language)
+# -----------------------------------------------------------
+print("--- 3. Account info ---")
 try:
     response = client.responses.create(
         model="default",
@@ -148,9 +225,9 @@ except Exception as e:
 print()
 
 # -----------------------------------------------------------
-# 2. Exchange rate (natural language)
+# 4. Exchange rate (natural language)
 # -----------------------------------------------------------
-print("--- 2. Exchange rate ---")
+print("--- 4. Exchange rate ---")
 try:
     response = client.responses.create(
         model="default",
@@ -177,9 +254,9 @@ except Exception as e:
 print()
 
 # -----------------------------------------------------------
-# 3. Send money advice (natural language)
+# 5. Send money advice (natural language)
 # -----------------------------------------------------------
-print("--- 3. Send money advice ---")
+print("--- 5. Send money advice ---")
 try:
     response = client.responses.create(
         model="default",
@@ -202,9 +279,9 @@ except Exception as e:
 print()
 
 # -----------------------------------------------------------
-# 4. Create notification (natural language)
+# 6. Create notification (natural language)
 # -----------------------------------------------------------
-print("--- 4. Create notification ---")
+print("--- 6. Create notification ---")
 try:
     response = client.responses.create(
         model="default",
@@ -250,7 +327,7 @@ try:
           f"events: {events[-5:]}")
     check("has text deltas", len(full_text) > 0, f"text={full_text[:100]}")
     check("mentions rate in stream", any(t in full_text.lower() for t in ["rate", "inr", "exchange"]),
-          f"streamed text doesn't mention rate")
+          "streamed text doesn't mention rate")
     print(f"  Events: {len(events)} total")
     print(f"  Text: {full_text[:300]}")
 except Exception as e:

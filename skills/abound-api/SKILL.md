@@ -1,7 +1,7 @@
 ---
-name: abound-remittance
-version: 0.2.0
-description: Smart remittance assistant for Abound — helps users send money to India with intelligent forex timing and transfer management via the Abound REST API.
+name: abound-api
+version: 0.1.0
+description: Abound API surface — account info, exchange rate, send wire transfer, and notifications via the Abound REST API.
 activation:
   keywords:
     - send money
@@ -33,6 +33,10 @@ activation:
     - hey
   patterns:
     - "send \\$?\\d+"
+    - "transfer.*\\$?\\d+"
+    - "\\$?\\d+.*to (india|INR)"
+    - "transfer.*(to india|to INR)"
+    - "send.*(to india|to INR)"
     - "schedule.*(trade|transfer|send|wire)"
     - "how much.*(INR|rupees|India)"
     - "best time to (send|transfer|convert)"
@@ -40,11 +44,33 @@ activation:
     - "transfer.*tomorrow|tomorrow.*transfer"
     - "account.*(info|balance|limit)"
     - "^(hi|hello|hey)$"
+    - "send now|proceed.*transfer|do it now|let's.*send|go ahead.*transfer|confirm.*transfer|execute.*transfer"
+    - "i want to send now|send it now|transfer now"
+    - "send to .*\\*+\\d+"
+    - "send.*\\$?\\d+.*to .*\\*"
   tags:
     - fintech
     - remittance
     - forex
   max_context_tokens: 3000
+credentials:
+  - name: abound_external_token
+    provider: abound
+    location:
+      type: bearer
+    hosts:
+      - "devneobank.timesclub.co"
+      - "dev.timesclub.co"
+    setup_instructions: "Provide your Abound bearer token. Set with: ironclaw secret set abound_external_token <YOUR_TOKEN>"
+  - name: abound_api_key
+    provider: abound
+    location:
+      type: header
+      name: X-API-KEY
+    hosts:
+      - "devneobank.timesclub.co"
+      - "dev.timesclub.co"
+    setup_instructions: "Provide your Abound API key. Set with: ironclaw secret set abound_api_key <YOUR_KEY>"
 ---
 
 # Abound Remittance Assistant
@@ -81,6 +107,12 @@ Do NOT mention any other capabilities.
 ## Authentication
 
 Headers are automatically injected. Only include `device-type: WEB`. Do NOT construct auth headers manually.
+
+**CRITICAL: All Abound API calls MUST use these exact base URLs — never guess or use any other domain:**
+- `https://devneobank.timesclub.co/times/bank/remittance/agent/` — for account, exchange rate, wire transfer
+- `https://dev.timesclub.co/times/users/agent/` — for notifications
+
+**NEVER call `withabound.com`, `abound.com`, `abound.co`, or any other domain.**
 
 If API calls fail with auth errors, say: "It looks like your account isn't fully set up yet. Please contact Abound support to complete your setup."
 
