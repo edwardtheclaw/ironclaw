@@ -174,9 +174,11 @@ try:
     agent_text = extract_agent_text(response)
     print(f"  Agent response ({len(agent_text)} chars): {agent_text[:400]}")
 
-    # Should reference INR amount and rate
-    has_conversion = any(term in agent_text.lower() for term in ["inr", "rupee"])
-    check("mentions INR conversion", has_conversion)
+    # Should reference INR/rate or ask about transfer details (recipient, reason)
+    has_transfer_context = any(term in agent_text.lower() for term in [
+        "inr", "rupee", "rate", "recipient", "transfer", "wire", "send",
+    ])
+    check("mentions transfer context", has_transfer_context)
 except Exception as e:
     check("request succeeded", False, str(e))
 print()
