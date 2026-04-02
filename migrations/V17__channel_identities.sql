@@ -9,5 +9,4 @@ CREATE TABLE channel_identities (
     UNIQUE (channel, external_id)
 );
 
-CREATE INDEX idx_channel_identities_lookup
-    ON channel_identities (channel, external_id);
+-- UNIQUE (channel, external_id) already creates an implicit index on (channel, external_id).

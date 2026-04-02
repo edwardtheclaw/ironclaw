@@ -246,8 +246,12 @@ mod tests {
             .await
             .unwrap();
 
-        db.approve_pairing(&req_a.code, "alice").await.unwrap();
-        db.approve_pairing(&req_b.code, "bob").await.unwrap();
+        db.approve_pairing("telegram", &req_a.code, "alice")
+            .await
+            .unwrap();
+        db.approve_pairing("telegram", &req_b.code, "bob")
+            .await
+            .unwrap();
 
         let alice_id = db
             .resolve_channel_identity("telegram", "tg-alice")
@@ -275,13 +279,13 @@ mod tests {
             .upsert_pairing_request("telegram", "user-999", None)
             .await
             .unwrap();
-        let req_slack = db
+        let _req_slack = db
             .upsert_pairing_request("slack", "user-999", None)
             .await
             .unwrap();
 
         // Approve only telegram
-        db.approve_pairing(&req_telegram.code, "alice")
+        db.approve_pairing("telegram", &req_telegram.code, "alice")
             .await
             .unwrap();
 

@@ -621,8 +621,7 @@ CREATE TABLE IF NOT EXISTS channel_identities (
     created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE (channel, external_id)
 );
-CREATE INDEX IF NOT EXISTS idx_channel_identities_lookup
-    ON channel_identities (channel, external_id);
+-- UNIQUE (channel, external_id) already creates an implicit index.
 
 -- ==================== Pairing Requests (V18) ====================
 
@@ -636,7 +635,7 @@ CREATE TABLE IF NOT EXISTS pairing_requests (
     expires_at  TEXT    NOT NULL,
     approved_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_pairing_requests_code    ON pairing_requests (code);
+-- UNIQUE on code already creates an implicit index.
 CREATE INDEX IF NOT EXISTS idx_pairing_requests_channel ON pairing_requests (channel, external_id);
 
 "#;
@@ -859,8 +858,6 @@ CREATE TABLE IF NOT EXISTS channel_identities (
     created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE (channel, external_id)
 );
-CREATE INDEX IF NOT EXISTS idx_channel_identities_lookup
-    ON channel_identities (channel, external_id);
 "#,
     ),
     (
@@ -880,7 +877,6 @@ CREATE TABLE IF NOT EXISTS pairing_requests (
     expires_at  TEXT    NOT NULL,
     approved_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_pairing_requests_code    ON pairing_requests (code);
 CREATE INDEX IF NOT EXISTS idx_pairing_requests_channel ON pairing_requests (channel, external_id);
 "#,
     ),

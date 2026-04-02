@@ -11,5 +11,5 @@ CREATE TABLE pairing_requests (
     approved_at TIMESTAMPTZ
 );
 
-CREATE INDEX idx_pairing_requests_code    ON pairing_requests (code);
+-- UNIQUE on code already creates an implicit index; no separate idx_pairing_requests_code needed.
 CREATE INDEX idx_pairing_requests_channel ON pairing_requests (channel, external_id);

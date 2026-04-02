@@ -1057,34 +1057,60 @@ impl ChannelPairingStore for PgBackend {
                 channel: row.get(1),
                 external_id: row.get(2),
                 code: row.get(3),
+                created: false,
                 created_at: row.get(4),
                 expires_at: row.get(5),
             });
         }
 
-        let code = crate::db::generate_pairing_code();
         let expires_at = chrono::Utc::now() + chrono::Duration::minutes(15);
-        let row = client
-            .query_one(
-                "INSERT INTO pairing_requests (id, channel, external_id, code, expires_at)
-                 VALUES (gen_random_uuid(), $1, $2, $3, $4)
-                 RETURNING id, channel, external_id, code, created_at, expires_at",
-                &[&channel, &external_id, &code, &expires_at],
-            )
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        Ok(PairingRequestRecord {
-            id: row.get(0),
-            channel: row.get(1),
-            external_id: row.get(2),
-            code: row.get(3),
-            created_at: row.get(4),
-            expires_at: row.get(5),
-        })
+        // Retry loop: regenerate code on UNIQUE violation (code collision)
+        for attempt in 0..3 {
+            let code = crate::db::generate_pairing_code();
+            match client
+                .query_one(
+                    "INSERT INTO pairing_requests (id, channel, external_id, code, expires_at)
+                     VALUES (gen_random_uuid(), $1, $2, $3, $4)
+                     RETURNING id, channel, external_id, code, created_at, expires_at",
+                    &[&channel, &external_id, &code, &expires_at],
+                )
+                .await
+            {
+                Ok(row) => {
+                    return Ok(PairingRequestRecord {
+                        id: row.get(0),
+                        channel: row.get(1),
+                        external_id: row.get(2),
+                        code: row.get(3),
+                        created: true,
+                        created_at: row.get(4),
+                        expires_at: row.get(5),
+                    });
+                }
+                Err(e) => {
+                    let is_unique = e
+                        .code()
+                        .is_some_and(|c| *c == tokio_postgres::error::SqlState::UNIQUE_VIOLATION);
+                    if attempt < 2 && is_unique {
+                        continue;
+                    }
+                    return Err(DatabaseError::Query(e.to_string()));
+                }
+            }
+        }
+
+        Err(DatabaseError::Query(
+            "failed to generate unique pairing code after 3 attempts".to_string(),
+        ))
     }
 
-    async fn approve_pairing(&self, code: &str, owner_id: &str) -> Result<(), DatabaseError> {
+    async fn approve_pairing(
+        &self,
+        channel: &str,
+        code: &str,
+        owner_id: &str,
+    ) -> Result<(), DatabaseError> {
         let mut client = self
             .pool()
             .get()
@@ -1099,9 +1125,10 @@ impl ChannelPairingStore for PgBackend {
             .query_opt(
                 "SELECT id, channel, external_id FROM pairing_requests
                  WHERE UPPER(code) = UPPER($1)
+                   AND channel = $2
                    AND approved_at IS NULL
                    AND expires_at > NOW()",
-                &[&code],
+                &[&code, &channel],
             )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?
@@ -1163,6 +1190,7 @@ impl ChannelPairingStore for PgBackend {
                 channel: r.get(1),
                 external_id: r.get(2),
                 code: r.get(3),
+                created: false,
                 created_at: r.get(4),
                 expires_at: r.get(5),
             })

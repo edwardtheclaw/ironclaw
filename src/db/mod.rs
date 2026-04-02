@@ -932,6 +932,7 @@ pub struct PairingRequestRecord {
     pub channel: String,
     pub external_id: String,
     pub code: String,
+    pub created: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
@@ -960,8 +961,13 @@ pub trait ChannelPairingStore: Send + Sync {
 
     /// Approve the pairing `code`, mapping `(channel, external_id)` → `owner_id`.
     /// Sets owner_id on the pairing_requests row + creates channel_identities row — one transaction.
-    /// Returns `Err` if code is invalid, expired, or already approved.
-    async fn approve_pairing(&self, code: &str, owner_id: &str) -> Result<(), DatabaseError>;
+    /// Returns `Err` if code is invalid, expired, already approved, or belongs to a different channel.
+    async fn approve_pairing(
+        &self,
+        channel: &str,
+        code: &str,
+        owner_id: &str,
+    ) -> Result<(), DatabaseError>;
 
     /// List pending (unapproved, non-expired) pairing requests for a channel.
     async fn list_pending_pairings(

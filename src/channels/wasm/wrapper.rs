@@ -644,12 +644,7 @@ impl near::agent::channel_host::Host for ChannelStoreData {
         match result {
             Ok(req) => Ok(near::agent::channel_host::PairingUpsertResult {
                 code: req.code,
-                // Heuristic: treat as "created" when created_at is within the last 2 seconds.
-                created: chrono::Utc::now()
-                    .signed_duration_since(req.created_at)
-                    .num_seconds()
-                    .unsigned_abs()
-                    < 2,
+                created: req.created,
             }),
             Err(e) => Err(e.to_string()),
         }

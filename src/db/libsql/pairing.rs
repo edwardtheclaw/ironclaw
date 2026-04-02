@@ -93,44 +93,69 @@ impl ChannelPairingStore for LibSqlBackend {
                 code: row
                     .get(3)
                     .map_err(|e| DatabaseError::Query(e.to_string()))?,
+                created: false,
                 created_at: get_ts(&row, 4),
                 expires_at: get_ts(&row, 5),
             });
         }
 
-        let id = uuid::Uuid::new_v4().to_string();
-        let code = crate::db::generate_pairing_code();
         let now = chrono::Utc::now();
         let expires_at = now + chrono::Duration::minutes(15);
         let now_str = fmt_ts(&now);
         let expires_str = fmt_ts(&expires_at);
 
-        conn.execute(
-            "INSERT INTO pairing_requests (id, channel, external_id, code, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                id.as_str(),
-                channel,
-                external_id,
-                code.as_str(),
-                now_str.as_str(),
-                expires_str.as_str()
-            ],
-        )
-        .await
-        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        // Retry loop: regenerate code on UNIQUE constraint violation (code collision)
+        for attempt in 0..3 {
+            let id = uuid::Uuid::new_v4().to_string();
+            let code = crate::db::generate_pairing_code();
+            match conn
+                .execute(
+                    "INSERT INTO pairing_requests (id, channel, external_id, code, created_at, expires_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        id.as_str(),
+                        channel,
+                        external_id,
+                        code.as_str(),
+                        now_str.as_str(),
+                        expires_str.as_str()
+                    ],
+                )
+                .await
+            {
+                Ok(_) => {
+                    return Ok(PairingRequestRecord {
+                        id: uuid::Uuid::parse_str(&id)
+                            .map_err(|e| DatabaseError::Query(e.to_string()))?,
+                        channel: channel.to_string(),
+                        external_id: external_id.to_string(),
+                        code,
+                        created: true,
+                        created_at: now,
+                        expires_at,
+                    });
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if attempt < 2 && msg.contains("UNIQUE constraint failed") {
+                        continue;
+                    }
+                    return Err(DatabaseError::Query(msg));
+                }
+            }
+        }
 
-        Ok(PairingRequestRecord {
-            id: uuid::Uuid::parse_str(&id).map_err(|e| DatabaseError::Query(e.to_string()))?,
-            channel: channel.to_string(),
-            external_id: external_id.to_string(),
-            code,
-            created_at: now,
-            expires_at,
-        })
+        Err(DatabaseError::Query(
+            "failed to generate unique pairing code after 3 attempts".to_string(),
+        ))
     }
 
-    async fn approve_pairing(&self, code: &str, owner_id: &str) -> Result<(), DatabaseError> {
+    async fn approve_pairing(
+        &self,
+        channel: &str,
+        code: &str,
+        owner_id: &str,
+    ) -> Result<(), DatabaseError> {
         let conn = self.connect().await?;
 
         // BEGIN IMMEDIATE acquires a write lock upfront, preventing concurrent approvals
@@ -144,10 +169,11 @@ impl ChannelPairingStore for LibSqlBackend {
                 .query(
                     "SELECT id, channel, external_id FROM pairing_requests
                      WHERE UPPER(code) = UPPER(?1)
+                       AND channel = ?2
                        AND approved_at IS NULL
                        AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                      LIMIT 1",
-                    libsql::params![code],
+                    libsql::params![code, channel],
                 )
                 .await
                 .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -252,6 +278,7 @@ impl ChannelPairingStore for LibSqlBackend {
                 code: row
                     .get(3)
                     .map_err(|e| DatabaseError::Query(e.to_string()))?,
+                created: false,
                 created_at: get_ts(&row, 4),
                 expires_at: get_ts(&row, 5),
             });
@@ -333,6 +360,7 @@ mod tests {
         assert_eq!(req.channel, "telegram");
         assert_eq!(req.external_id, "tg-alice-123");
         assert_eq!(req.code.len(), 8);
+        assert!(req.created, "first upsert should set created = true");
 
         // Before approval: still unknown
         assert!(
@@ -343,7 +371,9 @@ mod tests {
         );
 
         // Approve
-        db.approve_pairing(&req.code, "alice").await.unwrap();
+        db.approve_pairing("telegram", &req.code, "alice")
+            .await
+            .unwrap();
 
         // After approval: resolves to alice
         let identity = db
@@ -366,6 +396,8 @@ mod tests {
             .upsert_pairing_request("telegram", "user123", None)
             .await
             .unwrap();
+        assert!(r1.created, "first upsert should set created = true");
+        assert!(!r2.created, "second upsert should set created = false");
         assert_eq!(
             r1.code, r2.code,
             "Should return existing request, not create new one"
@@ -375,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn test_approve_invalid_code_returns_error() {
         let (db, _dir) = setup_db().await;
-        let err = db.approve_pairing("BADCODE1", "alice").await;
+        let err = db.approve_pairing("telegram", "BADCODE1", "alice").await;
         assert!(err.is_err(), "Invalid code should return error");
     }
 
@@ -386,7 +418,9 @@ mod tests {
             .upsert_pairing_request("telegram", "tg-remove-test", None)
             .await
             .unwrap();
-        db.approve_pairing(&req.code, "alice").await.unwrap();
+        db.approve_pairing("telegram", &req.code, "alice")
+            .await
+            .unwrap();
         assert!(
             db.resolve_channel_identity("telegram", "tg-remove-test")
                 .await
@@ -433,7 +467,9 @@ mod tests {
 
         // Approve with lowercase version of the code
         let lowercase_code = req.code.to_lowercase();
-        db.approve_pairing(&lowercase_code, "alice").await.unwrap();
+        db.approve_pairing("telegram", &lowercase_code, "alice")
+            .await
+            .unwrap();
 
         // Identity should resolve
         let identity = db
@@ -467,7 +503,7 @@ mod tests {
             .unwrap();
         }
 
-        let err = db.approve_pairing("EXPIRED1", "alice").await;
+        let err = db.approve_pairing("telegram", "EXPIRED1", "alice").await;
         assert!(err.is_err(), "Expired code should be rejected");
     }
 
@@ -480,10 +516,12 @@ mod tests {
             .unwrap();
 
         // First approval succeeds
-        db.approve_pairing(&req.code, "alice").await.unwrap();
+        db.approve_pairing("telegram", &req.code, "alice")
+            .await
+            .unwrap();
 
         // Second approval with same code fails
-        let err = db.approve_pairing(&req.code, "alice").await;
+        let err = db.approve_pairing("telegram", &req.code, "alice").await;
         assert!(
             err.is_err(),
             "Approving an already-approved code should fail"
