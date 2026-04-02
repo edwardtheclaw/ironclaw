@@ -41,6 +41,8 @@ pub enum ExtensionKind {
     WasmChannel,
     /// External channel via channel-relay service (Slack, etc.).
     ChannelRelay,
+    /// ACP-compliant coding agent (Goose, Codex, Gemini CLI, etc.).
+    AcpAgent,
 }
 
 impl std::fmt::Display for ExtensionKind {
@@ -50,6 +52,7 @@ impl std::fmt::Display for ExtensionKind {
             ExtensionKind::WasmTool => write!(f, "wasm_tool"),
             ExtensionKind::WasmChannel => write!(f, "wasm_channel"),
             ExtensionKind::ChannelRelay => write!(f, "channel_relay"),
+            ExtensionKind::AcpAgent => write!(f, "acp_agent"),
         }
     }
 }
