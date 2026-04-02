@@ -671,8 +671,9 @@ impl Turn {
         self.response = Some(response.into());
         self.state = TurnState::Completed;
         self.completed_at = Some(Utc::now());
-        // Free image data — only needed for the initial LLM call, not subsequent turns
-        self.image_content_parts.clear();
+        // Keep image_content_parts so subsequent turns can still reference the
+        // image in conversation history. They are freed when the turn is dropped
+        // (compaction, session end) or when the session is serialized (#[serde(skip)]).
     }
 
     /// Fail this turn.
@@ -680,14 +681,12 @@ impl Turn {
         self.error = Some(error.into());
         self.state = TurnState::Failed;
         self.completed_at = Some(Utc::now());
-        self.image_content_parts.clear();
     }
 
     /// Interrupt this turn.
     pub fn interrupt(&mut self) {
         self.state = TurnState::Interrupted;
         self.completed_at = Some(Utc::now());
-        self.image_content_parts.clear();
     }
 
     /// Record a tool call.
