@@ -891,7 +891,9 @@ impl Channel for ReplChannel {
             | StatusUpdate::ContextPressure { .. }
             | StatusUpdate::SandboxStatus { .. }
             | StatusUpdate::SecretsStatus { .. }
-            | StatusUpdate::CostGuard { .. } => {
+            | StatusUpdate::CostGuard { .. }
+            | StatusUpdate::ThreadList { .. }
+            | StatusUpdate::ConversationHistory { .. } => {
                 // Infrastructure status events are only rendered by the TUI
             }
             StatusUpdate::SkillActivated { skill_names } => {

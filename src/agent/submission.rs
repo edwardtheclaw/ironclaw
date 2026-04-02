@@ -165,6 +165,11 @@ impl SubmissionParser {
             }
         }
 
+        // /resume (bare) - list threads for interactive picker
+        if lower == "/resume" {
+            return Submission::ListThreads;
+        }
+
         // /resume <uuid> - resume from checkpoint
         if let Some(rest) = lower.strip_prefix("/resume ")
             && let Ok(id) = Uuid::parse_str(rest.trim())
@@ -316,6 +321,9 @@ pub enum Submission {
         checkpoint_id: Uuid,
     },
 
+    /// List threads for the interactive resume picker.
+    ListThreads,
+
     /// Clear the current thread and start fresh.
     Clear,
 
@@ -463,6 +471,7 @@ impl Submission {
                 | Self::Redo
                 | Self::Clear
                 | Self::NewThread
+                | Self::ListThreads
                 | Self::Heartbeat
                 | Self::Summarize
                 | Self::Suggest
@@ -631,6 +640,21 @@ mod tests {
         assert!(
             matches!(submission, Submission::Resume { checkpoint_id } if checkpoint_id == uuid)
         );
+    }
+
+    #[test]
+    fn test_parser_bare_resume_is_list_threads() {
+        let submission = SubmissionParser::parse("/resume");
+        assert!(matches!(submission, Submission::ListThreads));
+
+        // Case insensitive
+        let submission = SubmissionParser::parse("/RESUME");
+        assert!(matches!(submission, Submission::ListThreads));
+    }
+
+    #[test]
+    fn test_list_threads_is_control() {
+        assert!(Submission::ListThreads.is_control());
     }
 
     #[test]

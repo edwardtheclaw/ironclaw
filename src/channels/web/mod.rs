@@ -522,7 +522,9 @@ impl Channel for GatewayChannel {
             | StatusUpdate::ContextPressure { .. }
             | StatusUpdate::SandboxStatus { .. }
             | StatusUpdate::SecretsStatus { .. }
-            | StatusUpdate::CostGuard { .. } => {
+            | StatusUpdate::CostGuard { .. }
+            | StatusUpdate::ThreadList { .. }
+            | StatusUpdate::ConversationHistory { .. } => {
                 // Infrastructure status events are only rendered by the TUI
                 return Ok(());
             }

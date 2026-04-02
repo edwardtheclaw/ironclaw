@@ -1931,16 +1931,127 @@ impl Agent {
             .session_manager
             .get_or_create_session(&message.user_id)
             .await;
-        let mut sess = session.lock().await;
 
-        if sess.switch_thread(target_thread_id) {
-            Ok(SubmissionResult::ok_with_message(format!(
-                "Switched to thread {}",
-                target_thread_id
-            )))
-        } else {
-            Ok(SubmissionResult::error("Thread not found."))
+        // Check if thread is already in memory.
+        let in_memory = {
+            let sess = session.lock().await;
+            sess.threads.contains_key(&target_thread_id)
+        };
+
+        // If not in memory, hydrate from DB (reuses the maybe_hydrate_thread pattern).
+        if !in_memory {
+            let Some(store) = self.store() else {
+                return Ok(SubmissionResult::error(
+                    "Thread not found (no database configured).",
+                ));
+            };
+
+            // Verify ownership.
+            let owned = store
+                .conversation_belongs_to_user(target_thread_id, &message.user_id)
+                .await
+                .map_err(|e| crate::error::DatabaseError::Query(e.to_string()))?;
+
+            if !owned {
+                return Ok(SubmissionResult::error("Thread not found."));
+            }
+
+            // Load messages and rebuild chat history.
+            let db_messages = store
+                .list_conversation_messages(target_thread_id)
+                .await
+                .unwrap_or_default();
+            let chat_messages = rebuild_chat_messages_from_db(&db_messages);
+
+            // Read source_channel from DB for authorization.
+            let db_source_channel = match store
+                .get_conversation_source_channel(target_thread_id)
+                .await
+            {
+                Ok(sc) => sc,
+                Err(e) => {
+                    tracing::debug!(
+                        thread_id = %target_thread_id,
+                        error = %e,
+                        "Failed to read source_channel for thread switch"
+                    );
+                    None
+                }
+            };
+
+            let session_id = {
+                let sess = session.lock().await;
+                sess.id
+            };
+
+            let mut thread = crate::agent::session::Thread::with_id(
+                target_thread_id,
+                session_id,
+                db_source_channel.as_deref(),
+            );
+            if !chat_messages.is_empty() {
+                thread.restore_from_messages(chat_messages);
+            }
+
+            {
+                let mut sess = session.lock().await;
+                sess.threads.insert(target_thread_id, thread);
+            }
+
+            self.session_manager
+                .register_thread(
+                    &message.user_id,
+                    &message.channel,
+                    target_thread_id,
+                    Arc::clone(&session),
+                )
+                .await;
+
+            tracing::debug!("Hydrated thread {} from DB for switch", target_thread_id);
         }
+
+        // Switch the active thread.
+        {
+            let mut sess = session.lock().await;
+            if !sess.switch_thread(target_thread_id) {
+                return Ok(SubmissionResult::error("Thread not found."));
+            }
+        }
+
+        // Send conversation history to the TUI so messages display.
+        if let Some(store) = self.store() {
+            let db_messages = store
+                .list_conversation_messages(target_thread_id)
+                .await
+                .unwrap_or_default();
+
+            let history: Vec<crate::channels::HistoryMessage> = db_messages
+                .iter()
+                .filter(|m| matches!(m.role.as_str(), "user" | "assistant" | "system"))
+                .map(|m| crate::channels::HistoryMessage {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                    timestamp: m.created_at,
+                })
+                .collect();
+
+            let _ = self
+                .channels
+                .send_status(
+                    &message.channel,
+                    StatusUpdate::ConversationHistory {
+                        thread_id: target_thread_id.to_string(),
+                        messages: history,
+                    },
+                    &message.metadata,
+                )
+                .await;
+        }
+
+        Ok(SubmissionResult::ok_with_message(format!(
+            "Switched to thread {}",
+            target_thread_id
+        )))
     }
 
     pub(super) async fn process_resume(
@@ -1966,6 +2077,53 @@ impl Agent {
         } else {
             Ok(SubmissionResult::error("Checkpoint not found."))
         }
+    }
+
+    pub(super) async fn process_list_threads(
+        &self,
+        message: &IncomingMessage,
+    ) -> Result<SubmissionResult, Error> {
+        let Some(store) = self.store() else {
+            return Ok(SubmissionResult::ok_with_message(
+                "No conversation history available (no database configured).",
+            ));
+        };
+
+        let summaries = store
+            .list_conversations_all_channels(&message.user_id, 20)
+            .await
+            .map_err(|e| crate::error::DatabaseError::Query(e.to_string()))?;
+
+        if summaries.is_empty() {
+            return Ok(SubmissionResult::ok_with_message(
+                "No previous conversations found.",
+            ));
+        }
+
+        let threads: Vec<crate::channels::ThreadSummary> = summaries
+            .iter()
+            .map(|s| crate::channels::ThreadSummary {
+                id: s.id.to_string(),
+                title: s.title.clone(),
+                message_count: s.message_count,
+                last_activity: s.last_activity.format("%Y-%m-%d %H:%M").to_string(),
+                channel: s.channel.clone(),
+            })
+            .collect();
+
+        let count = threads.len();
+        let _ = self
+            .channels
+            .send_status(
+                &message.channel,
+                StatusUpdate::ThreadList { threads },
+                &message.metadata,
+            )
+            .await;
+
+        Ok(SubmissionResult::ok_with_message(format!(
+            "{count} conversation(s) available. Select one to resume."
+        )))
     }
 }
 

@@ -3881,7 +3881,9 @@ fn status_to_wit(
         | StatusUpdate::ContextPressure { .. }
         | StatusUpdate::SandboxStatus { .. }
         | StatusUpdate::SecretsStatus { .. }
-        | StatusUpdate::CostGuard { .. } => return None,
+        | StatusUpdate::CostGuard { .. }
+        | StatusUpdate::ThreadList { .. }
+        | StatusUpdate::ConversationHistory { .. } => return None,
         StatusUpdate::ReasoningUpdate {
             narrative,
             decisions,

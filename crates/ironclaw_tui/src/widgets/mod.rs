@@ -16,6 +16,7 @@ pub mod registry;
 pub mod status_bar;
 pub mod tab_bar;
 pub mod thread_list;
+pub mod thread_picker;
 pub mod tool_panel;
 
 use ratatui::buffer::Buffer;
@@ -162,6 +163,18 @@ pub struct AppState {
 
     /// Images pasted via Ctrl+V, pending submission with the next message.
     pub pending_attachments: Vec<crate::event::TuiAttachment>,
+
+    /// Pending thread picker (from /resume).
+    pub pending_thread_picker: Option<ThreadPickerState>,
+}
+
+/// State for the thread resume picker modal.
+#[derive(Debug, Clone)]
+pub struct ThreadPickerState {
+    /// Available threads to resume.
+    pub threads: Vec<crate::event::ThreadEntry>,
+    /// Currently selected index.
+    pub selected: usize,
 }
 
 impl Default for AppState {
@@ -210,6 +223,7 @@ impl Default for AppState {
             toasts: Vec::new(),
             tool_detail_modal: None,
             pending_attachments: Vec::new(),
+            pending_thread_picker: None,
         }
     }
 }

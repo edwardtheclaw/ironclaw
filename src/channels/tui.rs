@@ -407,6 +407,32 @@ impl Channel for TuiChannel {
                 limit_reached,
             },
             StatusUpdate::Suggestions { suggestions } => TuiEvent::Suggestions { suggestions },
+            StatusUpdate::ThreadList { threads } => TuiEvent::ThreadList {
+                threads: threads
+                    .into_iter()
+                    .map(|t| ironclaw_tui::ThreadEntry {
+                        id: t.id,
+                        title: t.title,
+                        message_count: t.message_count,
+                        last_activity: t.last_activity,
+                        channel: t.channel,
+                    })
+                    .collect(),
+            },
+            StatusUpdate::ConversationHistory {
+                thread_id,
+                messages,
+            } => TuiEvent::ConversationHistory {
+                thread_id,
+                messages: messages
+                    .into_iter()
+                    .map(|m| ironclaw_tui::HistoryMessage {
+                        role: m.role,
+                        content: m.content,
+                        timestamp: m.timestamp,
+                    })
+                    .collect(),
+            },
             StatusUpdate::SkillActivated { .. } | StatusUpdate::ImageGenerated { .. } => {
                 return Ok(());
             }

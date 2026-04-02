@@ -101,6 +101,10 @@ pub const COMMANDS: &[SlashCommand] = &[
         description: "Suggest next steps",
     },
     SlashCommand {
+        name: "/resume",
+        description: "Resume older conversation",
+    },
+    SlashCommand {
         name: "/quit",
         description: "Exit",
     },
@@ -381,6 +385,14 @@ mod tests {
         state.update_filter("");
         state.selected = 0;
         assert_eq!(state.selected_command(), Some("/help"));
+    }
+
+    #[test]
+    fn filter_matches_resume() {
+        let mut state = CommandPaletteState::default();
+        state.update_filter("res");
+        let names: Vec<&str> = state.filtered.iter().map(|&i| COMMANDS[i].name).collect();
+        assert!(names.contains(&"/resume"));
     }
 
     #[test]

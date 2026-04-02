@@ -40,7 +40,9 @@ pub mod theme;
 pub mod widgets;
 
 pub use app::{TuiAppConfig, TuiAppHandle, start_tui};
-pub use event::{TuiAttachment, TuiEvent, TuiLogEntry, TuiUserMessage};
+pub use event::{
+    HistoryMessage, ThreadEntry, TuiAttachment, TuiEvent, TuiLogEntry, TuiUserMessage,
+};
 pub use layout::TuiLayout;
 pub use theme::Theme;
 pub use widgets::{AppState, SkillCategory, ToolCategory};

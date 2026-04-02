@@ -67,11 +67,20 @@ pub enum InputAction {
     ToolDetailClose,
     /// Paste image from system clipboard (Ctrl+V).
     ClipboardPaste,
+    /// Navigate thread picker up.
+    ThreadPickerUp,
+    /// Navigate thread picker down.
+    ThreadPickerDown,
+    /// Select the highlighted thread.
+    ThreadPickerSelect,
+    /// Close the thread picker.
+    ThreadPickerClose,
     /// No recognized action — pass to input box.
     Forward,
 }
 
 /// Map a key event to an action, considering active modal/context state.
+#[allow(clippy::too_many_arguments)]
 pub fn map_key(
     key: KeyEvent,
     approval_active: bool,
@@ -80,7 +89,12 @@ pub fn map_key(
     help_active: bool,
     tool_detail_active: bool,
     logs_active: bool,
+    thread_picker_active: bool,
 ) -> InputAction {
+    if thread_picker_active {
+        return map_thread_picker_key(key);
+    }
+
     if approval_active {
         return map_approval_key(key);
     }
@@ -186,6 +200,18 @@ fn map_palette_key(key: KeyEvent) -> InputAction {
     }
 }
 
+/// Map key events when the thread picker modal is active.
+fn map_thread_picker_key(key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => InputAction::ThreadPickerUp,
+        KeyCode::Down | KeyCode::Char('j') => InputAction::ThreadPickerDown,
+        KeyCode::Enter => InputAction::ThreadPickerSelect,
+        KeyCode::Esc => InputAction::ThreadPickerClose,
+        KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => InputAction::Quit,
+        _ => InputAction::Forward,
+    }
+}
+
 /// Map key events when the approval dialog is active.
 fn map_approval_key(key: KeyEvent) -> InputAction {
     match key.code {
@@ -215,31 +241,35 @@ mod tests {
     use super::*;
 
     fn map_default(key: KeyEvent) -> InputAction {
-        map_key(key, false, false, false, false, false, false)
+        map_key(key, false, false, false, false, false, false, false)
     }
 
     fn map_approval(key: KeyEvent) -> InputAction {
-        map_key(key, true, false, false, false, false, false)
+        map_key(key, true, false, false, false, false, false, false)
     }
 
     fn map_palette(key: KeyEvent) -> InputAction {
-        map_key(key, false, true, false, false, false, false)
+        map_key(key, false, true, false, false, false, false, false)
     }
 
     fn map_search(key: KeyEvent) -> InputAction {
-        map_key(key, false, false, true, false, false, false)
+        map_key(key, false, false, true, false, false, false, false)
     }
 
     fn map_logs(key: KeyEvent) -> InputAction {
-        map_key(key, false, false, false, false, false, true)
+        map_key(key, false, false, false, false, false, true, false)
     }
 
     fn map_help(key: KeyEvent) -> InputAction {
-        map_key(key, false, false, false, true, false, false)
+        map_key(key, false, false, false, true, false, false, false)
     }
 
     fn map_tool_detail(key: KeyEvent) -> InputAction {
-        map_key(key, false, false, false, false, true, false)
+        map_key(key, false, false, false, false, true, false, false)
+    }
+
+    fn map_thread_picker(key: KeyEvent) -> InputAction {
+        map_key(key, false, false, false, false, false, false, true)
     }
 
     #[test]
@@ -435,6 +465,40 @@ mod tests {
     fn ctrl_v_clipboard_paste() {
         let key = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
         assert_eq!(map_default(key), InputAction::ClipboardPaste);
+    }
+
+    #[test]
+    fn thread_picker_up_down() {
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(map_thread_picker(up), InputAction::ThreadPickerUp);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(map_thread_picker(down), InputAction::ThreadPickerDown);
+    }
+
+    #[test]
+    fn thread_picker_jk_navigation() {
+        let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(map_thread_picker(j), InputAction::ThreadPickerDown);
+        let k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(map_thread_picker(k), InputAction::ThreadPickerUp);
+    }
+
+    #[test]
+    fn thread_picker_enter_selects() {
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(map_thread_picker(key), InputAction::ThreadPickerSelect);
+    }
+
+    #[test]
+    fn thread_picker_esc_closes() {
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(map_thread_picker(key), InputAction::ThreadPickerClose);
+    }
+
+    #[test]
+    fn thread_picker_ctrl_c_quits() {
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(map_thread_picker(key), InputAction::Quit);
     }
 
     #[test]

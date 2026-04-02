@@ -1610,6 +1610,7 @@ impl Agent {
             }
             Submission::JobCancel { job_id } => self.process_job_cancel(&tenant, &job_id).await,
             Submission::Quit => return Ok(None),
+            Submission::ListThreads => self.process_list_threads(message).await,
             Submission::SwitchThread { thread_id: target } => {
                 self.process_switch_thread(message, target).await
             }

@@ -303,6 +303,7 @@ async fn handle_event(
             let help_active = state.help_visible;
             let tool_detail_active = state.tool_detail_modal.is_some();
             let logs_active = state.active_tab == ActiveTab::Logs;
+            let thread_picker_active = state.pending_thread_picker.is_some();
             let action = map_key(
                 key,
                 approval_active,
@@ -311,6 +312,7 @@ async fn handle_event(
                 help_active,
                 tool_detail_active,
                 logs_active,
+                thread_picker_active,
             );
 
             match action {
@@ -562,6 +564,29 @@ async fn handle_event(
                         });
                         state.pending_attachments.push(attachment);
                     }
+                }
+                InputAction::ThreadPickerUp => {
+                    if let Some(ref mut picker) = state.pending_thread_picker {
+                        crate::widgets::thread_picker::thread_picker_up(picker);
+                    }
+                }
+                InputAction::ThreadPickerDown => {
+                    if let Some(ref mut picker) = state.pending_thread_picker {
+                        crate::widgets::thread_picker::thread_picker_down(picker);
+                    }
+                }
+                InputAction::ThreadPickerSelect => {
+                    if let Some(ref picker) = state.pending_thread_picker
+                        && let Some(id) =
+                            crate::widgets::thread_picker::thread_picker_selected_id(picker)
+                    {
+                        let cmd = format!("/thread {id}");
+                        let _ = msg_tx.send(TuiUserMessage::text_only(cmd)).await;
+                    }
+                    state.pending_thread_picker = None;
+                }
+                InputAction::ThreadPickerClose => {
+                    state.pending_thread_picker = None;
                 }
                 InputAction::Forward => {
                     if state.search.active {
@@ -1000,6 +1025,46 @@ async fn handle_event(
                 timestamp,
             });
         }
+
+        TuiEvent::ThreadList { threads } => {
+            if !threads.is_empty() {
+                state.pending_thread_picker = Some(super::widgets::ThreadPickerState {
+                    threads,
+                    selected: 0,
+                });
+            }
+        }
+
+        TuiEvent::ConversationHistory { messages, .. } => {
+            state.messages.clear();
+            state.active_tools.clear();
+            state.recent_tools.clear();
+            state.is_streaming = false;
+            state.status_text.clear();
+            state.pending_approval = None;
+            state.suggestions.clear();
+
+            for msg in &messages {
+                let role = match msg.role.as_str() {
+                    "user" => MessageRole::User,
+                    "assistant" => MessageRole::Assistant,
+                    _ => MessageRole::System,
+                };
+                state.messages.push(ChatMessage {
+                    role,
+                    content: msg.content.clone(),
+                    timestamp: msg.timestamp,
+                    cost_summary: None,
+                });
+            }
+
+            state.scroll_offset = 0;
+            state.toasts.push(Toast {
+                message: format!("Resumed conversation ({} messages)", state.messages.len()),
+                kind: ToastKind::Info,
+                created_at: chrono::Utc::now(),
+            });
+        }
     }
 }
 
@@ -1145,6 +1210,17 @@ fn render_frame(
         widgets
             .approval
             .render(modal_area, frame.buffer_mut(), state);
+    }
+
+    // Thread picker modal (/resume)
+    if let Some(ref picker) = state.pending_thread_picker {
+        let modal_area = crate::widgets::thread_picker::ThreadPickerWidget::modal_area(
+            size,
+            picker.threads.len(),
+        );
+        widgets
+            .thread_picker
+            .render_picker(modal_area, frame.buffer_mut(), state);
     }
 
     // Tool detail modal (Ctrl+E)

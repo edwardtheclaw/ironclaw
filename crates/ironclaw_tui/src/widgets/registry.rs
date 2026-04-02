@@ -16,6 +16,7 @@ use super::logs::LogsWidget;
 use super::status_bar::StatusBarWidget;
 use super::tab_bar::TabBarWidget;
 use super::thread_list::ThreadListWidget;
+use super::thread_picker::ThreadPickerWidget;
 use super::tool_panel::ToolPanelWidget;
 
 /// Create the default set of built-in widgets.
@@ -33,6 +34,7 @@ pub fn create_default_widgets(layout: &TuiLayout) -> BuiltinWidgets {
         thread_list: ThreadListWidget::new(theme.clone()),
         approval: super::approval::ApprovalWidget::new(theme.clone()),
         help: HelpOverlayWidget::new(theme.clone()),
+        thread_picker: ThreadPickerWidget::new(theme.clone()),
         command_palette: CommandPaletteWidget::new(theme),
     }
 }
@@ -52,6 +54,7 @@ pub struct BuiltinWidgets {
     pub thread_list: ThreadListWidget,
     pub approval: super::approval::ApprovalWidget,
     pub help: HelpOverlayWidget,
+    pub thread_picker: ThreadPickerWidget,
     pub command_palette: CommandPaletteWidget,
 }
 

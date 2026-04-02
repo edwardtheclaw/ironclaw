@@ -396,6 +396,31 @@ pub enum StatusUpdate {
     },
     /// Skills activated for this conversation turn.
     SkillActivated { skill_names: Vec<String> },
+    /// Thread list for interactive resume picker.
+    ThreadList { threads: Vec<ThreadSummary> },
+    /// Full conversation history for displaying a resumed thread in the TUI.
+    ConversationHistory {
+        thread_id: String,
+        messages: Vec<HistoryMessage>,
+    },
+}
+
+/// A single message from conversation history, for hydrating the TUI on thread resume.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HistoryMessage {
+    pub role: String,
+    pub content: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// Lightweight thread summary for the resume picker.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ThreadSummary {
+    pub id: String,
+    pub title: Option<String>,
+    pub message_count: i64,
+    pub last_activity: String,
+    pub channel: String,
 }
 
 const DETAIL_MAX_LEN: usize = 80;

@@ -85,6 +85,24 @@ impl TuiUserMessage {
     }
 }
 
+/// A past conversation entry for the resume/thread picker.
+#[derive(Debug, Clone)]
+pub struct ThreadEntry {
+    pub id: String,
+    pub title: Option<String>,
+    pub message_count: i64,
+    pub last_activity: String,
+    pub channel: String,
+}
+
+/// A single message from conversation history, for hydrating the TUI on thread resume.
+#[derive(Debug, Clone)]
+pub struct HistoryMessage {
+    pub role: String,
+    pub content: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
 /// Events consumed by the TUI run loop.
 #[derive(Debug, Clone)]
 pub enum TuiEvent {
@@ -220,5 +238,14 @@ pub enum TuiEvent {
         target: String,
         message: String,
         timestamp: String,
+    },
+
+    /// Thread list for the interactive resume picker.
+    ThreadList { threads: Vec<ThreadEntry> },
+
+    /// Full conversation history for a resumed thread.
+    ConversationHistory {
+        thread_id: String,
+        messages: Vec<HistoryMessage>,
     },
 }
