@@ -476,8 +476,9 @@ mod tests {
                 || error.contains("connect")
                 || error.contains("502")
                 || error.contains("503")
-                || error.contains("504"),
-            "Expected connection or gateway error, got: {error}",
+                || error.contains("504")
+                || error.contains("403"),
+            "Expected connection, gateway, or proxy error, got: {error}",
         );
     }
 
