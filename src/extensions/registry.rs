@@ -6,8 +6,8 @@
 use tokio::sync::RwLock;
 
 use crate::extensions::{
-    naming::canonicalize_extension_name,
     AuthHint, ExtensionKind, ExtensionSource, RegistryEntry, ResultSource, SearchResult,
+    naming::canonicalize_extension_name,
 };
 
 /// Curated extension registry with fuzzy search.
@@ -55,7 +55,7 @@ impl ExtensionRegistry {
         let tokens: Vec<String> = query
             .to_lowercase()
             .split_whitespace()
-            .map(|s| s.to_string())
+            .map(|s| canonicalize_extension_name(s).unwrap_or_else(|_| s.to_string()))
             .collect();
 
         if tokens.is_empty() {
@@ -540,10 +540,10 @@ mod tests {
         let results = registry.search("dual-ext").await;
         let has_mcp = results
             .iter()
-            .any(|r| r.entry.name == "dual-ext" && r.entry.kind == ExtensionKind::McpServer);
+            .any(|r| r.entry.name == "dual_ext" && r.entry.kind == ExtensionKind::McpServer);
         let has_wasm = results
             .iter()
-            .any(|r| r.entry.name == "dual-ext" && r.entry.kind == ExtensionKind::WasmTool);
+            .any(|r| r.entry.name == "dual_ext" && r.entry.kind == ExtensionKind::WasmTool);
         assert!(has_mcp, "Should have MCP dual-ext");
         assert!(has_wasm, "Should have WASM dual-ext");
     }

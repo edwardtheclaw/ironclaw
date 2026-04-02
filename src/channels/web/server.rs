@@ -2010,7 +2010,10 @@ async fn engine_pending_gate_info(
     })
 }
 
-async fn history_pending_gate_info(user_id: &str, thread_id: Option<&str>) -> Option<PendingGateInfo> {
+async fn history_pending_gate_info(
+    user_id: &str,
+    thread_id: Option<&str>,
+) -> Option<PendingGateInfo> {
     let scoped = engine_pending_gate_info(user_id, thread_id).await;
     if scoped.is_some() || thread_id.is_none() {
         return scoped;

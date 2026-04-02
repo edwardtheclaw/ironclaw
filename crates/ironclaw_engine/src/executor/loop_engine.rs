@@ -1115,17 +1115,17 @@ mod tests {
 
         exec.run().await.unwrap();
 
-        // Find the ActionResult message on the thread
+        // Find the ActionResult message in the internal orchestrator transcript
         let action_results: Vec<_> = exec
             .thread
-            .messages
+            .internal_messages
             .iter()
             .filter(|m| m.role == crate::types::message::MessageRole::ActionResult)
             .collect();
 
         assert!(
             !action_results.is_empty(),
-            "thread should have at least one ActionResult message"
+            "thread should have at least one internal ActionResult message"
         );
 
         for msg in &action_results {
@@ -1178,7 +1178,7 @@ mod tests {
         }
     }
 
-    /// When a tool call fails (no lease), the ActionResult message and
+    /// When a tool call fails (no lease), the internal ActionResult message and
     /// ActionFailed event must still carry the original call_id.
     #[tokio::test]
     async fn failed_action_preserves_call_id_in_message_and_event() {
@@ -1229,10 +1229,10 @@ mod tests {
 
         exec.run().await.unwrap();
 
-        // Check ActionResult messages
+        // Check internal ActionResult messages
         let action_results: Vec<_> = exec
             .thread
-            .messages
+            .internal_messages
             .iter()
             .filter(|m| m.role == crate::types::message::MessageRole::ActionResult)
             .collect();

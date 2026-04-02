@@ -226,7 +226,7 @@ When context pressure reaches the configured threshold, the Python orchestrator 
 3. Preserve full prior trajectory in searchable/project-scoped history accessible to code
 4. Continue to rely on retrieval/search over workspace-backed artifacts rather than replaying raw history into the attention window
 
-Rust should provide token estimates, retrieval helpers, and message mutation hooks. The compaction policy, timing, and prompt should live in the Python RLM loop.
+Rust should provide token estimates, retrieval helpers, checkpoints, and final transcript commit points. The compaction policy, timing, and prompt should live in the Python RLM loop, and the orchestrator should own the mutable working transcript it sends to the LLM.
 
 ### 4.4 `rlm_query()` — full recursive sub-agent
 Unlike `llm_query()` (single-shot text completion), `rlm_query(prompt)` spawns a **child thread with its own CodeAct executor**:
@@ -343,7 +343,7 @@ The existing `Channel` trait stays. A bridge adapter translates:
 Engine broadcasts `ThreadEvent`s via `tokio::broadcast`. Router subscribes and forwards as `StatusUpdate` to channel: Thinking, ToolCompleted (success/error), Processing results.
 
 ### 6.4 Conversation persistence — DONE
-`EngineState` persists across messages (OnceLock singleton). ConversationManager builds message history from prior entries for context continuity. State dict (`persisted_state`) carries tool results across code steps.
+`EngineState` persists across messages (OnceLock singleton). ConversationManager builds the visible conversation transcript for continuity. The orchestrator persists its mutable working transcript and intermediate execution state in `persisted_state` / internal thread transcript rather than mixing tool traces into the user-visible transcript.
 
 ### 6.5 Trace recording + retrospective — DONE
 `ENGINE_V2_TRACE=1` writes full JSON traces. Automatic trace analysis detects 8 issue categories. Reflection pipeline produces Summary/Lesson/Issue/Spec/Playbook docs. All run inside ThreadManager after thread completion.
@@ -493,7 +493,8 @@ Once boundaries stabilize, split if beneficial:
 - **Thread-structural events** (thread.started, step.completed, action.executed) vs per-subsystem
 
 ### RLM Execution Model
-- **Context as variable**: thread messages/goal/results injected as Python variables, not LLM attention input
+- **Transcript split**: `thread.messages` is the user-visible conversation surface; internal orchestrator/tool history is persisted separately and can diverge from the visible transcript
+- **Context as variable**: goal, visible transcript bootstrap, and persisted internal working state are injected into Python variables; the orchestrator chooses the explicit message history sent to the LLM
 - **Output truncation**: 8K chars between steps (configurable), with `[TRUNCATED]`/`[FULL OUTPUT]` prefixes
 - **Step 0 orientation**: auto-inject context metadata before first code step
 - **FINAL()/FINAL_VAR()**: explicit termination from within code

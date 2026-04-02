@@ -651,13 +651,13 @@ mod advanced {
         // 6. Simulate OAuth completion: inject token + activate.
         // This mirrors what the gateway's oauth_callback_handler does after
         // the user completes the OAuth flow in their browser.
-        let secret_name = "mcp_mock-notion_access_token";
+        let secret_name = "mcp_mock_notion_access_token";
         ext_mgr
             .secrets()
             .create(
                 TEST_USER_ID,
                 ironclaw::secrets::CreateSecretParams::new(secret_name, "mock-access-token")
-                    .with_provider("mcp:mock-notion".to_string()),
+                    .with_provider("mcp:mock_notion".to_string()),
             )
             .await
             .expect("failed to inject test token");
@@ -694,7 +694,8 @@ mod advanced {
 
         // Verify MCP tools were called in turn 2.
         assert!(
-            started.iter().any(|s| s.starts_with("mock-notion_")),
+            started.iter().any(|s| s == "mock_notion_notion-search")
+                && started.iter().any(|s| s == "mock_notion_notion-fetch"),
             "No mock-notion MCP tools called: {started:?}"
         );
 

@@ -831,7 +831,8 @@ async fn resolve_pending_gate_for_user(
         .await
         .into_iter()
         .filter(|gate| {
-            hinted_uuid.is_none_or(|hint| gate.thread_id.0 == hint || gate.conversation_id.0 == hint)
+            hinted_uuid
+                .is_none_or(|hint| gate.thread_id.0 == hint || gate.conversation_id.0 == hint)
         })
         .collect();
 

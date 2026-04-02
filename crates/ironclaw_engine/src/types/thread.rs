@@ -181,7 +181,12 @@ pub struct Thread {
     pub user_id: String,
     pub parent_id: Option<ThreadId>,
     pub config: ThreadConfig,
+    /// User-visible transcript for the thread.
     pub messages: Vec<ThreadMessage>,
+    /// Internal execution transcript used by the orchestrator for inference,
+    /// tool traces, compaction, and resumable working state.
+    #[serde(default)]
+    pub internal_messages: Vec<ThreadMessage>,
     pub events: Vec<ThreadEvent>,
     pub capability_leases: Vec<LeaseId>,
     pub metadata: serde_json::Value,
@@ -214,6 +219,7 @@ impl Thread {
             parent_id: None,
             config,
             messages: Vec::new(),
+            internal_messages: Vec::new(),
             events: Vec::new(),
             capability_leases: Vec::new(),
             metadata: serde_json::Value::Object(serde_json::Map::new()),
@@ -291,6 +297,13 @@ impl Thread {
             content_preview: preview,
         });
         self.messages.push(message);
+    }
+
+    /// Add a message to the internal execution transcript without exposing it
+    /// as a user-visible conversation message.
+    pub fn add_internal_message(&mut self, message: ThreadMessage) {
+        self.internal_messages.push(message);
+        self.updated_at = Utc::now();
     }
 }
 

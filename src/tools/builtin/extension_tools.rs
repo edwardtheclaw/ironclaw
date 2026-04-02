@@ -709,7 +709,9 @@ mod tests {
         assert!(activation_error_requires_auth("not authenticated"));
         assert!(activation_error_requires_auth("401 unauthorized"));
         assert!(activation_error_requires_auth("Unauthorized"));
-        assert!(!activation_error_requires_auth("Activation failed: crashed"));
+        assert!(!activation_error_requires_auth(
+            "Activation failed: crashed"
+        ));
     }
 
     #[test]

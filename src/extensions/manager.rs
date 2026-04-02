@@ -18,10 +18,10 @@ use crate::channels::{ChannelManager, OutgoingResponse};
 use crate::extensions::discovery::OnlineDiscovery;
 use crate::extensions::registry::ExtensionRegistry;
 use crate::extensions::{
-    naming::{canonicalize_extension_name, legacy_extension_alias},
     ActivateResult, AuthResult, ConfigureResult, ExtensionError, ExtensionKind, ExtensionSource,
     InstallResult, InstalledExtension, RegistryEntry, ResultSource, SearchResult, ToolAuthState,
     UpgradeOutcome, UpgradeResult, VerificationChallenge,
+    naming::{canonicalize_extension_name, legacy_extension_alias},
 };
 use crate::hooks::HookRegistry;
 use crate::pairing::PairingStore;
@@ -495,6 +495,30 @@ fn sanitize_url_for_logging(url: &str) -> String {
 }
 
 impl ExtensionManager {
+    fn extension_name_candidates(name: &str) -> Vec<String> {
+        let mut candidates = vec![name.to_string()];
+        if let Some(legacy) = legacy_extension_alias(name)
+            && legacy != name
+        {
+            candidates.push(legacy);
+        }
+        candidates
+    }
+
+    fn existing_extension_file_path(
+        dir: &std::path::Path,
+        name: &str,
+        suffix: &str,
+    ) -> std::path::PathBuf {
+        for candidate in Self::extension_name_candidates(name) {
+            let path = dir.join(format!("{}{}", candidate, suffix));
+            if path.exists() {
+                return path;
+            }
+        }
+        dir.join(format!("{}{}", name, suffix))
+    }
+
     pub fn owner_id(&self) -> &str {
         &self.user_id
     }
@@ -1691,18 +1715,20 @@ impl ExtensionManager {
                 self.activation_errors.write().await.remove(&name);
 
                 // Revoke credential mappings from the shared registry
-                let cap_path = self
-                    .wasm_tools_dir
-                    .join(format!("{}.capabilities.json", name));
-                self.revoke_credential_mappings(&cap_path).await;
+                for candidate in Self::extension_name_candidates(&name) {
+                    let cap_path = self
+                        .wasm_tools_dir
+                        .join(format!("{}.capabilities.json", candidate));
+                    self.revoke_credential_mappings(&cap_path).await;
+                }
 
                 // Unregister hooks registered from this plugin source.
                 let removed_hooks = self
                     .unregister_hook_prefix(&format!("plugin.tool:{}::", name))
                     .await
                     + self
-                    .unregister_hook_prefix(&format!("plugin.dev_tool:{}::", name))
-                    .await;
+                        .unregister_hook_prefix(&format!("plugin.dev_tool:{}::", name))
+                        .await;
                 if removed_hooks > 0 {
                     tracing::info!(
                         extension = name,
@@ -1712,15 +1738,20 @@ impl ExtensionManager {
                 }
 
                 // Delete files
-                let wasm_path = self.wasm_tools_dir.join(format!("{}.wasm", name));
+                for candidate in Self::extension_name_candidates(&name) {
+                    let wasm_path = self.wasm_tools_dir.join(format!("{}.wasm", candidate));
+                    let cap_path = self
+                        .wasm_tools_dir
+                        .join(format!("{}.capabilities.json", candidate));
 
-                if wasm_path.exists() {
-                    tokio::fs::remove_file(&wasm_path)
-                        .await
-                        .map_err(|e| ExtensionError::Other(e.to_string()))?;
-                }
-                if cap_path.exists() {
-                    let _ = tokio::fs::remove_file(&cap_path).await;
+                    if wasm_path.exists() {
+                        tokio::fs::remove_file(&wasm_path)
+                            .await
+                            .map_err(|e| ExtensionError::Other(e.to_string()))?;
+                    }
+                    if cap_path.exists() {
+                        let _ = tokio::fs::remove_file(&cap_path).await;
+                    }
                 }
 
                 self.cleanup_uninstalled_extension_secrets(cleanup_plan, user_id)
@@ -1741,21 +1772,23 @@ impl ExtensionManager {
                 self.activation_errors.write().await.remove(&name);
 
                 // Delete channel files
-                let wasm_path = self.wasm_channels_dir.join(format!("{}.wasm", name));
-                let cap_path = self
-                    .wasm_channels_dir
-                    .join(format!("{}.capabilities.json", name));
+                for candidate in Self::extension_name_candidates(&name) {
+                    let wasm_path = self.wasm_channels_dir.join(format!("{}.wasm", candidate));
+                    let cap_path = self
+                        .wasm_channels_dir
+                        .join(format!("{}.capabilities.json", candidate));
 
-                // Revoke credential mappings before deleting the capabilities file
-                self.revoke_credential_mappings(&cap_path).await;
+                    // Revoke credential mappings before deleting the capabilities file
+                    self.revoke_credential_mappings(&cap_path).await;
 
-                if wasm_path.exists() {
-                    tokio::fs::remove_file(&wasm_path)
-                        .await
-                        .map_err(|e| ExtensionError::Other(e.to_string()))?;
-                }
-                if cap_path.exists() {
-                    let _ = tokio::fs::remove_file(&cap_path).await;
+                    if wasm_path.exists() {
+                        tokio::fs::remove_file(&wasm_path)
+                            .await
+                            .map_err(|e| ExtensionError::Other(e.to_string()))?;
+                    }
+                    if cap_path.exists() {
+                        let _ = tokio::fs::remove_file(&cap_path).await;
+                    }
                 }
 
                 self.cleanup_uninstalled_extension_secrets(cleanup_plan, user_id)
@@ -1767,34 +1800,51 @@ impl ExtensionManager {
                 ))
             }
             ExtensionKind::ChannelRelay => {
+                let candidate_names = Self::extension_name_candidates(&name);
+
                 // Remove from installed set
-                self.installed_relay_extensions.write().await.remove(&name);
+                {
+                    let mut installed = self.installed_relay_extensions.write().await;
+                    for candidate in &candidate_names {
+                        installed.remove(candidate);
+                    }
+                }
 
                 // Remove from active channels
-                self.active_channel_names.write().await.remove(&name);
+                {
+                    let mut active_channels = self.active_channel_names.write().await;
+                    for candidate in &candidate_names {
+                        active_channels.remove(candidate);
+                    }
+                }
                 self.persist_active_channels(user_id).await;
                 self.activation_errors.write().await.remove(&name);
 
                 // Remove stored team_id setting and clean up secrets
-                if let Some(ref store) = self.store
-                    && let Err(e) = store
-                        .delete_setting(user_id, &format!("relay:{}:team_id", name))
+                if let Some(ref store) = self.store {
+                    for candidate in &candidate_names {
+                        if let Err(e) = store
+                            .delete_setting(user_id, &format!("relay:{}:team_id", candidate))
+                            .await
+                        {
+                            tracing::warn!(error = %e, name = candidate, "Failed to delete relay team_id setting on removal");
+                        }
+                    }
+                }
+                for candidate in &candidate_names {
+                    if let Err(e) = self
+                        .secrets
+                        .delete(user_id, &format!("relay:{}:oauth_state", candidate))
                         .await
-                {
-                    tracing::warn!(error = %e, name, "Failed to delete relay team_id setting on removal");
+                    {
+                        tracing::warn!(error = %e, name = candidate, "Failed to delete relay oauth_state secret on removal");
+                    }
+                    // Clean up legacy stream_token secret from pre-webhook installs
+                    let _ = self
+                        .secrets
+                        .delete(user_id, &format!("relay:{}:stream_token", candidate))
+                        .await;
                 }
-                if let Err(e) = self
-                    .secrets
-                    .delete(user_id, &format!("relay:{}:oauth_state", name))
-                    .await
-                {
-                    tracing::warn!(error = %e, name, "Failed to delete relay oauth_state secret on removal");
-                }
-                // Clean up legacy stream_token secret from pre-webhook installs
-                let _ = self
-                    .secrets
-                    .delete(user_id, &format!("relay:{}:stream_token", name))
-                    .await;
 
                 // Stop webhook traffic before removing the channel from the managers.
                 self.clear_relay_webhook_state().await;
@@ -1802,19 +1852,22 @@ impl ExtensionManager {
                 // Shut down and remove the channel (check both runtime paths for
                 // WASM+relay and relay-only modes).
                 let mut shut_down = false;
-                if let Some(ref rt) = *self.channel_runtime.read().await
-                    && let Some(channel) = rt.channel_manager.get_channel(&name).await
-                {
-                    let _ = channel.shutdown().await;
-                    rt.channel_manager.remove(&name).await;
-                    shut_down = true;
+                if let Some(ref rt) = *self.channel_runtime.read().await {
+                    for candidate in &candidate_names {
+                        if let Some(channel) = rt.channel_manager.get_channel(candidate).await {
+                            let _ = channel.shutdown().await;
+                            rt.channel_manager.remove(candidate).await;
+                            shut_down = true;
+                        }
+                    }
                 }
-                if !shut_down
-                    && let Some(ref cm) = *self.relay_channel_manager.read().await
-                    && let Some(channel) = cm.get_channel(&name).await
-                {
-                    let _ = channel.shutdown().await;
-                    cm.remove(&name).await;
+                if !shut_down && let Some(ref cm) = *self.relay_channel_manager.read().await {
+                    for candidate in &candidate_names {
+                        if let Some(channel) = cm.get_channel(candidate).await {
+                            let _ = channel.shutdown().await;
+                            cm.remove(candidate).await;
+                        }
+                    }
                 }
 
                 Ok(format!("Removed channel relay '{}'", name))
@@ -3020,14 +3073,7 @@ impl ExtensionManager {
 
     /// Determine the auth readiness of a WASM channel.
     async fn check_channel_auth_status(&self, name: &str, user_id: &str) -> ToolAuthState {
-        let cap_path = self
-            .wasm_channels_dir
-            .join(format!("{}.capabilities.json", name));
-        let Ok(cap_bytes) = tokio::fs::read(&cap_path).await else {
-            return ToolAuthState::NoAuth;
-        };
-        let Ok(cap_file) = crate::channels::wasm::ChannelCapabilitiesFile::from_bytes(&cap_bytes)
-        else {
+        let Some(cap_file) = self.load_channel_capabilities(name).await else {
             return ToolAuthState::NoAuth;
         };
 
@@ -3064,9 +3110,8 @@ impl ExtensionManager {
         &self,
         name: &str,
     ) -> Option<crate::tools::wasm::CapabilitiesFile> {
-        let cap_path = self
-            .wasm_tools_dir
-            .join(format!("{}.capabilities.json", name));
+        let cap_path =
+            Self::existing_extension_file_path(&self.wasm_tools_dir, name, ".capabilities.json");
         let cap_bytes = tokio::fs::read(&cap_path).await.ok()?;
         crate::tools::wasm::CapabilitiesFile::from_bytes(&cap_bytes).ok()
     }
@@ -3075,9 +3120,8 @@ impl ExtensionManager {
         &self,
         name: &str,
     ) -> Option<crate::channels::wasm::ChannelCapabilitiesFile> {
-        let cap_path = self
-            .wasm_channels_dir
-            .join(format!("{}.capabilities.json", name));
+        let cap_path =
+            Self::existing_extension_file_path(&self.wasm_channels_dir, name, ".capabilities.json");
         let cap_bytes = tokio::fs::read(&cap_path).await.ok()?;
         crate::channels::wasm::ChannelCapabilitiesFile::from_bytes(&cap_bytes).ok()
     }
@@ -3997,23 +4041,12 @@ impl ExtensionManager {
         name: &str,
         user_id: &str,
     ) -> Result<AuthResult, ExtensionError> {
-        let cap_path = self
-            .wasm_channels_dir
-            .join(format!("{}.capabilities.json", name));
-
-        if !cap_path.exists() {
+        let Some(cap_file) = self.load_channel_capabilities(name).await else {
             return Ok(AuthResult::no_auth_required(
                 name,
                 ExtensionKind::WasmChannel,
             ));
-        }
-
-        let cap_bytes = tokio::fs::read(&cap_path)
-            .await
-            .map_err(|e| ExtensionError::Other(e.to_string()))?;
-
-        let cap_file = crate::channels::wasm::ChannelCapabilitiesFile::from_bytes(&cap_bytes)
-            .map_err(|e| ExtensionError::Other(e.to_string()))?;
+        };
 
         let required_secrets = &cap_file.setup.required_secrets;
         if required_secrets.is_empty() {
@@ -5074,7 +5107,11 @@ impl ExtensionManager {
             return Ok(ExtensionKind::ChannelRelay);
         }
         if let Some(ref legacy_name) = legacy_name
-            && self.installed_relay_extensions.read().await.contains(legacy_name)
+            && self
+                .installed_relay_extensions
+                .read()
+                .await
+                .contains(legacy_name)
         {
             return Ok(ExtensionKind::ChannelRelay);
         }

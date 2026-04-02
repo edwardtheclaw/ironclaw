@@ -908,6 +908,7 @@ fn thread_from_archive(summary: &ThreadArchiveSummary) -> Option<Thread> {
         parent_id: None,
         config: ironclaw_engine::ThreadConfig::default(),
         messages: Vec::new(),
+        internal_messages: Vec::new(),
         events: Vec::new(),
         capability_leases: Vec::new(),
         metadata: serde_json::Value::Object(serde_json::Map::new()),
