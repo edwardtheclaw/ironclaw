@@ -726,6 +726,26 @@ CREATE INDEX IF NOT EXISTS idx_routines_event_triggers
 PRAGMA foreign_keys=ON;
 "#,
     ),
+    (
+        14,
+        "webhook_events",
+        // Audit log for inbound webhook deliveries. Records timestamp, channel,
+        // whether HMAC was valid, SHA-256 hash of payload, and user_id.
+        // Retained for 90 days; older rows can be pruned by hygiene passes.
+        r#"
+CREATE TABLE IF NOT EXISTS webhook_events (
+    id TEXT PRIMARY KEY,
+    received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    channel TEXT NOT NULL,
+    hmac_valid INTEGER,
+    payload_hash TEXT NOT NULL,
+    user_id TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_webhook_events_user_received
+    ON webhook_events(user_id, received_at DESC);
+"#,
+    ),
 ];
 
 /// Run incremental migrations that haven't been applied yet.

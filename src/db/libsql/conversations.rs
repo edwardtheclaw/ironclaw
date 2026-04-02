@@ -565,6 +565,61 @@ impl ConversationStore for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(found.is_some())
     }
+
+    async fn search_conversations(
+        &self,
+        user_id: &str,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<crate::history::ConversationSearchHit>, DatabaseError> {
+        let conn = self.connect().await?;
+        // Use LIKE for cross-backend compatibility. SQLite LIKE is case-insensitive
+        // for ASCII, which is sufficient for personal assistant search.
+        let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT c.id, c.channel, c.last_activity,
+                       substr(cm.content, 1, 200) AS snippet,
+                       (SELECT content FROM conversation_messages
+                        WHERE conversation_id = c.id AND role = 'user'
+                        ORDER BY created_at ASC LIMIT 1) AS title
+                FROM conversations c
+                JOIN conversation_messages cm ON cm.conversation_id = c.id
+                WHERE c.user_id = ?1
+                  AND cm.role IN ('user', 'assistant')
+                  AND cm.content LIKE ?2 ESCAPE '\'
+                GROUP BY c.id
+                ORDER BY c.last_activity DESC
+                LIMIT ?3
+                "#,
+                libsql::params![user_id, pattern.as_str(), limit],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut hits = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            let id_str: String = row
+                .get(0)
+                .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            let conversation_id: Uuid = id_str
+                .parse()
+                .map_err(|_| DatabaseError::Serialization("Invalid UUID".to_string()))?;
+            hits.push(crate::history::ConversationSearchHit {
+                conversation_id,
+                channel: get_text(&row, 1),
+                last_activity: get_ts(&row, 2),
+                snippet: get_text(&row, 3),
+                title: row.get::<String>(4).ok().filter(|s| !s.is_empty()),
+            });
+        }
+        Ok(hits)
+    }
 }
 
 #[cfg(test)]

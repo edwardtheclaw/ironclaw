@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Query, State, WebSocketUpgrade},
+    extract::{Path, Query, State, WebSocketUpgrade},
     http::StatusCode,
     response::IntoResponse,
 };
@@ -583,6 +583,130 @@ pub async fn chat_new_thread_handler(
     }
 
     Ok(Json(info))
+}
+
+/// Export a conversation thread as JSON or Markdown.
+///
+/// `GET /api/chat/threads/{id}/export?format=json|markdown`
+pub async fn chat_export_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(thread_id): Path<Uuid>,
+    Query(query): Query<crate::channels::web::types::ExportQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Verify ownership before returning any data.
+    let store = state
+        .store
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "Database not available".to_string()))?;
+
+    let owned = store
+        .conversation_belongs_to_user(thread_id, &state.user_id)
+        .await
+        .unwrap_or(false);
+    if !owned {
+        // Also accept threads that are alive in the in-memory session.
+        let in_memory = if let Some(ref sm) = state.session_manager {
+            let session = sm.get_or_create_session(&state.user_id).await;
+            let sess = session.lock().await;
+            sess.threads.contains_key(&thread_id)
+        } else {
+            false
+        };
+        if !in_memory {
+            return Err((StatusCode::NOT_FOUND, "Thread not found".to_string()));
+        }
+    }
+
+    let messages = store
+        .list_conversation_messages(thread_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let format = query.format.as_deref().unwrap_or("json");
+    let exported_at = chrono::Utc::now().to_rfc3339();
+
+    match format {
+        "markdown" => {
+            let mut md = format!("# Conversation {thread_id}\n\nExported: {exported_at}\n\n---\n\n");
+            for msg in &messages {
+                let speaker = match msg.role.as_str() {
+                    "user" => "**User**",
+                    "assistant" => "**Assistant**",
+                    other => other,
+                };
+                md.push_str(&format!("{speaker}\n\n{}\n\n---\n\n", msg.content));
+            }
+            Ok((
+                axum::http::StatusCode::OK,
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/markdown; charset=utf-8",
+                )],
+                md,
+            )
+                .into_response())
+        }
+        _ => {
+            use crate::channels::web::types::{ConversationExportResponse, ExportedMessage};
+            let exported = ConversationExportResponse {
+                thread_id: thread_id.to_string(),
+                exported_at,
+                message_count: messages.len(),
+                messages: messages
+                    .into_iter()
+                    .map(|m| ExportedMessage {
+                        id: m.id.to_string(),
+                        role: m.role,
+                        content: m.content,
+                        created_at: m.created_at.to_rfc3339(),
+                    })
+                    .collect(),
+            };
+            Ok(Json(exported).into_response())
+        }
+    }
+}
+
+/// Search conversation history by keyword.
+///
+/// `GET /api/chat/search?q=...&limit=20`
+pub async fn chat_search_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(query): Query<crate::channels::web::types::ChatSearchQuery>,
+) -> Result<Json<crate::channels::web::types::ChatSearchResponse>, (StatusCode, String)> {
+    use crate::channels::web::types::{ChatSearchHit, ChatSearchResponse};
+
+    if query.q.trim().is_empty() {
+        return Ok(Json(ChatSearchResponse {
+            query: query.q,
+            hits: Vec::new(),
+        }));
+    }
+
+    let store = state
+        .store
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "Database not available".to_string()))?;
+
+    let limit = query.limit.unwrap_or(20).min(100);
+    let hits = store
+        .search_conversations(&state.user_id, &query.q, limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ChatSearchResponse {
+        query: query.q,
+        hits: hits
+            .into_iter()
+            .map(|h| ChatSearchHit {
+                thread_id: h.conversation_id.to_string(),
+                title: h.title,
+                snippet: h.snippet,
+                channel: h.channel,
+                last_activity: h.last_activity.to_rfc3339(),
+            })
+            .collect(),
+    }))
 }
 
 #[cfg(test)]

@@ -939,6 +939,88 @@ pub struct SettingsExportResponse {
     pub settings: std::collections::HashMap<String, serde_json::Value>,
 }
 
+// --- Export ---
+
+#[derive(Debug, Deserialize)]
+pub struct ExportQuery {
+    /// Output format: "json" (default) or "markdown".
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExportedMessage {
+    pub id: String,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConversationExportResponse {
+    pub thread_id: String,
+    pub exported_at: String,
+    pub message_count: usize,
+    pub messages: Vec<ExportedMessage>,
+}
+
+// --- Search ---
+
+#[derive(Debug, Deserialize)]
+pub struct ChatSearchQuery {
+    pub q: String,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatSearchHit {
+    pub thread_id: String,
+    pub title: Option<String>,
+    pub snippet: String,
+    pub channel: String,
+    pub last_activity: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatSearchResponse {
+    pub query: String,
+    pub hits: Vec<ChatSearchHit>,
+}
+
+// --- Hygiene Settings ---
+
+#[derive(Debug, Serialize)]
+pub struct HygieneSettingsResponse {
+    pub enabled: bool,
+    pub daily_retention_days: u32,
+    pub conversation_retention_days: u32,
+    pub cadence_hours: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HygieneSettingsRequest {
+    pub enabled: Option<bool>,
+    pub daily_retention_days: Option<u32>,
+    pub conversation_retention_days: Option<u32>,
+    pub cadence_hours: Option<u32>,
+}
+
+// --- Webhook Audit ---
+
+#[derive(Debug, Serialize)]
+pub struct WebhookEventResponse {
+    pub id: String,
+    pub received_at: String,
+    pub channel: String,
+    pub hmac_valid: Option<bool>,
+    pub payload_hash: String,
+    pub user_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WebhookEventsResponse {
+    pub events: Vec<WebhookEventResponse>,
+}
+
 // --- Health ---
 
 #[derive(Debug, Serialize)]

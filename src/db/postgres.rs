@@ -17,12 +17,12 @@ use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
     ConversationStore, Database, JobStore, RoutineStore, SandboxStore, SettingsStore,
-    ToolFailureStore, WorkspaceStore,
+    ToolFailureStore, WebhookAuditStore, WorkspaceStore,
 };
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::history::{
     AgentJobRecord, AgentJobSummary, ConversationMessage, ConversationSummary, JobEventRecord,
-    LlmCallRecord, SandboxJobRecord, SandboxJobSummary, SettingRow, Store,
+    LlmCallRecord, SandboxJobRecord, SandboxJobSummary, SettingRow, Store, WebhookEventRecord,
 };
 use crate::workspace::{
     MemoryChunk, MemoryDocument, Repository, SearchConfig, SearchResult, WorkspaceEntry,
@@ -211,6 +211,15 @@ impl ConversationStore for PgBackend {
         self.store
             .conversation_belongs_to_user(conversation_id, user_id)
             .await
+    }
+
+    async fn search_conversations(
+        &self,
+        user_id: &str,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<crate::history::ConversationSearchHit>, DatabaseError> {
+        self.store.search_conversations(user_id, query, limit).await
     }
 }
 
@@ -709,5 +718,25 @@ impl WorkspaceStore for PgBackend {
         self.repo
             .hybrid_search(user_id, agent_id, query, embedding, config)
             .await
+    }
+}
+
+// ==================== WebhookAuditStore ====================
+
+#[async_trait]
+impl WebhookAuditStore for PgBackend {
+    async fn insert_webhook_event(
+        &self,
+        record: &WebhookEventRecord,
+    ) -> Result<(), DatabaseError> {
+        self.store.insert_webhook_event(record).await
+    }
+
+    async fn list_webhook_events(
+        &self,
+        user_id: &str,
+        limit: i64,
+    ) -> Result<Vec<WebhookEventRecord>, DatabaseError> {
+        self.store.list_webhook_events(user_id, limit).await
     }
 }

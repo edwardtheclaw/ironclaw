@@ -129,9 +129,6 @@ The `Database` supertrait is composed of seven sub-traits. Leaf consumers can de
 - `_migrations` — libSQL-only internal migration version tracking
 
 ## libSQL Current Limitations
-
-- **Secrets store** — still requires `PostgresSecretsStore`; `LibSqlSecretsStore` exists but is not plumbed through the main startup path
-- **Settings reload** — `Config::from_db` skipped (requires `Store`)
 - **No incremental migrations** — schema is idempotent CREATE IF NOT EXISTS; no ALTER TABLE support; column additions require a new versioned approach
 - **No encryption at rest** — only secrets (API tokens) are AES-256-GCM encrypted; all other data is plaintext SQLite
 - **Hybrid search** — both FTS5 and vector search (`libsql_vector_idx`) are implemented; however, the vector index is fixed at `F32_BLOB(1536)` while PostgreSQL switched to unbounded `vector` in V9

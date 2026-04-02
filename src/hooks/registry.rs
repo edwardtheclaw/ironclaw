@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use crate::hooks::hook::{Hook, HookContext, HookError, HookEvent, HookFailureMode, HookOutcome};
+use crate::hooks::hook::{
+    Hook, HookCategory, HookContext, HookError, HookEvent, HookFailureMode, HookOutcome,
+};
 
 /// A registered hook with its priority.
 struct HookEntry {
@@ -119,34 +121,52 @@ impl HookRegistry {
                 Ok(Ok(HookOutcome::Continue { modified: None })) => {
                     // No-op, continue chain
                 }
-                Ok(Err(err)) => match hook.failure_mode() {
-                    HookFailureMode::FailOpen => {
-                        tracing::warn!(hook = hook.name(), "Hook failed (fail-open): {}", err);
+                Ok(Err(err)) => {
+                    let effective_mode = if hook.category() == HookCategory::Safety {
+                        HookFailureMode::FailClosed
+                    } else {
+                        hook.failure_mode()
+                    };
+                    match effective_mode {
+                        HookFailureMode::FailOpen => {
+                            tracing::warn!(hook = hook.name(), "Hook failed (fail-open): {}", err);
+                        }
+                        HookFailureMode::FailClosed => {
+                            tracing::warn!(
+                                hook = hook.name(),
+                                "Hook failed (fail-closed): {}",
+                                err
+                            );
+                            return Err(HookError::ExecutionFailed {
+                                reason: format!("Hook '{}' failed: {}", hook.name(), err),
+                            });
+                        }
                     }
-                    HookFailureMode::FailClosed => {
-                        tracing::warn!(hook = hook.name(), "Hook failed (fail-closed): {}", err);
-                        return Err(HookError::ExecutionFailed {
-                            reason: format!("Hook '{}' failed: {}", hook.name(), err),
-                        });
+                }
+                Err(_elapsed) => {
+                    let effective_mode = if hook.category() == HookCategory::Safety {
+                        HookFailureMode::FailClosed
+                    } else {
+                        hook.failure_mode()
+                    };
+                    match effective_mode {
+                        HookFailureMode::FailOpen => {
+                            tracing::warn!(
+                                hook = hook.name(),
+                                "Hook timed out (fail-open) after {:?}",
+                                timeout
+                            );
+                        }
+                        HookFailureMode::FailClosed => {
+                            tracing::warn!(
+                                hook = hook.name(),
+                                "Hook timed out (fail-closed) after {:?}",
+                                timeout
+                            );
+                            return Err(HookError::Timeout { timeout });
+                        }
                     }
-                },
-                Err(_elapsed) => match hook.failure_mode() {
-                    HookFailureMode::FailOpen => {
-                        tracing::warn!(
-                            hook = hook.name(),
-                            "Hook timed out (fail-open) after {:?}",
-                            timeout
-                        );
-                    }
-                    HookFailureMode::FailClosed => {
-                        tracing::warn!(
-                            hook = hook.name(),
-                            "Hook timed out (fail-closed) after {:?}",
-                            timeout
-                        );
-                        return Err(HookError::Timeout { timeout });
-                    }
-                },
+                }
             }
         }
 
@@ -604,5 +624,158 @@ mod tests {
         // Inbound event should not be affected by outbound-only hook
         let result = registry.run(&test_event()).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_safety_category_overrides_fail_open_on_error() {
+        use crate::hooks::hook::HookCategory;
+
+        /// A hook that always errors but declares FailOpen AND Safety category.
+        struct SafetyCategoryHook {
+            name: String,
+            points: Vec<HookPoint>,
+        }
+
+        #[async_trait]
+        impl Hook for SafetyCategoryHook {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn hook_points(&self) -> &[HookPoint] {
+                &self.points
+            }
+            fn failure_mode(&self) -> HookFailureMode {
+                HookFailureMode::FailOpen // explicitly fail-open
+            }
+            fn category(&self) -> HookCategory {
+                HookCategory::Safety // but Safety category overrides to fail-closed
+            }
+            async fn execute(
+                &self,
+                _event: &HookEvent,
+                _ctx: &HookContext,
+            ) -> Result<HookOutcome, HookError> {
+                Err(HookError::ExecutionFailed {
+                    reason: "safety check failed".into(),
+                })
+            }
+        }
+
+        let registry = HookRegistry::new();
+        registry
+            .register(Arc::new(SafetyCategoryHook {
+                name: "safety-hook".into(),
+                points: vec![HookPoint::BeforeInbound],
+            }))
+            .await;
+
+        // Even though failure_mode() is FailOpen, Safety category must fail-closed.
+        let result = registry.run(&test_event()).await;
+        assert!(result.is_err(), "Safety hook error must block processing");
+        assert!(
+            matches!(result.unwrap_err(), HookError::ExecutionFailed { .. }),
+            "Expected ExecutionFailed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_safety_category_overrides_fail_open_on_timeout() {
+        use crate::hooks::hook::HookCategory;
+        use std::time::Duration;
+
+        struct SafetySlowHook {
+            name: String,
+            points: Vec<HookPoint>,
+        }
+
+        #[async_trait]
+        impl Hook for SafetySlowHook {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn hook_points(&self) -> &[HookPoint] {
+                &self.points
+            }
+            fn failure_mode(&self) -> HookFailureMode {
+                HookFailureMode::FailOpen
+            }
+            fn category(&self) -> HookCategory {
+                HookCategory::Safety
+            }
+            fn timeout(&self) -> Duration {
+                Duration::from_millis(50)
+            }
+            async fn execute(
+                &self,
+                _event: &HookEvent,
+                _ctx: &HookContext,
+            ) -> Result<HookOutcome, HookError> {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok(HookOutcome::ok())
+            }
+        }
+
+        let registry = HookRegistry::new();
+        registry
+            .register(Arc::new(SafetySlowHook {
+                name: "safety-slow".into(),
+                points: vec![HookPoint::BeforeInbound],
+            }))
+            .await;
+
+        // Safety hook timeout must block processing.
+        let result = registry.run(&test_event()).await;
+        assert!(result.is_err(), "Safety hook timeout must block processing");
+        assert!(matches!(result.unwrap_err(), HookError::Timeout { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_notification_category_uses_fail_open() {
+        use crate::hooks::hook::HookCategory;
+
+        struct NotificationErrorHook {
+            name: String,
+            points: Vec<HookPoint>,
+        }
+
+        #[async_trait]
+        impl Hook for NotificationErrorHook {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn hook_points(&self) -> &[HookPoint] {
+                &self.points
+            }
+            fn failure_mode(&self) -> HookFailureMode {
+                HookFailureMode::FailClosed // declared fail-closed
+            }
+            fn category(&self) -> HookCategory {
+                HookCategory::Notification // but Notification → not overridden by category alone
+            }
+            async fn execute(
+                &self,
+                _event: &HookEvent,
+                _ctx: &HookContext,
+            ) -> Result<HookOutcome, HookError> {
+                Err(HookError::ExecutionFailed {
+                    reason: "webhook unreachable".into(),
+                })
+            }
+        }
+
+        let registry = HookRegistry::new();
+        registry
+            .register(Arc::new(NotificationErrorHook {
+                name: "notify-fail-closed".into(),
+                points: vec![HookPoint::BeforeInbound],
+            }))
+            .await;
+
+        // Notification category doesn't override failure_mode; FailClosed still applies.
+        let result = registry.run(&test_event()).await;
+        assert!(
+            result.is_err(),
+            "Notification hook with FailClosed should still fail closed"
+        );
     }
 }

@@ -235,6 +235,7 @@ impl GatewayWorkflowHarness {
             routine_engine: Arc::clone(&routine_slot),
             startup_time: Instant::now(),
             active_config: ironclaw::channels::web::server::ActiveConfigSnapshot::default(),
+            prometheus_metrics: None,
         });
 
         let mut agent = Agent::new(

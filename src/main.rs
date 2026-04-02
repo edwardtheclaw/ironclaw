@@ -19,7 +19,7 @@ use ironclaw::{
         run_status_command, run_tool_command,
     },
     config::Config,
-    hooks::bootstrap_hooks,
+    hooks::{WebhookAuditHook, bootstrap_hooks},
     llm::create_session_manager,
     orchestrator::{ReaperConfig, SandboxReaper},
     pairing::PairingStore,
@@ -452,6 +452,14 @@ async fn async_main() -> anyhow::Result<()> {
         "Lifecycle hooks initialized"
     );
 
+    // Register the webhook delivery audit hook when a DB is present.
+    if let Some(ref db) = components.db {
+        components
+            .hooks
+            .register(Arc::new(WebhookAuditHook::new(Arc::clone(db))))
+            .await;
+    }
+
     // Reuse the shared agent session manager prepared by AppBuilder.
     let session_manager = Arc::clone(&components.agent_session_manager);
 
@@ -522,6 +530,12 @@ async fn async_main() -> anyhow::Result<()> {
             gw = gw.with_skill_catalog(Arc::clone(sc));
         }
         gw = gw.with_cost_guard(Arc::clone(&components.cost_guard));
+        {
+            let (_, prom) = ironclaw::observability::create_observer(&config.observability);
+            if let Some(metrics) = prom {
+                gw = gw.with_prometheus_metrics(metrics);
+            }
+        }
         {
             let active_model = components.llm.model_name().to_string();
             let mut enabled = channel_names.clone();

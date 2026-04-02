@@ -757,4 +757,64 @@ mod tests {
         // Verify builder was actually invoked
         assert_eq!(builder.builds(), 1, "Builder should have been called once");
     }
+
+    /// T-02: Full detect→repair cycle through a real libSQL database.
+    ///
+    /// Unlike `e2e_stuck_job_repair_and_tool_rebuild` (which creates BrokenTool directly),
+    /// this test exercises the full path: record failures in DB → detect_broken_tools()
+    /// reads from DB → repair_broken_tool() rebuilds and marks repaired → DB cleared.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn e2e_detect_broken_tools_from_real_db() {
+        let cm = Arc::new(ContextManager::new(10));
+        let builder = Arc::new(MockBuilder::new());
+        let tools = Arc::new(ToolRegistry::new());
+        let (db, _tmp_dir) = crate::testing::test_db().await;
+
+        // Record 6 failures for "flaky-tool" (threshold in DefaultSelfRepair is 5)
+        for i in 0..6u32 {
+            db.record_tool_failure("flaky-tool", &format!("error #{}", i))
+                .await
+                .unwrap_or_else(|e| panic!("record_tool_failure failed: {}", e));
+        }
+
+        let repair = DefaultSelfRepair::new(Arc::clone(&cm), Duration::from_secs(0), 3)
+            .with_store(Arc::clone(&db))
+            .with_builder(
+                Arc::clone(&builder) as Arc<dyn crate::tools::SoftwareBuilder>,
+                tools,
+            );
+
+        // detect_broken_tools() must read the DB and return "flaky-tool"
+        let broken = repair.detect_broken_tools().await;
+        assert!(
+            !broken.is_empty(),
+            "detect_broken_tools should return flaky-tool after 6 failures"
+        );
+        let found = broken.iter().find(|b| b.name == "flaky-tool");
+        assert!(
+            found.is_some(),
+            "flaky-tool should appear in broken tools list"
+        );
+
+        // repair_broken_tool() should invoke builder and mark repaired
+        let flaky = found.unwrap();
+        let result = repair.repair_broken_tool(flaky).await.unwrap();
+        assert!(
+            matches!(result, RepairResult::Success { .. }),
+            "Repair should succeed with mock builder: {:?}",
+            result
+        );
+        assert_eq!(builder.builds(), 1, "Builder should have been called once");
+
+        // After repair, broken tool count should drop (mark_tool_repaired clears failures)
+        let remaining = db
+            .get_broken_tools(5)
+            .await
+            .expect("get_broken_tools after repair");
+        assert!(
+            remaining.iter().all(|b| b.name != "flaky-tool"),
+            "flaky-tool should be cleared from broken list after repair"
+        );
+    }
 }

@@ -158,6 +158,25 @@ pub enum HookFailureMode {
     FailClosed,
 }
 
+/// Semantic category for a hook.
+///
+/// The registry uses this to enforce appropriate failure behaviour:
+/// - `Safety` hooks are **always** treated as fail-closed, regardless of
+///   what `failure_mode()` returns. A safety check that fails must block.
+/// - `Audit` hooks (the default) log failures but do not block processing.
+/// - `Notification` hooks are best-effort; failures are suppressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookCategory {
+    /// A safety or policy gate. Registry overrides failure mode to
+    /// `HookFailureMode::FailClosed` for this category.
+    Safety,
+    /// An audit or logging hook. Failures are logged but do not block.
+    Audit,
+    /// A best-effort notification (e.g. webhook, alert). Failures are
+    /// silently ignored.
+    Notification,
+}
+
 /// Hook execution errors.
 #[derive(Debug, thiserror::Error)]
 pub enum HookError {
@@ -201,6 +220,14 @@ pub trait Hook: Send + Sync {
     /// Default: `FailOpen` (continue on error).
     fn failure_mode(&self) -> HookFailureMode {
         HookFailureMode::FailOpen
+    }
+
+    /// The semantic category of this hook.
+    ///
+    /// The registry uses this to determine how failures are handled. `Safety`
+    /// hooks are always fail-closed even if `failure_mode()` returns `FailOpen`.
+    fn category(&self) -> HookCategory {
+        HookCategory::Audit
     }
 
     /// Maximum time this hook is allowed to run.

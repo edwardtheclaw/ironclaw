@@ -36,7 +36,7 @@ use crate::error::DatabaseError;
 use crate::error::WorkspaceError;
 use crate::history::{
     AgentJobRecord, AgentJobSummary, ConversationMessage, ConversationSummary, JobEventRecord,
-    LlmCallRecord, SandboxJobRecord, SandboxJobSummary, SettingRow,
+    LlmCallRecord, SandboxJobRecord, SandboxJobSummary, SettingRow, WebhookEventRecord,
 };
 use crate::workspace::{MemoryChunk, MemoryDocument, WorkspaceEntry};
 use crate::workspace::{SearchConfig, SearchResult};
@@ -394,6 +394,17 @@ pub trait ConversationStore: Send + Sync {
         conversation_id: Uuid,
         user_id: &str,
     ) -> Result<bool, DatabaseError>;
+
+    /// Full-text search over conversation message content.
+    ///
+    /// Returns matching conversations with a snippet of the matching text,
+    /// ordered by most-recently-active first. Limit is capped by the caller.
+    async fn search_conversations(
+        &self,
+        user_id: &str,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<crate::history::ConversationSearchHit>, DatabaseError>;
 }
 
 #[async_trait]
@@ -641,6 +652,23 @@ pub trait WorkspaceStore: Send + Sync {
     ) -> Result<Vec<SearchResult>, WorkspaceError>;
 }
 
+/// Audit log for inbound webhook deliveries.
+#[async_trait]
+pub trait WebhookAuditStore: Send + Sync {
+    /// Record a webhook delivery in the audit log.
+    async fn insert_webhook_event(
+        &self,
+        record: &WebhookEventRecord,
+    ) -> Result<(), DatabaseError>;
+
+    /// Fetch recent webhook events for a user, newest first.
+    async fn list_webhook_events(
+        &self,
+        user_id: &str,
+        limit: i64,
+    ) -> Result<Vec<WebhookEventRecord>, DatabaseError>;
+}
+
 /// Backend-agnostic database supertrait.
 ///
 /// Combines all sub-traits into one. Existing `Arc<dyn Database>` consumers
@@ -654,6 +682,7 @@ pub trait Database:
     + ToolFailureStore
     + SettingsStore
     + WorkspaceStore
+    + WebhookAuditStore
     + Send
     + Sync
 {

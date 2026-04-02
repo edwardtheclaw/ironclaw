@@ -512,6 +512,12 @@ impl McpClient {
     pub async fn create_tools(&self) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
         let mcp_tools = self.list_tools().await?;
         let client = Arc::new(self.clone());
+        tracing::warn!(
+            server = %self.server_name,
+            tool_count = mcp_tools.len(),
+            "MCP tools registered without WASM/Docker sandbox; MCP server runs with \
+             full IronClaw process permissions. Ensure the MCP server is trusted."
+        );
         Ok(mcp_tools
             .into_iter()
             .map(|t| {

@@ -1455,6 +1455,32 @@ pub struct ConversationMessage {
     pub created_at: DateTime<Utc>,
 }
 
+/// A search result from conversation history.
+#[derive(Debug, Clone)]
+pub struct ConversationSearchHit {
+    pub conversation_id: Uuid,
+    /// First user message or extracted title.
+    pub title: Option<String>,
+    /// Matching content snippet (truncated to ~200 chars).
+    pub snippet: String,
+    pub channel: String,
+    pub last_activity: DateTime<Utc>,
+}
+
+/// A single entry from the webhook delivery audit log.
+#[derive(Debug, Clone)]
+pub struct WebhookEventRecord {
+    pub id: Uuid,
+    pub received_at: DateTime<Utc>,
+    /// Channel that delivered the webhook (e.g. "webhook").
+    pub channel: String,
+    /// Whether HMAC was validated successfully. `None` = validation not required.
+    pub hmac_valid: Option<bool>,
+    /// SHA-256 hex digest of the raw payload.
+    pub payload_hash: String,
+    pub user_id: String,
+}
+
 #[cfg(feature = "postgres")]
 impl Store {
     /// Ensure a conversation row exists for a given UUID.
@@ -1777,6 +1803,51 @@ impl Store {
             )
             .await?;
         Ok(row.is_some())
+    }
+
+    /// Search conversations by keyword (case-insensitive ILIKE over message content).
+    pub async fn search_conversations(
+        &self,
+        user_id: &str,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<ConversationSearchHit>, DatabaseError> {
+        let conn = self.conn().await?;
+        let pattern = format!("%{}%", query);
+        let rows = conn
+            .query(
+                r#"
+                SELECT DISTINCT ON (c.id)
+                    c.id,
+                    c.channel,
+                    c.last_activity,
+                    LEFT(cm.content, 200) AS snippet,
+                    (SELECT content FROM conversation_messages
+                     WHERE conversation_id = c.id AND role = 'user'
+                     ORDER BY created_at ASC LIMIT 1) AS title
+                FROM conversations c
+                JOIN conversation_messages cm ON cm.conversation_id = c.id
+                WHERE c.user_id = $1
+                  AND cm.role IN ('user', 'assistant')
+                  AND cm.content ILIKE $2
+                ORDER BY c.id, c.last_activity DESC
+                LIMIT $3
+                "#,
+                &[&user_id, &pattern, &limit],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| ConversationSearchHit {
+                conversation_id: row.get("id"),
+                channel: row.get("channel"),
+                last_activity: row.get("last_activity"),
+                snippet: row.get("snippet"),
+                title: row.get("title"),
+            })
+            .collect())
     }
 
     /// Load messages for a conversation with cursor-based pagination.
@@ -2163,6 +2234,59 @@ impl Store {
             .await?;
         let count: i64 = row.get("cnt");
         Ok(count > 0)
+    }
+
+    /// Insert a webhook delivery audit record.
+    pub async fn insert_webhook_event(
+        &self,
+        record: &WebhookEventRecord,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.conn().await?;
+        conn.execute(
+            "INSERT INTO webhook_events (id, received_at, channel, hmac_valid, payload_hash, user_id)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (id) DO NOTHING",
+            &[
+                &record.id,
+                &record.received_at,
+                &record.channel,
+                &record.hmac_valid,
+                &record.payload_hash,
+                &record.user_id,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// List recent webhook events for a user, newest first.
+    pub async fn list_webhook_events(
+        &self,
+        user_id: &str,
+        limit: i64,
+    ) -> Result<Vec<WebhookEventRecord>, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, received_at, channel, hmac_valid, payload_hash, user_id
+                 FROM webhook_events
+                 WHERE user_id = $1
+                 ORDER BY received_at DESC
+                 LIMIT $2",
+                &[&user_id, &limit],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| WebhookEventRecord {
+                id: r.get("id"),
+                received_at: r.get("received_at"),
+                channel: r.get("channel"),
+                hmac_valid: r.get("hmac_valid"),
+                payload_hash: r.get("payload_hash"),
+                user_id: r.get("user_id"),
+            })
+            .collect())
     }
 }
 

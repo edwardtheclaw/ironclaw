@@ -40,6 +40,10 @@ use crate::channels::web::handlers::routines::{
     routines_delete_handler, routines_detail_handler, routines_list_handler,
     routines_summary_handler, routines_toggle_handler, routines_trigger_handler,
 };
+use crate::channels::web::handlers::chat::{chat_export_handler, chat_search_handler};
+use crate::channels::web::handlers::settings::{
+    settings_hygiene_get_handler, settings_hygiene_set_handler,
+};
 use crate::channels::web::handlers::skills::{
     skills_install_handler, skills_list_handler, skills_remove_handler, skills_search_handler,
 };
@@ -201,6 +205,8 @@ pub struct GatewayState {
     pub startup_time: std::time::Instant,
     /// Snapshot of active (resolved) configuration for the frontend.
     pub active_config: ActiveConfigSnapshot,
+    /// Prometheus metrics handle for the `/metrics` scrape endpoint.
+    pub prometheus_metrics: Option<Arc<crate::observability::PrometheusMetrics>>,
 }
 
 /// Start the gateway HTTP server.
@@ -231,6 +237,8 @@ pub async fn start_server(
         // /healthz is a process-supervisor–friendly alias used by systemd, Kubernetes,
         // and Docker Compose readiness/liveness probes (QW-06 / Ops-01).
         .route("/healthz", get(health_handler))
+        // Prometheus scrape endpoint — no auth so external scrapers work without config.
+        .route("/metrics", get(prometheus_metrics_handler))
         .route("/oauth/callback", get(oauth_callback_handler))
         .route(
             "/oauth/slack/callback",
@@ -250,6 +258,8 @@ pub async fn start_server(
         .route("/api/chat/ws", get(chat_ws_handler))
         .route("/api/chat/history", get(chat_history_handler))
         .route("/api/chat/threads", get(chat_threads_handler))
+        .route("/api/chat/threads/:id/export", get(chat_export_handler))
+        .route("/api/chat/search", get(chat_search_handler))
         .route("/api/chat/thread/new", post(chat_new_thread_handler))
         // Memory
         .route("/api/memory/tree", get(memory_tree_handler))
@@ -320,6 +330,10 @@ pub async fn start_server(
         .route("/api/settings", get(settings_list_handler))
         .route("/api/settings/export", get(settings_export_handler))
         .route("/api/settings/import", post(settings_import_handler))
+        .route(
+            "/api/settings/hygiene",
+            get(settings_hygiene_get_handler).put(settings_hygiene_set_handler),
+        )
         .route("/api/settings/{key}", get(settings_get_handler))
         .route(
             "/api/settings/{key}",
@@ -329,6 +343,8 @@ pub async fn start_server(
             "/api/settings/{key}",
             axum::routing::delete(settings_delete_handler),
         )
+        // Webhook audit log
+        .route("/api/webhooks/events", get(webhook_events_handler))
         // Gateway control plane
         .route("/api/gateway/status", get(gateway_status_handler))
         // OpenAI-compatible API
@@ -527,10 +543,63 @@ async fn health_handler() -> Json<HealthResponse> {
     })
 }
 
+// --- Prometheus metrics ---
+
+async fn prometheus_metrics_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> axum::response::Response {
+    use axum::http::{HeaderValue, StatusCode, header};
+    use axum::response::IntoResponse;
+
+    let body = match state.prometheus_metrics.as_ref() {
+        Some(m) => m.render(),
+        None => "# Prometheus metrics not enabled.\n# Set OBSERVABILITY_BACKEND=prometheus to enable.\n".to_string(),
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"))],
+        body,
+    )
+        .into_response()
+}
+
 /// Return an OAuth error landing page response.
 fn oauth_error_page(label: &str) -> axum::response::Response {
     let html = crate::cli::oauth_defaults::landing_html(label, false);
     axum::response::Html(html).into_response()
+}
+
+// --- Webhook audit log ---
+
+async fn webhook_events_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<WebhookEventsResponse>, StatusCode> {
+    let store = state
+        .store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let records = store
+        .list_webhook_events(&state.user_id, 100)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to list webhook events: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let events = records
+        .into_iter()
+        .map(|r| WebhookEventResponse {
+            id: r.id.to_string(),
+            received_at: r.received_at.to_rfc3339(),
+            channel: r.channel,
+            hmac_valid: r.hmac_valid,
+            payload_hash: r.payload_hash,
+            user_id: r.user_id,
+        })
+        .collect();
+
+    Ok(Json(WebhookEventsResponse { events }))
 }
 
 /// OAuth callback handler for the web gateway.
@@ -2831,6 +2900,7 @@ mod tests {
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
             active_config: ActiveConfigSnapshot::default(),
+            prometheus_metrics: None,
         })
     }
 
