@@ -247,6 +247,15 @@ impl AppBuilder {
                     &self.config.owner_id,
                 )
                 .await;
+
+                // Migrate NEAR AI session token from plaintext settings to
+                // encrypted secrets. Idempotent — safe to run on every startup.
+                migrate_session_credential(
+                    db.as_ref(),
+                    secrets.as_ref(),
+                    &self.config.owner_id,
+                )
+                .await;
             }
 
             // Inject LLM API keys from encrypted storage
@@ -271,6 +280,10 @@ impl AppBuilder {
             {
                 tracing::warn!("Failed to re-resolve LLM config after secret injection: {e}");
             }
+
+            // Wire the secrets store into the session manager so future
+            // token saves go to encrypted storage.
+            self.session.attach_secrets(Arc::clone(secrets)).await;
         }
 
         self.secrets_store = store;
@@ -1004,6 +1017,63 @@ pub async fn bootstrap_ownership(
         "bootstrap_ownership: owner user ensured, default rows migrated"
     );
     Ok(())
+}
+
+/// Migrate the NEAR AI session token from the plaintext settings table to the
+/// encrypted secrets store.
+///
+/// The `nearai.session_token` settings key stores a JSON-serialized `SessionData`
+/// object. This migration re-serializes it as a JSON string and stores it under
+/// the `nearai_session_token` secret name.
+///
+/// Idempotent: if the secret already exists, the settings key is removed (cleanup).
+/// If the settings key is absent, nothing happens.
+async fn migrate_session_credential(
+    db: &dyn crate::db::Database,
+    secrets: &(dyn crate::secrets::SecretsStore + Send + Sync),
+    user_id: &str,
+) {
+    // If already migrated, clean up the plaintext copy and return.
+    match secrets.exists(user_id, "nearai_session_token").await {
+        Ok(true) => {
+            let _ = db.delete_setting(user_id, "nearai.session_token").await;
+            return;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!("Failed to check secrets store for nearai_session_token: {e}");
+            return;
+        }
+    }
+
+    // Read the JSON value from settings.
+    let value = match db.get_setting(user_id, "nearai.session_token").await {
+        Ok(Some(v)) => v,
+        Ok(None) => return, // Nothing to migrate.
+        Err(e) => {
+            tracing::warn!("Failed to read nearai.session_token from settings: {e}");
+            return;
+        }
+    };
+
+    // Re-serialize the JSON value to a string for secrets storage.
+    let value_str = match &value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+
+    let params = crate::secrets::CreateSecretParams::new("nearai_session_token", value_str)
+        .with_provider("nearai");
+
+    match secrets.create(user_id, params).await {
+        Ok(_) => {
+            tracing::info!("Migrated nearai.session_token from settings to encrypted secrets");
+            let _ = db.delete_setting(user_id, "nearai.session_token").await;
+        }
+        Err(e) => {
+            tracing::warn!("Failed to migrate nearai.session_token to secrets: {e}");
+        }
+    }
 }
 
 #[cfg(test)]
