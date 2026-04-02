@@ -43,7 +43,6 @@ async def test_user(admin_client):
 # ---------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_create_user(admin_client):
     email = f"test-{uuid.uuid4().hex[:8]}@example.com"
     r = await admin_client.post("/api/admin/users", json={
@@ -61,7 +60,6 @@ async def test_create_user(admin_client):
     await admin_client.delete(f"/api/admin/users/{data['id']}")
 
 
-@pytest.mark.asyncio
 async def test_list_users_contains_new_user(admin_client, test_user):
     r = await admin_client.get("/api/admin/users")
     assert r.status_code == 200
@@ -69,7 +67,6 @@ async def test_list_users_contains_new_user(admin_client, test_user):
     assert test_user["id"] in ids
 
 
-@pytest.mark.asyncio
 async def test_get_user_detail(admin_client, test_user):
     r = await admin_client.get(f"/api/admin/users/{test_user['id']}")
     assert r.status_code == 200
@@ -78,7 +75,6 @@ async def test_get_user_detail(admin_client, test_user):
     assert data["id"] == test_user["id"]
 
 
-@pytest.mark.asyncio
 async def test_update_user(admin_client, test_user):
     r = await admin_client.patch(f"/api/admin/users/{test_user['id']}", json={
         "display_name": "Updated Name",
@@ -95,7 +91,6 @@ async def test_update_user(admin_client, test_user):
 # ---------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_suspend_and_activate(admin_client, test_user):
     uid = test_user["id"]
 
@@ -113,7 +108,6 @@ async def test_suspend_and_activate(admin_client, test_user):
 # ---------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_secret_lifecycle(admin_client, test_user):
     uid = test_user["id"]
 
@@ -142,7 +136,6 @@ async def test_secret_lifecycle(admin_client, test_user):
 # ---------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_delete_user_and_verify_gone(admin_client):
     email = f"test-{uuid.uuid4().hex[:8]}@example.com"
     r = await admin_client.post("/api/admin/users", json={

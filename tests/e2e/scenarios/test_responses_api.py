@@ -34,7 +34,7 @@ async def responses_user(ironclaw_server):
 
 
 @pytest.fixture()
-def openai_client(responses_user):
+async def openai_client(responses_user):
     """OpenAI client pointed at the test IronClaw instance."""
     base_url, user_token = responses_user
     return OpenAI(api_key=user_token, base_url=f"{base_url}/v1")
@@ -45,7 +45,6 @@ def openai_client(responses_user):
 # ---------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_non_streaming_text_input(openai_client):
     response = openai_client.responses.create(
         model="default",
@@ -56,7 +55,6 @@ async def test_non_streaming_text_input(openai_client):
     assert len(response.output) > 0
 
 
-@pytest.mark.asyncio
 async def test_non_streaming_messages_input(openai_client):
     response = openai_client.responses.create(
         model="default",
@@ -71,7 +69,6 @@ async def test_non_streaming_messages_input(openai_client):
 # ---------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_continue_conversation(openai_client):
     r1 = openai_client.responses.create(
         model="default",
@@ -93,7 +90,6 @@ async def test_continue_conversation(openai_client):
 # ---------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_get_response_by_id(openai_client):
     response = openai_client.responses.create(
         model="default",
@@ -109,7 +105,6 @@ async def test_get_response_by_id(openai_client):
 # ---------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_streaming_events(openai_client):
     stream = openai_client.responses.create(
         model="default",
@@ -128,7 +123,6 @@ async def test_streaming_events(openai_client):
     assert len(full_text) > 0
 
 
-@pytest.mark.asyncio
 async def test_streaming_raw_sse(responses_user):
     base_url, user_token = responses_user
     async with httpx.AsyncClient(timeout=30) as client:
@@ -154,7 +148,6 @@ async def test_streaming_raw_sse(responses_user):
 # ---------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_context_injection_approval(responses_user):
     base_url, user_token = responses_user
     async with httpx.AsyncClient(timeout=120) as client:
@@ -166,7 +159,7 @@ async def test_context_injection_approval(responses_user):
             },
             json={
                 "input": "Go ahead with the transfer",
-                "context": {
+                "x_context": {
                     "notification_response": {
                         "notification_id": "msg_456",
                         "action": "approved",
@@ -183,7 +176,6 @@ async def test_context_injection_approval(responses_user):
         assert len(data["output"]) > 0
 
 
-@pytest.mark.asyncio
 async def test_context_injection_rejection(responses_user):
     base_url, user_token = responses_user
     async with httpx.AsyncClient(timeout=120) as client:
@@ -195,7 +187,7 @@ async def test_context_injection_rejection(responses_user):
             },
             json={
                 "input": "Cancel it",
-                "context": {
+                "x_context": {
                     "notification_response": {
                         "notification_id": "msg_789",
                         "action": "rejected",
@@ -214,7 +206,6 @@ async def test_context_injection_rejection(responses_user):
 # ---------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_error_no_auth(ironclaw_server):
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(
@@ -225,7 +216,6 @@ async def test_error_no_auth(ironclaw_server):
         assert r.status_code == 401
 
 
-@pytest.mark.asyncio
 async def test_error_empty_input(responses_user):
     base_url, user_token = responses_user
     async with httpx.AsyncClient(timeout=10) as client:

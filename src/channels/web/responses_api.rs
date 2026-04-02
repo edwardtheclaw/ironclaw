@@ -64,13 +64,14 @@ pub struct ResponsesRequest {
     pub tools: Option<Vec<ResponsesTool>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
-    /// Structured context injected into the agent's conversation.
+    /// IronClaw extension: structured context injected into the agent's conversation.
     ///
-    /// Used by integrations (e.g. Abound) to pass notification responses,
-    /// approval/rejection status, or other structured data that the agent
-    /// should see when processing the user's message.
-    #[serde(default)]
-    pub context: Option<serde_json::Value>,
+    /// NOT part of the OpenAI Responses API spec. Used by integrations
+    /// (e.g. Abound) to pass notification responses, approval/rejection
+    /// status, or other structured data. Must be a flat `{key: {flat_object}}`
+    /// structure — nested objects are serialized as raw JSON.
+    #[serde(default, alias = "context")]
+    pub x_context: Option<serde_json::Value>,
 }
 
 fn default_model() -> String {
@@ -650,7 +651,7 @@ pub async fn create_response_handler(
 
     // Prepend structured context (e.g. notification approval/rejection) so
     // the agent sees it naturally in the conversation.
-    if let Some(ref ctx) = req.context {
+    if let Some(ref ctx) = req.x_context {
         let prefix = format_context(ctx);
         content = format!("{prefix}\n\n{content}");
     }
@@ -675,7 +676,7 @@ pub async fn create_response_handler(
         "user_id": &user.user_id,
         "source": "responses_api",
     });
-    if let Some(ref ctx) = req.context {
+    if let Some(ref ctx) = req.x_context {
         metadata["context"] = ctx.clone();
     }
     let msg = IncomingMessage::new("gateway", &user.user_id, &content)

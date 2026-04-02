@@ -331,17 +331,29 @@ impl ToolRegistry {
             {
                 Some("bearer") => CredentialLocation::AuthorizationBearer,
                 Some("header") => {
-                    let name = entry["location"]["name"]
-                        .as_str()
-                        .unwrap_or("X-API-KEY")
-                        .to_string();
+                    let name = match entry["location"]["name"].as_str() {
+                        Some(n) => n.to_string(),
+                        None => {
+                            tracing::warn!(
+                                "Skipping credential mapping '{}': header location missing 'name'",
+                                secret_name
+                            );
+                            continue;
+                        }
+                    };
                     CredentialLocation::Header { name, prefix: None }
                 }
                 Some("query") => {
-                    let name = entry["location"]["name"]
-                        .as_str()
-                        .unwrap_or("api_key")
-                        .to_string();
+                    let name = match entry["location"]["name"].as_str() {
+                        Some(n) => n.to_string(),
+                        None => {
+                            tracing::warn!(
+                                "Skipping credential mapping '{}': query location missing 'name'",
+                                secret_name
+                            );
+                            continue;
+                        }
+                    };
                     CredentialLocation::QueryParam { name }
                 }
                 _ => continue,

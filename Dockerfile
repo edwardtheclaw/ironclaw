@@ -80,8 +80,8 @@ USER ironclaw
 EXPOSE 3000
 
 ENV RUST_LOG=ironclaw=info
-ENV SKILLS_DIR=/app/integrations/abound/skills
-ENV INTEGRATION_CREDENTIALS=/app/integrations/abound/credentials.json
-ENV AGENT_AUTO_APPROVE_TOOLS=true
+# Abound-specific env vars (SKILLS_DIR, INTEGRATION_CREDENTIALS,
+# AGENT_AUTO_APPROVE_TOOLS) should be set in the deployment platform
+# (e.g. Railway), not baked into the base image.
 
 ENTRYPOINT ["ironclaw"]

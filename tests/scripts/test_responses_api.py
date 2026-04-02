@@ -257,7 +257,7 @@ try:
         },
         json={
             "input": "Go ahead with the transfer",
-            "context": {
+            "x_context": {
                 "notification_response": {
                     "notification_id": "msg_456",
                     "action": "approved",
@@ -301,7 +301,7 @@ try:
         },
         json={
             "input": "I changed my mind, cancel it",
-            "context": {
+            "x_context": {
                 "notification_response": {
                     "notification_id": "msg_789",
                     "action": "rejected",
