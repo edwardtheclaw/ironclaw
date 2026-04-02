@@ -205,6 +205,11 @@ impl SignalChannel {
             // SAFETY: block_in_place requires a multi-thread Tokio runtime.
             // Signal channel message processing runs on a multi-thread runtime worker thread.
             // Do NOT use this pattern in #[tokio::test] (which uses current_thread by default).
+            debug_assert!(
+                tokio::runtime::Handle::current().runtime_flavor()
+                    == tokio::runtime::RuntimeFlavor::MultiThread,
+                "Signal channel requires a multi-thread Tokio runtime"
+            );
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async move {
                     store.resolve_identity("signal", &sender_owned).await
@@ -236,6 +241,11 @@ impl SignalChannel {
             // SAFETY: block_in_place requires a multi-thread Tokio runtime.
             // Signal channel message processing runs on a multi-thread runtime worker thread.
             // Do NOT use this pattern in #[tokio::test] (which uses current_thread by default).
+            debug_assert!(
+                tokio::runtime::Handle::current().runtime_flavor()
+                    == tokio::runtime::RuntimeFlavor::MultiThread,
+                "Signal channel requires a multi-thread Tokio runtime"
+            );
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async move {
                     store.upsert_request("signal", &sender_owned, Some(meta_clone)).await

@@ -85,6 +85,11 @@ impl PairingStore {
         meta: Option<serde_json::Value>,
     ) -> Result<PairingRequestRecord, DatabaseError> {
         let Some(ref db) = self.db else {
+            tracing::warn!(
+                channel = %channel,
+                external_id = %external_id,
+                "PairingStore noop: generated pairing code will never be redeemable (no database configured)"
+            );
             return Ok(PairingRequestRecord {
                 id: uuid::Uuid::new_v4(),
                 channel: channel.to_string(),
@@ -111,6 +116,12 @@ impl PairingStore {
             return Ok(());
         };
         db.approve_pairing(channel, code, owner_id.as_str()).await
+    }
+
+    /// Evict all cached entries for a specific owner.
+    /// Called when a user is deactivated or their role changes.
+    pub fn evict_user(&self, owner_id: &str) {
+        self.cache.evict_user(owner_id);
     }
 
     /// List pending pairing requests (for CLI and web UI display).

@@ -2681,6 +2681,7 @@ async fn extensions_setup_submit_handler(
 
 async fn pairing_list_handler(
     State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(_user): AuthenticatedUser,
     Path(channel): Path<String>,
 ) -> Result<Json<PairingListResponse>, (StatusCode, String)> {
     let store = state.pairing_store.as_ref().ok_or((

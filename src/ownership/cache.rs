@@ -51,6 +51,13 @@ impl OwnershipCache {
             .unwrap_or_else(|p| p.into_inner())
             .remove(&key);
     }
+
+    /// Evict all cached entries belonging to a specific owner.
+    /// Called when a user is deactivated or their role changes.
+    pub fn evict_user(&self, owner_id: &str) {
+        let mut map = self.identities.write().unwrap_or_else(|p| p.into_inner());
+        map.retain(|_, identity| identity.owner_id.as_str() != owner_id);
+    }
 }
 
 impl Default for OwnershipCache {

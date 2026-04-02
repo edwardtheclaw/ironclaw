@@ -619,7 +619,7 @@ async fn toggle_server(name: String, enable: bool, disable: bool) -> anyhow::Res
 /// Returns both the optional database handle and the resolved owner_id.
 async fn connect_db() -> (Option<Arc<dyn Database>>, String) {
     let Ok(config) = Config::from_env().await else {
-        return (None, "default".to_string());
+        return (None, "<unset>".to_string());
     };
     let owner_id = config.owner_id.clone();
     let db = crate::db::connect_from_config(&config.database).await.ok();
