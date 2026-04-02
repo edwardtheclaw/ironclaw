@@ -1,10 +1,10 @@
 //! DB-backed pairing store.
 //!
 //! Replaces the file-based `~/.ironclaw/{channel}-pairing.json` store.
-//! Delegates to the `ChannelPairingStore` DB sub-trait. `insert` and `remove`
-//! update `OwnershipCache` immediately (write-through); `approve` populates the
-//! cache lazily on the next `resolve_identity` call because the channel and
-//! external_id are not available at approval time.
+//! Delegates to the `ChannelPairingStore` DB sub-trait. `remove` evicts from
+//! `OwnershipCache` immediately (write-through); `approve` populates the cache
+//! lazily on the next `resolve_identity` call because the channel/external_id
+//! are not available at approval time.
 //!
 //! When no database is available (the `db` field is `None`), the store operates
 //! in noop mode: writes silently succeed (returning dummy records where needed)

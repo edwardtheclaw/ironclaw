@@ -2687,10 +2687,14 @@ async fn pairing_list_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Pairing store not available".to_string(),
     ))?;
-    let requests: Vec<crate::db::PairingRequestRecord> = store
-        .list_pending(&channel)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let requests: Vec<crate::db::PairingRequestRecord> =
+        store.list_pending(&channel).await.map_err(|e| {
+            tracing::warn!(error = %e, "pairing list failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error listing pairing requests".to_string(),
+            )
+        })?;
 
     let infos = requests
         .into_iter()
@@ -2721,7 +2725,15 @@ async fn pairing_approve_handler(
     let owner_id = crate::ownership::OwnerId::from(user.user_id.clone());
     match store.approve(&channel, &req.code, &owner_id).await {
         Ok(()) => Ok(Json(ActionResponse::ok("Pairing approved.".to_string()))),
-        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
+        Err(crate::error::DatabaseError::NotFound { .. }) => Ok(Json(ActionResponse::fail(
+            "Invalid or expired pairing code.".to_string(),
+        ))),
+        Err(e) => {
+            tracing::warn!(error = %e, "pairing approval failed");
+            Ok(Json(ActionResponse::fail(
+                "Internal error processing approval.".to_string(),
+            )))
+        }
     }
 }
 

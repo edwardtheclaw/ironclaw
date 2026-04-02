@@ -25,6 +25,9 @@ pub(crate) fn derive_activation_status(
         // In the DB-backed model there is no separate allowFrom file to check.
         // Treat the channel as "owner-bound" (or simply active) when it is
         // active — the pairing state lives in the DB now.
+        // TODO(ownership): `has_paired` should ideally query channel_identities
+        // for this channel, not just use ext.active. For single-tenant this is
+        // equivalent; for multi-tenant it should check actual DB pairing state.
         classify_wasm_channel_activation(ext, ext.active, has_owner_binding || ext.active)
     } else if ext.kind == crate::extensions::ExtensionKind::ChannelRelay {
         Some(if ext.active {
