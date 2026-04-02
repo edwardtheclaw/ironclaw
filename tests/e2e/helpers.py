@@ -112,6 +112,12 @@ SEL = {
     "routines_tbody":           "#routines-tbody",
     "routine_row":              "#routines-tbody .routine-row",
     "routines_empty":           "#routines-empty",
+    # Tool permissions (Settings → Tools tab)
+    "tools_tab":                "button[data-settings-subtab='tools']",
+    "tool_permission_row":      ".tool-permission-row",
+    "tool_permission_toggle":   ".tool-permission-toggle",
+    "tool_lock_icon":           ".tool-lock-icon",
+    "tool_default_badge":       ".tool-default-badge",
 }
 
 TABS = ["chat", "memory", "jobs", "routines", "settings"]
