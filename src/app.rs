@@ -1034,15 +1034,38 @@ async fn migrate_session_credential(
     // through to re-migrate from the plaintext settings value.
     match secrets.get_decrypted(user_id, "nearai_session_token").await {
         Ok(decrypted) => {
-            if serde_json::from_str::<serde_json::Value>(decrypted.expose()).is_ok() {
-                // Valid — safe to clean up plaintext copy.
-                let _ = db.delete_setting(user_id, "nearai.session_token").await;
-                return;
+            if let Ok(secret_value) = serde_json::from_str::<serde_json::Value>(decrypted.expose())
+            {
+                // Verify the decrypted secret matches the plaintext setting (round-trip check).
+                match db.get_setting(user_id, "nearai.session_token").await {
+                    Ok(Some(settings_value)) if secret_value == settings_value => {
+                        // Round-trip verified — safe to clean up plaintext copy.
+                        let _ = db.delete_setting(user_id, "nearai.session_token").await;
+                        return;
+                    }
+                    Ok(Some(_)) => {
+                        // Secret doesn't match plaintext — fall through to re-migrate.
+                        tracing::warn!(
+                            "nearai_session_token secret doesn't match plaintext setting; re-migrating"
+                        );
+                    }
+                    Ok(None) => {
+                        // No plaintext left — treat as already migrated.
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to read nearai.session_token setting for round-trip check: {e}"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                // Secret exists but failed JSON parsing — fall through to re-migrate.
+                tracing::warn!(
+                    "nearai_session_token secret exists but failed JSON validation; re-migrating"
+                );
             }
-            // Secret exists but is corrupt — fall through to re-migrate.
-            tracing::warn!(
-                "nearai_session_token secret exists but failed JSON validation; re-migrating"
-            );
         }
         Err(crate::secrets::SecretError::NotFound(_)) => {
             // Not yet migrated — continue.

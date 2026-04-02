@@ -181,8 +181,7 @@ impl ChannelPairingStore for LibSqlBackend {
             let row = rows
                 .next()
                 .await
-                .ok()
-                .flatten()
+                .map_err(|e| DatabaseError::Query(format!("approve_pairing SELECT: {e}")))?
                 .ok_or_else(|| DatabaseError::NotFound {
                     entity: "pairing_request".into(),
                     id: code.to_string(),

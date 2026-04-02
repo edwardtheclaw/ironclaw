@@ -1,6 +1,6 @@
 //! Integration tests for the ownership model.
 //!
-//! Tests bootstrap_ownership, tenant isolation, ChannelPairingStore, and migrate_default_owner.
+//! Tests get_or_create_user, migrate_default_owner, tenant isolation, and ChannelPairingStore.
 //! Uses libSQL file-backed tempdir — no PostgreSQL required.
 //!
 //! Note: `new_memory()` does NOT share schema across separate `connect()` calls
