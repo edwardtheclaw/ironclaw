@@ -57,6 +57,14 @@ def extract_agent_text(response) -> str:
     return text
 
 
+def has_tool_call(response, tool_name: str = "http") -> bool:
+    """Check if the response includes a function_call for the given tool."""
+    for item in response.output:
+        if item.type == "function_call" and getattr(item, "name", "") == tool_name:
+            return True
+    return False
+
+
 def cleanup():
     if user_id:
         print("\n--- Cleanup: deleting test user ---")
@@ -124,6 +132,10 @@ try:
     agent_text = extract_agent_text(response)
     print(f"  Agent response ({len(agent_text)} chars): {agent_text[:400]}")
 
+    # Verify the http tool was actually called
+    check("called http tool", has_tool_call(response, "http"),
+          f"output types: {[item.type for item in response.output]}")
+
     # Verify Abound-specific data (not generic)
     has_abound_data = any(term in agent_text.lower() for term in [
         "ach", "limit", "recipient", "funding", "discover", "bageshwar",
@@ -149,6 +161,9 @@ try:
 
     agent_text = extract_agent_text(response)
     print(f"  Agent response ({len(agent_text)} chars): {agent_text[:400]}")
+
+    check("called http tool", has_tool_call(response, "http"),
+          f"output types: {[item.type for item in response.output]}")
 
     # "effective rate" is Abound-specific — a generic API wouldn't return this
     has_effective_rate = "effective" in agent_text.lower()
