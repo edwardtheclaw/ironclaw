@@ -1033,13 +1033,24 @@ async fn migrate_session_credential(
     secrets: &(dyn crate::secrets::SecretsStore + Send + Sync),
     user_id: &str,
 ) {
-    // If already migrated, clean up the plaintext copy and return.
-    match secrets.exists(user_id, "nearai_session_token").await {
-        Ok(true) => {
-            let _ = db.delete_setting(user_id, "nearai.session_token").await;
-            return;
+    // If already migrated and the secret decrypts to valid JSON, clean up the
+    // plaintext copy and return. If the secret exists but is corrupt, fall
+    // through to re-migrate from the plaintext settings value.
+    match secrets.get_decrypted(user_id, "nearai_session_token").await {
+        Ok(decrypted) => {
+            if serde_json::from_str::<serde_json::Value>(decrypted.expose()).is_ok() {
+                // Valid — safe to clean up plaintext copy.
+                let _ = db.delete_setting(user_id, "nearai.session_token").await;
+                return;
+            }
+            // Secret exists but is corrupt — fall through to re-migrate.
+            tracing::warn!(
+                "nearai_session_token secret exists but failed JSON validation; re-migrating"
+            );
         }
-        Ok(false) => {}
+        Err(crate::secrets::SecretError::NotFound(_)) => {
+            // Not yet migrated — continue.
+        }
         Err(e) => {
             tracing::warn!("Failed to check secrets store for nearai_session_token: {e}");
             return;

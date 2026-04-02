@@ -522,10 +522,8 @@ impl SessionManager {
             } else {
                 tracing::debug!("Session saved to encrypted secrets store");
             }
-        }
-
-        // Also save to DB settings table (fallback for installs without secrets store)
-        if let Some(ref store) = *self.store.read().await {
+        // Save to DB settings table only as fallback when no secrets store is attached
+        } else if let Some(ref store) = *self.store.read().await {
             let user_id = self.user_id.read().await.clone();
             let session_json = serde_json::to_value(&session)
                 .unwrap_or(serde_json::Value::String(token.to_string()));
