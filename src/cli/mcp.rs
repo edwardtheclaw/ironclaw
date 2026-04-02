@@ -139,6 +139,59 @@ fn parse_env_var(s: &str) -> Result<(String, String), String> {
     Ok((s[..pos].to_string(), s[pos + 1..].to_string()))
 }
 
+fn server_display_name(server: &McpServerConfig) -> String {
+    config::derived_server_display_name(server)
+        .unwrap_or(&server.name)
+        .to_string()
+}
+
+fn env_managed_server_message(server: &McpServerConfig) -> Option<String> {
+    let display_name = server_display_name(server);
+    if config::is_derived_nearai_mcp_server(server) {
+        Some(format!(
+            "Server '{}' is derived from {} and {}. Update or unset those environment variables instead.",
+            display_name,
+            config::NEARAI_MCP_URL_ENV,
+            config::NEARAI_MCP_API_KEY_ENV
+        ))
+    } else {
+        None
+    }
+}
+
+fn custom_auth_server_message(server: &McpServerConfig) -> Option<String> {
+    let display_name = server_display_name(server);
+    if config::is_derived_nearai_mcp_server(server) {
+        Some(format!(
+            "Server '{}' uses {} and {} for authentication. No separate 'ironclaw mcp auth' flow is available.",
+            display_name,
+            config::NEARAI_MCP_URL_ENV,
+            config::NEARAI_MCP_API_KEY_ENV
+        ))
+    } else if server.has_custom_auth_header() {
+        Some(format!(
+            "Server '{}' uses a configured Authorization header. No separate 'ironclaw mcp auth' flow is available.",
+            display_name
+        ))
+    } else {
+        None
+    }
+}
+
+fn custom_auth_failure_message(server: &McpServerConfig) -> Option<String> {
+    if config::is_derived_nearai_mcp_server(server) {
+        Some(format!(
+            "Check {} and {}. The configured NEAR AI credentials or URL may be invalid.",
+            config::NEARAI_MCP_URL_ENV,
+            config::NEARAI_MCP_API_KEY_ENV
+        ))
+    } else if server.has_custom_auth_header() {
+        Some("Check the configured Authorization header or API key for this server.".to_string())
+    } else {
+        None
+    }
+}
+
 /// Run an MCP command.
 pub async fn run_mcp_command(cmd: McpCommand) -> anyhow::Result<()> {
     match cmd {
@@ -283,9 +336,16 @@ async fn add_server(args: McpAddArgs) -> anyhow::Result<()> {
 async fn remove_server(name: String) -> anyhow::Result<()> {
     let db = connect_db().await;
     let mut servers = load_servers(db.as_deref()).await?;
-    if !servers.remove(&name) {
-        anyhow::bail!("Server '{}' not found", name);
+    let server = servers
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", name))?;
+
+    if let Some(msg) = env_managed_server_message(&server) {
+        anyhow::bail!(msg);
     }
+
+    servers.remove(&name);
     save_servers(db.as_deref(), &servers).await?;
 
     println!();
@@ -315,6 +375,7 @@ async fn list_servers(verbose: bool) -> anyhow::Result<()> {
     println!();
 
     for server in &servers.servers {
+        let display_name = server_display_name(server);
         let status = if server.enabled { "●" } else { "○" };
         let auth_status = if server.requires_auth() {
             " (auth required)"
@@ -335,8 +396,11 @@ async fn list_servers(verbose: bool) -> anyhow::Result<()> {
         };
 
         if verbose {
-            println!("  {} {}{}", status, server.name, auth_status);
+            println!("  {} {}{}", status, display_name, auth_status);
             println!("      Transport: {}", transport_label);
+            if display_name != server.name {
+                println!("      ID: {}", server.name);
+            }
             match &effective {
                 EffectiveTransport::Http => {
                     println!("      URL: {}", server.url);
@@ -385,7 +449,7 @@ async fn list_servers(verbose: bool) -> anyhow::Result<()> {
             };
             println!(
                 "  {} {} - {} [{}]{}",
-                status, server.name, display, transport_label, auth_status
+                status, display_name, display, transport_label, auth_status
             );
         }
     }
@@ -409,6 +473,14 @@ async fn auth_server(name: String, user_id: String) -> anyhow::Result<()> {
         .get(&name)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", name))?;
+    let display_name = server_display_name(&server);
+
+    if let Some(msg) = custom_auth_server_message(&server) {
+        println!();
+        println!("  {}", msg);
+        println!();
+        return Ok(());
+    }
 
     // Initialize secrets store
     let secrets = get_secrets_store().await?;
@@ -416,7 +488,7 @@ async fn auth_server(name: String, user_id: String) -> anyhow::Result<()> {
     // Check if already authenticated
     if is_authenticated(&server, &secrets, &user_id).await {
         println!();
-        println!("  Server '{}' is already authenticated.", name);
+        println!("  Server '{}' is already authenticated.", display_name);
         println!();
         print!("  Re-authenticate? [y/N]: ");
         std::io::stdout().flush()?;
@@ -434,7 +506,7 @@ async fn auth_server(name: String, user_id: String) -> anyhow::Result<()> {
     println!("╔════════════════════════════════════════════════════════════════╗");
     println!(
         "║  {:^62}║",
-        format!("{} Authentication", name.to_uppercase())
+        format!("{} Authentication", display_name.to_uppercase())
     );
     println!("╚════════════════════════════════════════════════════════════════╝");
     println!();
@@ -443,7 +515,7 @@ async fn auth_server(name: String, user_id: String) -> anyhow::Result<()> {
     match authorize_mcp_server(&server, &secrets, &user_id).await {
         Ok(_token) => {
             println!();
-            println!("  ✓ Successfully authenticated with '{}'!", name);
+            println!("  ✓ Successfully authenticated with '{}'!", display_name);
             println!();
             println!("  You can now use tools from this server.");
             println!();
@@ -482,9 +554,10 @@ async fn test_server(name: String, user_id: String) -> anyhow::Result<()> {
         .get(&name)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", name))?;
+    let display_name = server_display_name(&server);
 
     println!();
-    println!("  Testing connection to '{}'...", name);
+    println!("  Testing connection to '{}'...", display_name);
 
     // Create client
     let session_manager = Arc::new(McpSessionManager::new());
@@ -562,6 +635,10 @@ async fn test_server(name: String, user_id: String) -> anyhow::Result<()> {
                         "  ✗ Authentication failed (token may be expired). Try re-authenticating:"
                     );
                     println!("    ironclaw mcp auth {}", name);
+                } else if let Some(msg) = custom_auth_failure_message(&server) {
+                    println!("  ✗ Authentication failed.");
+                    println!();
+                    println!("  {}", msg);
                 } else {
                     // No tokens - server requires auth
                     println!("  ✗ Server requires authentication.");
@@ -583,6 +660,15 @@ async fn test_server(name: String, user_id: String) -> anyhow::Result<()> {
 async fn toggle_server(name: String, enable: bool, disable: bool) -> anyhow::Result<()> {
     let db = connect_db().await;
     let mut servers = load_servers(db.as_deref()).await?;
+
+    let existing = servers
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", name))?;
+
+    if let Some(msg) = env_managed_server_message(&existing) {
+        anyhow::bail!(msg);
+    }
 
     let server = servers
         .get_mut(&name)

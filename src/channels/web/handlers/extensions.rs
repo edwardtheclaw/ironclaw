@@ -85,6 +85,7 @@ pub async fn extensions_list_handler(
                 tools: ext.tools,
                 needs_setup: ext.needs_setup,
                 has_auth: ext.has_auth,
+                removable: ext.removable,
                 activation_status,
                 activation_error: ext.activation_error,
                 version: ext.version,
@@ -183,6 +184,7 @@ mod tests {
             needs_setup: false,
             has_auth: false,
             installed: true,
+            removable: true,
             activation_error: None,
             version: None,
         }

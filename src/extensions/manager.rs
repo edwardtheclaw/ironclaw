@@ -1393,18 +1393,22 @@ impl ExtensionManager {
             match self.load_mcp_servers(user_id).await {
                 Ok(servers) => {
                     for server in &servers.servers {
-                        let authenticated = is_authenticated(server, &self.secrets, user_id).await;
+                        let authenticated = self.mcp_has_configured_auth(server, user_id).await;
                         let clients = self.mcp_clients.read().await;
                         let active = clients.contains_key(&server.name);
 
                         // Get tool names if active
                         let tools = if active {
-                            self.tool_registry
-                                .list()
-                                .await
-                                .into_iter()
-                                .filter(|t| t.starts_with(&format!("{}_", server.name)))
-                                .collect()
+                            if crate::tools::mcp::config::is_derived_nearai_mcp_server(server) {
+                                Vec::new()
+                            } else {
+                                self.tool_registry
+                                    .list()
+                                    .await
+                                    .into_iter()
+                                    .filter(|t| t.starts_with(&format!("{}:", server.name)))
+                                    .collect()
+                            }
                         } else {
                             Vec::new()
                         };
@@ -1413,7 +1417,11 @@ impl ExtensionManager {
                             .registry
                             .get_with_kind(&server.name, Some(ExtensionKind::McpServer))
                             .await
-                            .map(|e| e.display_name);
+                            .map(|e| e.display_name)
+                            .or_else(|| {
+                                crate::tools::mcp::config::derived_server_display_name(server)
+                                    .map(str::to_string)
+                            });
                         extensions.push(InstalledExtension {
                             name: server.name.clone(),
                             kind: ExtensionKind::McpServer,
@@ -1426,6 +1434,9 @@ impl ExtensionManager {
                             needs_setup: false,
                             has_auth: false,
                             installed: true,
+                            removable: !crate::tools::mcp::config::is_derived_nearai_mcp_server(
+                                server,
+                            ),
                             activation_error: None,
                             version: None,
                         });
@@ -1477,6 +1488,7 @@ impl ExtensionManager {
                             needs_setup: auth_state == ToolAuthState::NeedsSetup,
                             has_auth: auth_state != ToolAuthState::NoAuth,
                             installed: true,
+                            removable: true,
                             activation_error: None,
                             version,
                         });
@@ -1533,6 +1545,7 @@ impl ExtensionManager {
                             needs_setup: auth_state == ToolAuthState::NeedsSetup,
                             has_auth: auth_state != ToolAuthState::NoAuth,
                             installed: true,
+                            removable: true,
                             activation_error,
                             version,
                         });
@@ -1571,6 +1584,7 @@ impl ExtensionManager {
                     needs_setup: false,
                     has_auth: true,
                     installed: true,
+                    removable: true,
                     activation_error,
                     version: None,
                 });
@@ -1605,6 +1619,7 @@ impl ExtensionManager {
                     needs_setup: false,
                     has_auth: false,
                     installed: false,
+                    removable: true,
                     activation_error: None,
                     version: entry.version,
                 });
@@ -1634,6 +1649,19 @@ impl ExtensionManager {
 
         match kind {
             ExtensionKind::McpServer => {
+                let server = self
+                    .get_mcp_server(name, user_id)
+                    .await
+                    .map_err(|e| ExtensionError::NotInstalled(e.to_string()))?;
+                if crate::tools::mcp::config::is_derived_nearai_mcp_server(&server) {
+                    return Err(ExtensionError::Config(format!(
+                        "MCP server '{}' is derived from {} and {}. Unset those environment variables to remove it.",
+                        name,
+                        crate::tools::mcp::config::NEARAI_MCP_URL_ENV,
+                        crate::tools::mcp::config::NEARAI_MCP_API_KEY_ENV
+                    )));
+                }
+
                 let cleanup_plan = self
                     .collect_secret_cleanup_plan(name, kind, user_id)
                     .await?;
@@ -1644,7 +1672,7 @@ impl ExtensionManager {
                     .list()
                     .await
                     .into_iter()
-                    .filter(|t| t.starts_with(&format!("{}_", name)))
+                    .filter(|t| t.starts_with(&format!("{}:", name)))
                     .collect();
 
                 for tool_name in &tool_names {
@@ -2117,6 +2145,10 @@ impl ExtensionManager {
         } else {
             crate::tools::mcp::config::load_mcp_servers().await
         }
+    }
+
+    async fn mcp_has_configured_auth(&self, server: &McpServerConfig, user_id: &str) -> bool {
+        server.has_custom_auth_header() || is_authenticated(server, &self.secrets, user_id).await
     }
 
     async fn get_mcp_server(
@@ -2678,7 +2710,7 @@ impl ExtensionManager {
             .map_err(|e| ExtensionError::NotInstalled(e.to_string()))?;
 
         // Check if already authenticated
-        if is_authenticated(&server, &self.secrets, user_id).await {
+        if self.mcp_has_configured_auth(&server, user_id).await {
             return Ok(AuthResult::authenticated(name, ExtensionKind::McpServer));
         }
 
@@ -3997,7 +4029,7 @@ impl ExtensionManager {
                     .list()
                     .await
                     .into_iter()
-                    .filter(|t| t.starts_with(&format!("{}_", name)))
+                    .filter(|t| t.starts_with(&format!("{}:", name)))
                     .collect();
 
                 return Ok(ActivateResult {
@@ -4032,11 +4064,25 @@ impl ExtensionManager {
         let mcp_tools = client.list_tools().await.map_err(|e| {
             let msg = e.to_string();
             let msg_lower = msg.to_ascii_lowercase();
-            if msg_lower.contains("requires authentication")
+            let auth_like = msg_lower.contains("requires authentication")
                 || msg.contains("401")
                 || (msg.contains("400")
-                    && (msg_lower.contains("authorization") || msg_lower.contains("authenticate")))
-            {
+                    && (msg_lower.contains("authorization") || msg_lower.contains("authenticate")));
+            if auth_like && server.has_custom_auth_header() {
+                if crate::tools::mcp::config::is_derived_nearai_mcp_server(&server) {
+                    ExtensionError::ActivationFailed(format!(
+                        "MCP server '{}' rejected the credentials from {} / {}. Update those environment variables and try again.",
+                        name,
+                        crate::tools::mcp::config::NEARAI_MCP_URL_ENV,
+                        crate::tools::mcp::config::NEARAI_MCP_API_KEY_ENV
+                    ))
+                } else {
+                    ExtensionError::ActivationFailed(format!(
+                        "MCP server '{}' rejected its configured Authorization header. Update the configured credential and try again.",
+                        name
+                    ))
+                }
+            } else if auth_like {
                 ExtensionError::AuthRequired
             } else {
                 ExtensionError::ActivationFailed(msg)
@@ -4050,7 +4096,7 @@ impl ExtensionManager {
 
         let tool_names: Vec<String> = mcp_tools
             .iter()
-            .map(|t| format!("{}_{}", name, t.name))
+            .map(|t| format!("{}:{}", name, t.name))
             .collect();
 
         for tool in tool_impls {
@@ -8306,6 +8352,45 @@ mod tests {
                     .expect("exists query"),
                 "MCP secret {secret_name} should be deleted"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_env_derived_mcp_server_requires_unsetting_env() {
+        let _guard = crate::config::helpers::lock_env();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (store, _db_dir) = make_test_store().await;
+        let mgr = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(Arc::clone(&store)),
+        );
+
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe {
+            std::env::set_var(
+                crate::tools::mcp::config::NEARAI_MCP_URL_ENV,
+                "https://mcp.near.ai",
+            );
+            std::env::set_var(
+                crate::tools::mcp::config::NEARAI_MCP_API_KEY_ENV,
+                "test-nearai-key",
+            );
+        }
+
+        let err = mgr
+            .remove(crate::tools::mcp::config::NEARAI_MCP_SERVER_NAME, "test")
+            .await
+            .expect_err("env-derived server removal should fail");
+        let msg = err.to_string();
+        assert!(msg.contains(crate::tools::mcp::config::NEARAI_MCP_URL_ENV));
+        assert!(msg.contains(crate::tools::mcp::config::NEARAI_MCP_API_KEY_ENV));
+
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe {
+            std::env::remove_var(crate::tools::mcp::config::NEARAI_MCP_URL_ENV);
+            std::env::remove_var(crate::tools::mcp::config::NEARAI_MCP_API_KEY_ENV);
         }
     }
 

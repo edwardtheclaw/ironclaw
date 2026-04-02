@@ -344,6 +344,7 @@ pub struct ExtensionInfo {
     /// Whether this extension has an auth configuration (OAuth or manual token).
     #[serde(default)]
     pub has_auth: bool,
+    pub removable: bool,
     /// WASM channel activation status.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activation_status: Option<ExtensionActivationStatus>,

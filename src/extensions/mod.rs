@@ -510,6 +510,9 @@ pub struct InstalledExtension {
     /// Whether this extension is installed locally (false = available in registry but not installed).
     #[serde(default = "default_true")]
     pub installed: bool,
+    /// Whether this extension can be removed directly from the UI/CLI.
+    #[serde(default = "default_true")]
+    pub removable: bool,
     /// Last activation error for WASM channels.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activation_error: Option<String>,
@@ -941,6 +944,7 @@ mod tests {
         assert!(ext.display_name.is_none());
         assert!(ext.description.is_none());
         assert!(ext.url.is_none());
+        assert!(ext.removable, "removable should default to true");
         assert!(ext.activation_error.is_none());
     }
 
@@ -958,6 +962,7 @@ mod tests {
             needs_setup: true,
             has_auth: true,
             installed: false,
+            removable: true,
             activation_error: Some("token expired".to_string()),
             version: None,
         };
@@ -967,12 +972,14 @@ mod tests {
         assert_eq!(json["url"], "https://gmail.example.com");
         assert_eq!(json["needs_setup"], true);
         assert_eq!(json["installed"], false);
+        assert_eq!(json["removable"], true);
         assert_eq!(json["activation_error"], "token expired");
 
         let back: InstalledExtension = serde_json::from_value(json).unwrap();
         assert_eq!(back.name, "gmail");
         assert_eq!(back.tools.len(), 2);
         assert!(back.needs_setup);
+        assert!(back.removable);
         assert!(!back.installed);
         assert_eq!(back.activation_error.as_deref(), Some("token expired"));
     }

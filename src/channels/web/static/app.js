@@ -2839,11 +2839,13 @@ function renderMcpServerCard(entry, installedExt) {
       configBtn.addEventListener('click', function() { showConfigureModal(installedExt.name); });
       actions.appendChild(configBtn);
     }
-    var removeBtn = document.createElement('button');
-    removeBtn.className = 'btn-ext remove';
-    removeBtn.textContent = I18n.t('ext.remove');
-    removeBtn.addEventListener('click', function() { removeExtension(installedExt.name); });
-    actions.appendChild(removeBtn);
+    if (installedExt.removable !== false) {
+      var removeBtn = document.createElement('button');
+      removeBtn.className = 'btn-ext remove';
+      removeBtn.textContent = I18n.t('ext.remove');
+      removeBtn.addEventListener('click', function() { removeExtension(installedExt.name); });
+      actions.appendChild(removeBtn);
+    }
   } else {
     var installBtn = document.createElement('button');
     installBtn.className = 'btn-ext install';
@@ -3017,11 +3019,13 @@ function renderExtensionCard(ext) {
     }
   }
 
-  const removeBtn = document.createElement('button');
-  removeBtn.className = 'btn-ext remove';
-  removeBtn.textContent = I18n.t('ext.remove');
-  removeBtn.addEventListener('click', () => removeExtension(ext.name));
-  actions.appendChild(removeBtn);
+  if (ext.removable !== false) {
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'btn-ext remove';
+    removeBtn.textContent = I18n.t('ext.remove');
+    removeBtn.addEventListener('click', () => removeExtension(ext.name));
+    actions.appendChild(removeBtn);
+  }
 
   card.appendChild(actions);
 
