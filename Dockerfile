@@ -72,7 +72,11 @@ COPY --from=builder /app/target/release/ironclaw /usr/local/bin/ironclaw
 COPY --from=builder /app/migrations /app/migrations
 
 # Non-root user
-RUN useradd -m -u 1000 -s /bin/bash ironclaw
+ENV HOME=/home/ironclaw
+RUN useradd -m -u 1000 -s /bin/bash ironclaw \
+    && mkdir -p /home/ironclaw/.ironclaw \
+    && chown -R ironclaw:ironclaw /home/ironclaw
+WORKDIR /home/ironclaw
 USER ironclaw
 
 EXPOSE 3000
