@@ -47,8 +47,8 @@
     activeTab = sessionStorage.getItem(SESSION_TAB_KEY) || 'activity';
     panelOpen = sessionStorage.getItem(SESSION_OPEN_KEY) !== 'false';
 
-    currentTurn = 1;
-    viewingTurn = 1;
+    currentTurn = 0;
+    viewingTurn = 0;
 
     createToolbarButton();
     createPanel();
@@ -387,24 +387,29 @@
   // ── Hook send message to start new turn ──
 
   function hookSendMessage() {
+    var hasStartedTurn = false;
+
+    // Hook sendMessage to start new turn
     var origSend = window.sendMessage;
     if (typeof origSend === 'function') {
       window.sendMessage = function () {
+        hasStartedTurn = true;
         startNewTurn();
         return origSend.apply(window, arguments);
       };
     }
 
-    // Hook addMessage to stamp user messages with turn number + add click handler
+    // Hook addMessage to stamp messages with turn number + add click handler.
+    // Only stamp messages created during an active turn (after user sends first message).
     var origAddMessage = window.addMessage;
     if (typeof origAddMessage === 'function') {
       window.addMessage = function (role, content) {
         var el = origAddMessage.apply(window, arguments);
-        if (el) {
+        if (el && hasStartedTurn) {
           el.setAttribute('data-debug-turn', String(currentTurn));
           el.addEventListener('click', function () {
             var turn = parseInt(el.getAttribute('data-debug-turn'), 10);
-            if (turn && turn > 0) {
+            if (turn && turn > 0 && entriesForTurn(turn).length > 0) {
               viewTurn(turn);
               if (!panelOpen) openPanel();
               switchDebugTab('activity');

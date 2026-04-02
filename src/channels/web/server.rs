@@ -2323,6 +2323,7 @@ async fn extensions_install_handler(
         "mcp_server" => Some(crate::extensions::ExtensionKind::McpServer),
         "wasm_tool" => Some(crate::extensions::ExtensionKind::WasmTool),
         "wasm_channel" => Some(crate::extensions::ExtensionKind::WasmChannel),
+        "acp_agent" => Some(crate::extensions::ExtensionKind::AcpAgent),
         _ => None,
     });
 
@@ -4495,5 +4496,73 @@ mod tests {
     fn test_is_local_origin_rejects_garbage() {
         assert!(!is_local_origin("not-a-url"));
         assert!(!is_local_origin(""));
+    }
+
+    #[test]
+    fn test_debug_prompt_response_serializes_all_fields() {
+        let resp = DebugPromptResponse {
+            components: vec![
+                DebugPromptComponent {
+                    source: "AGENTS.md".to_string(),
+                    label: "Agent Instructions".to_string(),
+                    content: "You are an assistant.".to_string(),
+                    estimated_tokens: 30,
+                },
+                DebugPromptComponent {
+                    source: "SOUL.md".to_string(),
+                    label: "Core Values".to_string(),
+                    content: "Be helpful.".to_string(),
+                    estimated_tokens: 10,
+                },
+            ],
+            total_estimated_tokens: 40,
+            system_prompt: Some("Full assembled prompt text here.".to_string()),
+            model: "claude-sonnet-4-20250514".to_string(),
+            context_limit: 200000,
+            note: "reconstructed, may differ from last turn",
+        };
+
+        let json = serde_json::to_value(&resp).expect("should serialize");
+        assert_eq!(json["components"].as_array().unwrap().len(), 2);
+        assert_eq!(json["total_estimated_tokens"], 40);
+        assert_eq!(json["model"], "claude-sonnet-4-20250514");
+        assert_eq!(json["context_limit"], 200000);
+        assert!(json["system_prompt"].is_string());
+        assert!(json["note"].is_string());
+        // Verify component shape
+        let first = &json["components"][0];
+        assert_eq!(first["source"], "AGENTS.md");
+        assert_eq!(first["label"], "Agent Instructions");
+        assert!(first["content"].is_string());
+        assert_eq!(first["estimated_tokens"], 30);
+    }
+
+    #[test]
+    fn test_debug_prompt_response_omits_null_system_prompt() {
+        let resp = DebugPromptResponse {
+            components: vec![],
+            total_estimated_tokens: 0,
+            system_prompt: None,
+            model: "test".to_string(),
+            context_limit: 100000,
+            note: "reconstructed, may differ from last turn",
+        };
+
+        let json = serde_json::to_value(&resp).expect("should serialize");
+        assert!(json.get("system_prompt").is_none());
+    }
+
+    #[test]
+    fn test_estimate_tokens_english() {
+        // "hello world" = 2 words → 2 * 1.3 + 4 = 6
+        assert_eq!(estimate_tokens("hello world"), 6);
+    }
+
+    #[test]
+    fn test_estimate_tokens_cjk() {
+        // CJK text has few spaces but many chars — should use char-based heuristic
+        let cjk = "这是一段中文测试文本，用于验证Token估算";
+        let est = estimate_tokens(cjk);
+        assert!(est > 4, "CJK text should estimate more than overhead");
     }
 }

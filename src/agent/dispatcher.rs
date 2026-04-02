@@ -946,18 +946,22 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                             .await;
 
                         // Send full (non-truncated) output for debug subscribers.
+                        // Scrub secrets before broadcasting.
                         const MAX_TOOL_OUTPUT_BYTES: usize = 50_000;
-                        let truncated = output.len() > MAX_TOOL_OUTPUT_BYTES;
+                        let scrubbed = ironclaw_safety::LeakDetector::new()
+                            .scan_and_clean(output)
+                            .unwrap_or_else(|_| output.clone());
+                        let truncated = scrubbed.len() > MAX_TOOL_OUTPUT_BYTES;
                         let capped = if truncated {
-                            let boundary = output
+                            let boundary = scrubbed
                                 .char_indices()
                                 .take_while(|(i, _)| *i < MAX_TOOL_OUTPUT_BYTES)
                                 .last()
                                 .map(|(i, c)| i + c.len_utf8())
                                 .unwrap_or(0);
-                            output[..boundary].to_string()
+                            scrubbed[..boundary].to_string()
                         } else {
-                            output.clone()
+                            scrubbed
                         };
                         let _ = self
                             .agent

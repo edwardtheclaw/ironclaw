@@ -436,4 +436,93 @@ mod tests {
         let deserialized: AppEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.event_type(), "response");
     }
+
+    #[test]
+    fn turn_metrics_contains_valid_token_fields() {
+        let event = AppEvent::TurnMetrics {
+            thread_id: Some("t1".to_string()),
+            input_tokens: 4200,
+            output_tokens: 850,
+            cache_read_tokens: 3100,
+            model: "claude-sonnet-4-20250514".to_string(),
+            duration_ms: 2340,
+            iteration: 1,
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "turn_metrics");
+        assert_eq!(json["input_tokens"], 4200);
+        assert_eq!(json["output_tokens"], 850);
+        assert_eq!(json["cache_read_tokens"], 3100);
+        assert_eq!(json["model"], "claude-sonnet-4-20250514");
+        assert_eq!(json["duration_ms"], 2340);
+        assert_eq!(json["iteration"], 1);
+        assert_eq!(json["thread_id"], "t1");
+    }
+
+    #[test]
+    fn tool_result_full_serializes_correctly() {
+        let event = AppEvent::ToolResultFull {
+            name: "shell_execute".to_string(),
+            output: "test output\nline 2".to_string(),
+            truncated: Some(true),
+            thread_id: Some("t1".to_string()),
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "tool_result_full");
+        assert_eq!(json["name"], "shell_execute");
+        assert_eq!(json["output"], "test output\nline 2");
+        assert_eq!(json["truncated"], true);
+    }
+
+    #[test]
+    fn is_verbose_only_identifies_debug_events() {
+        let verbose_events = vec![
+            AppEvent::ToolResultFull {
+                name: String::new(),
+                output: String::new(),
+                truncated: None,
+                thread_id: None,
+            },
+            AppEvent::TurnMetrics {
+                thread_id: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                model: String::new(),
+                duration_ms: 0,
+                iteration: 0,
+            },
+        ];
+        for event in &verbose_events {
+            assert!(
+                event.is_verbose_only(),
+                "{:?} should be verbose-only",
+                event
+            );
+        }
+
+        let normal_events = vec![
+            AppEvent::Heartbeat,
+            AppEvent::Status {
+                message: String::new(),
+                thread_id: None,
+            },
+            AppEvent::ToolCompleted {
+                name: String::new(),
+                success: true,
+                error: None,
+                parameters: None,
+                thread_id: None,
+            },
+        ];
+        for event in &normal_events {
+            assert!(
+                !event.is_verbose_only(),
+                "{:?} should NOT be verbose-only",
+                event
+            );
+        }
+    }
 }
