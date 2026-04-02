@@ -31,7 +31,7 @@ use crate::bootstrap::ironclaw_base_dir;
 use crate::channels::IncomingMessage;
 use crate::channels::relay::DEFAULT_RELAY_NAME;
 use crate::channels::web::auth::{
-    AuthenticatedUser, CombinedAuthState, UserIdentity, auth_middleware,
+    AdminUser, AuthenticatedUser, CombinedAuthState, UserIdentity, auth_middleware,
 };
 use crate::channels::web::handlers::jobs::{
     job_files_list_handler, job_files_read_handler, jobs_cancel_handler, jobs_detail_handler,
@@ -578,6 +578,7 @@ pub async fn start_server(
             "/api/admin/usage",
             get(super::handlers::users::usage_stats_handler),
         )
+        .route("/api/admin/usage/summary", get(usage_summary_handler))
         // User self-service profile
         .route(
             "/api/profile",
@@ -626,7 +627,13 @@ pub async fn start_server(
         .route("/i18n/index.js", get(i18n_index_handler))
         .route("/i18n/en.js", get(i18n_en_handler))
         .route("/i18n/zh-CN.js", get(i18n_zh_handler))
-        .route("/i18n-app.js", get(i18n_app_handler));
+        .route("/i18n-app.js", get(i18n_app_handler))
+        // Admin panel SPA (auth handled client-side + API layer)
+        .route("/admin", get(admin_html_handler))
+        .route("/admin/", get(admin_html_handler))
+        .route("/admin/{*path}", get(admin_html_handler))
+        .route("/admin.css", get(admin_css_handler))
+        .route("/admin.js", get(admin_js_handler));
 
     // Project file serving (behind auth to prevent unauthorized file access).
     let projects = Router::new()
@@ -829,6 +836,101 @@ async fn i18n_app_handler() -> impl IntoResponse {
         ],
         include_str!("static/i18n-app.js"),
     )
+}
+
+// --- Admin panel static handlers ---
+
+async fn admin_html_handler() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_str!("static/admin.html"),
+    )
+}
+
+async fn admin_css_handler() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/css"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_str!("static/admin.css"),
+    )
+}
+
+async fn admin_js_handler() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_str!("static/admin.js"),
+    )
+}
+
+// --- Admin usage summary ---
+
+async fn usage_summary_handler(
+    State(state): State<Arc<GatewayState>>,
+    AdminUser(_user): AdminUser,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let users = store
+        .list_users(None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let total = users.len();
+    let active = users.iter().filter(|u| u.status == "active").count();
+    let suspended = users.iter().filter(|u| u.status == "suspended").count();
+    let admins = users.iter().filter(|u| u.role == "admin").count();
+
+    let summary_stats = store
+        .user_summary_stats(None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let total_jobs: i64 = summary_stats.iter().map(|s| s.job_count).sum();
+    let total_cost: rust_decimal::Decimal = summary_stats.iter().map(|s| s.total_cost).sum();
+
+    let since_30d = chrono::Utc::now() - chrono::Duration::days(30);
+    let usage_stats = store
+        .user_usage_stats(None, since_30d)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let llm_calls: i64 = usage_stats.iter().map(|s| s.call_count).sum();
+    let input_tokens: i64 = usage_stats.iter().map(|s| s.input_tokens).sum();
+    let output_tokens: i64 = usage_stats.iter().map(|s| s.output_tokens).sum();
+    let usage_cost: rust_decimal::Decimal = usage_stats.iter().map(|s| s.total_cost).sum();
+
+    let uptime_seconds = state.startup_time.elapsed().as_secs();
+
+    Ok(Json(serde_json::json!({
+        "users": {
+            "total": total,
+            "active": active,
+            "suspended": suspended,
+            "admins": admins,
+        },
+        "jobs": {
+            "total": total_jobs,
+            "total_cost": total_cost.to_string(),
+        },
+        "usage_30d": {
+            "llm_calls": llm_calls,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_cost": usage_cost.to_string(),
+        },
+        "uptime_seconds": uptime_seconds,
+    })))
 }
 
 // --- Health ---
