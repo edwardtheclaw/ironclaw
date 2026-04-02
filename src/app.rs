@@ -564,6 +564,24 @@ impl AppBuilder {
 
                             join_set.spawn(async move {
                                 let server_name = server.name.clone();
+                                let auth_failure_message =
+                                    if crate::tools::mcp::config::is_derived_nearai_mcp_server(
+                                        &server,
+                                    ) {
+                                        Some(format!(
+                                            "MCP server '{}' rejected the credentials from {} / {}. Update those environment variables and try again.",
+                                            server_name,
+                                            crate::tools::mcp::config::NEARAI_MCP_URL_ENV,
+                                            crate::tools::mcp::config::NEARAI_MCP_API_KEY_ENV
+                                        ))
+                                    } else if server.has_custom_auth_header() {
+                                        Some(format!(
+                                            "MCP server '{}' rejected its configured Authorization header. Update the configured credential and try again.",
+                                            server_name
+                                        ))
+                                    } else {
+                                        None
+                                    };
 
                                 let client = match crate::tools::mcp::create_client_from_config(
                                     server,
@@ -614,15 +632,21 @@ impl AppBuilder {
                                     }
                                     Err(e) => {
                                         let err_str = e.to_string();
-                                        if err_str.contains("401")
-                                            || err_str.contains("authentication")
-                                        {
-                                            tracing::warn!(
-                                                "MCP server '{}' requires authentication. \
-                                                 Run: ironclaw mcp auth {}",
-                                                server_name,
-                                                server_name
-                                            );
+                                        let err_lower = err_str.to_ascii_lowercase();
+                                        let auth_like = err_str.contains("401")
+                                            || err_lower.contains("authentication")
+                                            || err_lower.contains("authorization");
+                                        if auth_like {
+                                            if let Some(msg) = auth_failure_message.as_ref() {
+                                                tracing::warn!("{}", msg);
+                                            } else {
+                                                tracing::warn!(
+                                                    "MCP server '{}' requires authentication. \
+                                                     Run: ironclaw mcp auth {}",
+                                                    server_name,
+                                                    server_name
+                                                );
+                                            }
                                         } else {
                                             tracing::warn!(
                                                 "Failed to connect to MCP server '{}': {}",
