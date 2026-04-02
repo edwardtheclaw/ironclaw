@@ -320,7 +320,8 @@ impl AppBuilder {
         tools.register_tool_info();
 
         // Load integration credential mappings from a directory.
-        // Scans for all *.json files in the INTEGRATION_CREDENTIALS_DIR path.
+        // Scans for *.json files in the directory and one level of subdirectories
+        // (e.g. integrations/abound/credentials.json).
         if let Ok(dir) = std::env::var("INTEGRATION_CREDENTIALS_DIR") {
             let dir_path = std::path::Path::new(&dir);
             if dir_path.is_dir() {
@@ -329,11 +330,20 @@ impl AppBuilder {
                         let path = entry.path();
                         if path.extension().and_then(|e| e.to_str()) == Some("json") {
                             tools.load_credential_mappings(&path);
+                        } else if path.is_dir() {
+                            if let Ok(sub) = std::fs::read_dir(&path) {
+                                for sub_entry in sub.flatten() {
+                                    let sub_path = sub_entry.path();
+                                    if sub_path.extension().and_then(|e| e.to_str()) == Some("json")
+                                    {
+                                        tools.load_credential_mappings(&sub_path);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             } else if dir_path.is_file() {
-                // Backward compat: also accept a single file path
                 tools.load_credential_mappings(dir_path);
             }
         }
